@@ -29,7 +29,7 @@ async fn main() {
     let mut clients = vec![];
     let notify = Arc::new(Notify::new());
     let throughput = Arc::new(AtomicU32::new(0));
-    for i in 0..4 {
+    for i in 0..10 {
         let config = config.clone();
         let notify = notify.clone();
         let throughput = throughput.clone();
@@ -63,7 +63,7 @@ async fn main() {
     for _ in 0..10 {
         sleep(Duration::from_secs(1)).await;
         println!(
-            "* internal throughput {} ops/sec",
+            "* interval throughput {} ops/sec",
             throughput.swap(0, Ordering::SeqCst)
         );
     }

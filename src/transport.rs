@@ -8,22 +8,29 @@ use tokio::{
     time::{sleep, Instant, Sleep},
 };
 
-use crate::meta::Config;
+use crate::{crypto::Signature, meta::Config};
 
 pub trait Receiver: Sized {
     fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]);
     fn transport(&mut self) -> &mut Transport<Self>;
+    type SignedMessage;
+    #[allow(unused_variables)]
+    fn signature(message: &Self::SignedMessage) -> &Signature {
+        unimplemented!()
+    }
+    #[allow(unused_variables)]
+    fn set_signature(message: &mut Self::SignedMessage, signature: Signature) {
+        unimplemented!()
+    }
 }
 
-pub struct Transport<T> {
+pub struct Transport<T: Receiver> {
     pub config: Config,
-    event_bus: (mpsc::Sender<Event<T>>, mpsc::Receiver<Event<T>>),
+    crypto_channel: (mpsc::Sender<CryptoEvent<T>>, mpsc::Receiver<CryptoEvent<T>>),
     socket: UdpSocket,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
 }
-
-type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
 
 struct Timer<T> {
     sleep: Pin<Box<Sleep>>,
@@ -31,7 +38,13 @@ struct Timer<T> {
     event: Event<T>,
 }
 
-impl<T> Transport<T> {
+pub type CryptoEvent<T> = (
+    <T as Receiver>::SignedMessage,
+    Box<dyn FnOnce(&mut T, <T as Receiver>::SignedMessage) + Send>,
+);
+type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
+
+impl<T: Receiver> Transport<T> {
     pub fn new(config: Config, socket: UdpSocket) -> Self {
         let mut timer_table = HashMap::new();
         // insert a sentinel entry to make sure we get always get a `sleep` to
@@ -46,7 +59,7 @@ impl<T> Transport<T> {
         );
         Self {
             config,
-            event_bus: mpsc::channel(64),
+            crypto_channel: mpsc::channel(64),
             socket,
             timer_table,
             timer_id: 0,
@@ -89,6 +102,10 @@ impl<T> Transport<T> {
     pub fn cancel_timer(&mut self, id: u32) {
         self.timer_table.remove(&id);
     }
+
+    pub fn crypto_sender(&self) -> mpsc::Sender<CryptoEvent<T>> {
+        self.crypto_channel.0.clone()
+    }
 }
 
 #[async_trait]
@@ -97,7 +114,11 @@ pub trait Run {
 }
 
 #[async_trait]
-impl<T: Receiver + Send> Run for T {
+impl<T> Run for T
+where
+    T: Receiver + Send,
+    T::SignedMessage: Send,
+{
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
         let mut buf = [0; 1400];
@@ -114,7 +135,10 @@ impl<T: Receiver + Send> Run for T {
                     let timer = self.transport().timer_table.remove(&id).unwrap();
                     (timer.event)(self);
                 }
-                event = transport.event_bus.1.recv() => event.unwrap()(self),
+                event = transport.crypto_channel.1.recv() => {
+                    let (message, on_message) = event.unwrap();
+                    on_message(self, message);
+                },
                 message = transport.socket.recv_from(&mut buf) => {
                     let (len, remote) = message.unwrap();
                     self.receive_message(remote, &buf[..len]);

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
+    crypto::{Crypto, ExecutorSetting, Signature},
     meta::{deserialize, random_id, serialize, ClientId, OpNumber, ReplicaId, RequestNumber},
     transport::{Receiver, Transport},
     App,
@@ -17,9 +18,10 @@ struct Request {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Reply {
+pub struct Reply {
     request_number: RequestNumber,
     result: Vec<u8>,
+    signature: Signature,
 }
 
 pub struct Client {
@@ -83,11 +85,13 @@ impl Receiver for Client {
         self.transport.cancel_timer(invoke.timer_id);
         invoke.continuation.send(message.result).unwrap();
     }
+
+    type SignedMessage = ();
 }
 
 impl Client {
     fn send_request(&mut self) {
-        let replica = self.transport.config.replicas()[0];
+        let replica = self.transport.config.replicas[0];
         let request = &self.invoke.as_ref().unwrap().request;
         self.transport
             .send_message(replica, |buf| serialize(buf, request));
@@ -112,15 +116,22 @@ impl Client {
 
 pub struct Replica {
     transport: Transport<Self>,
+    crypto: Crypto<Self>,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
     client_table: HashMap<ClientId, Reply>,
 }
 
 impl Replica {
-    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
+    pub fn new(
+        transport: Transport<Self>,
+        setting: ExecutorSetting,
+        id: ReplicaId,
+        app: impl App + Send + 'static,
+    ) -> Self {
         assert_eq!(id, 0);
         Self {
+            crypto: Crypto::new(&transport, id, setting),
             transport,
             op_number: 0,
             app: Box::new(app),
@@ -152,9 +163,23 @@ impl Receiver for Replica {
         let reply = Reply {
             request_number: message.request_number,
             result,
+            signature: Signature::from_compact(&[0; 64]).unwrap(),
         };
-        self.client_table.insert(message.client_id, reply.clone());
-        self.transport
-            .send_message(remote, |buf| serialize(buf, reply));
+
+        let client_id = message.client_id;
+        self.crypto.sign(reply, move |receiver, reply| {
+            receiver.client_table.insert(client_id, reply.clone());
+            receiver
+                .transport
+                .send_message(remote, |buf| serialize(buf, reply));
+        });
+    }
+
+    type SignedMessage = Reply;
+    fn signature(message: &Self::SignedMessage) -> &Signature {
+        &message.signature
+    }
+    fn set_signature(message: &mut Self::SignedMessage, signature: Signature) {
+        message.signature = signature;
     }
 }

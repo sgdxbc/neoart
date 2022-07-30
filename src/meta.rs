@@ -2,6 +2,7 @@ use std::{convert::Infallible, io::Read, net::SocketAddr, str::FromStr};
 
 use bincode::Options;
 use rand::random;
+use secp256k1::{PublicKey, SecretKey};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub type ClientId = [u8; 4];
@@ -30,22 +31,11 @@ pub fn serialize(mut buf: &mut [u8], message: impl Serialize) -> usize {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    f: usize,
-    replicas: Vec<SocketAddr>,
-}
-
-impl Config {
-    pub fn n(&self) -> usize {
-        self.replicas.len()
-    }
-
-    pub fn f(&self) -> usize {
-        self.f
-    }
-
-    pub fn replicas(&self) -> &[SocketAddr] {
-        &self.replicas
-    }
+    pub n: usize,
+    pub f: usize,
+    pub replicas: Vec<SocketAddr>,
+    pub secret_keys: Vec<SecretKey>,
+    pub public_keys: Vec<PublicKey>,
 }
 
 impl FromStr for Config {
@@ -62,8 +52,11 @@ impl FromStr for Config {
             }
         }
         Ok(Self {
+            n: replicas.len(),
             f: f.unwrap(),
             replicas,
+            secret_keys: vec![],
+            public_keys: vec![],
         })
     }
 }
