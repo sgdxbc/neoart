@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    meta::{deserialize, serialize, ClientId, OpNumber, ReplicaId, RequestNumber},
+    meta::{deserialize, random_id, serialize, ClientId, OpNumber, ReplicaId, RequestNumber},
     transport::{Receiver, Transport},
     App,
 };
@@ -39,7 +39,7 @@ impl Client {
     pub fn new(transport: Transport<Self>) -> Self {
         Self {
             transport,
-            id: [0; 4],
+            id: random_id(),
             request_number: 0,
             invoke: None,
         }

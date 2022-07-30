@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use meta::OpNumber;
 
+pub mod latency;
 pub mod meta;
 pub mod transport;
 pub mod unreplicated;

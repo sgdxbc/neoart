@@ -1,12 +1,17 @@
 use std::{convert::Infallible, io::Read, net::SocketAddr, str::FromStr};
 
 use bincode::Options;
+use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub type ClientId = [u8; 4];
 pub type ReplicaId = u8;
 pub type RequestNumber = u32;
 pub type OpNumber = u32;
+
+pub fn random_id() -> ClientId {
+    random()
+}
 
 pub fn deserialize<M: DeserializeOwned>(buf: impl Read) -> M {
     bincode::options()
