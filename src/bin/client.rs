@@ -26,39 +26,40 @@ async fn main() {
     .parse()
     .unwrap();
 
-    let mut clients = vec![];
     let notify = Arc::new(Notify::new());
     let throughput = Arc::new(AtomicU32::new(0));
-    for i in 0..10 {
-        let config = config.clone();
-        let notify = notify.clone();
-        let throughput = throughput.clone();
-        clients.push(spawn(async move {
-            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            socket.writable().await.unwrap();
-            let transport = Transport::new(config, Socket::Os(socket));
-            let mut client = unreplicated::Client::new(transport);
-            let notified = notify.notified();
-            pin!(notified);
+    let clients = (0..10)
+        .map(|i| {
+            let config = config.clone();
+            let notify = notify.clone();
+            let throughput = throughput.clone();
+            spawn(async move {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                socket.writable().await.unwrap();
+                let transport = Transport::new(config, Socket::Os(socket));
+                let mut client = unreplicated::Client::new(transport);
+                let notified = notify.notified();
+                pin!(notified);
 
-            let mut closed = false;
-            while !closed {
-                push_latency::<RequestBegin>(i);
-                let result = client.invoke(&[]);
-                client
-                    .run(async {
-                        select! {
-                            _ = result => {
-                                push_latency::<RequestEnd>(i);
-                                throughput.fetch_add(1, Ordering::SeqCst);
+                let mut closed = false;
+                while !closed {
+                    push_latency::<RequestBegin>(i);
+                    let result = client.invoke(&[]);
+                    client
+                        .run(async {
+                            select! {
+                                _ = result => {
+                                    push_latency::<RequestEnd>(i);
+                                    throughput.fetch_add(1, Ordering::SeqCst);
+                                }
+                                _ = &mut notified => closed = true,
                             }
-                            _ = &mut notified => closed = true,
-                        }
-                    })
-                    .await;
-            }
-        }));
-    }
+                        })
+                        .await;
+                }
+            })
+        })
+        .collect::<Vec<_>>();
 
     for _ in 0..10 {
         sleep(Duration::from_secs(1)).await;

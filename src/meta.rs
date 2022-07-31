@@ -8,7 +8,9 @@ use serde::{de::DeserializeOwned, Serialize};
 pub type ClientId = [u8; 4];
 pub type ReplicaId = u8;
 pub type RequestNumber = u32;
+pub type ViewNumber = u8;
 pub type OpNumber = u32;
+pub type Digest = [u8; 32];
 
 pub fn random_id() -> ClientId {
     random()
@@ -41,7 +43,7 @@ impl FromStr for Config {
     type Err = Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut f = None;
-        let mut replicas = vec![];
+        let mut replicas = Vec::new();
         for line in s.lines() {
             let line = line.trim_start();
             if let Some(line) = line.strip_prefix('f') {
@@ -54,7 +56,7 @@ impl FromStr for Config {
             n: replicas.len(),
             f: f.unwrap(),
             replicas,
-            keys: vec![],
+            keys: Vec::new(),
         })
     }
 }
@@ -66,5 +68,9 @@ impl Config {
             self.keys
                 .push(KeyPair::from_seckey_slice(&secp, &[(i + 1) as _; 32]).unwrap());
         }
+    }
+
+    pub fn primary(&self, view_number: ViewNumber) -> ReplicaId {
+        (view_number as usize % self.n) as _
     }
 }

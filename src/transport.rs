@@ -81,28 +81,42 @@ impl<T: Receiver> Transport<T> {
         }
     }
 
+    fn send_message_interal(
+        socket: &Socket,
+        destinations: &[SocketAddr],
+        message: impl FnOnce(&mut [u8]) -> usize,
+    ) {
+        let mut buf = [0; 1400];
+        let len = message(&mut buf);
+        for &destination in destinations {
+            match socket {
+                Socket::Os(socket) => {
+                    socket.try_send_to(&buf[..len], destination).unwrap();
+                }
+                Socket::Simulated(SimulatedSocket { addr, network, .. }) => {
+                    network
+                        .try_send(Message {
+                            source: *addr,
+                            destination,
+                            buf: buf[..len].to_vec(),
+                        })
+                        .map_err(|_| panic!())
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     pub fn send_message(
         &mut self,
         destination: SocketAddr,
         message: impl FnOnce(&mut [u8]) -> usize,
     ) {
-        let mut buf = [0; 1400];
-        let len = message(&mut buf);
-        match &self.socket {
-            Socket::Os(socket) => {
-                socket.try_send_to(&buf[..len], destination).unwrap();
-            }
-            Socket::Simulated(SimulatedSocket { addr, network, .. }) => {
-                network
-                    .try_send(Message {
-                        source: *addr,
-                        destination,
-                        buf: buf[..len].to_vec(),
-                    })
-                    .map_err(|_| panic!())
-                    .unwrap();
-            }
-        }
+        Self::send_message_interal(&self.socket, &[destination], message);
+    }
+
+    pub fn send_message_to_all(&mut self, message: impl FnOnce(&mut [u8]) -> usize) {
+        Self::send_message_interal(&self.socket, &self.config.replicas[..], message);
     }
 
     pub fn create_timer(

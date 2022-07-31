@@ -143,7 +143,7 @@ impl Replica {
             op_number: 0,
             app: Box::new(app),
             client_table: HashMap::new(),
-            log: vec![],
+            log: Vec::new(),
         }
     }
 }

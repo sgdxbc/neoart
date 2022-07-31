@@ -7,6 +7,7 @@ pub mod latency;
 pub mod meta;
 pub mod transport;
 pub mod unreplicated;
+pub mod zyzzyva;
 
 pub trait Client {
     fn invoke(&mut self, op: &[u8]) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>>;

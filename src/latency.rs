@@ -31,7 +31,7 @@ impl Latency {
     pub fn intervals<B: 'static, E: 'static>(&self) -> Vec<Duration> {
         let mut instances = HashMap::new();
         let (begin_tag, end_tag) = (TypeId::of::<B>(), TypeId::of::<E>());
-        let mut intervals = vec![];
+        let mut intervals = Vec::new();
         for &(instant, tag, i) in &self.0 {
             if tag == begin_tag {
                 instances.insert(i, instant);
