@@ -120,6 +120,13 @@ pub struct Replica {
     op_number: OpNumber,
     app: Box<dyn App + Send>,
     client_table: HashMap<ClientId, Reply>,
+    log: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LogEntry {
+    request: Request,
+    reply: Option<Reply>,
 }
 
 impl Replica {
@@ -136,6 +143,7 @@ impl Replica {
             op_number: 0,
             app: Box::new(app),
             client_table: HashMap::new(),
+            log: vec![],
         }
     }
 }
@@ -159,6 +167,11 @@ impl Receiver for Replica {
         }
 
         self.op_number += 1;
+        self.log.push(LogEntry {
+            request: message.clone(),
+            reply: None,
+        });
+        assert_eq!(self.log.len() as OpNumber, self.op_number);
         let result = self.app.replica_upcall(self.op_number, &message.op);
         let reply = Reply {
             request_number: message.request_number,
@@ -167,7 +180,9 @@ impl Receiver for Replica {
         };
 
         let client_id = message.client_id;
+        let op_number = self.op_number;
         self.crypto.sign(reply, move |receiver, reply| {
+            receiver.log[op_number as usize - 1].reply = Some(reply.clone());
             receiver.client_table.insert(client_id, reply.clone());
             receiver
                 .transport
@@ -181,5 +196,52 @@ impl Receiver for Replica {
     }
     fn set_signature(message: &mut Self::SignedMessage, signature: Signature) {
         message.signature = signature;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use crate::{
+        crypto::ExecutorSetting,
+        transport::{Concurrent, Run, SimulatedNetwork, TestApp, Transport},
+        Client as _,
+    };
+
+    use super::{Client, Replica};
+
+    #[tokio::test(start_paused = true)]
+    async fn test_single_op() {
+        let config = SimulatedNetwork::config(1, 0);
+        let mut net = SimulatedNetwork::default();
+        let replica = Replica::new(
+            Transport::new(config.clone(), net.insert_socket(config.replicas[0])),
+            ExecutorSetting::Inline,
+            0,
+            TestApp::default(),
+        );
+        let mut client = Client::new(Transport::new(
+            config.clone(),
+            net.insert_socket(SimulatedNetwork::client(0)),
+        ));
+
+        let net = Concurrent::run(net);
+        let replica = Concurrent::run(replica);
+        let result = client.invoke("hello".as_bytes());
+        timeout(
+            Duration::from_millis(20),
+            client.run(async {
+                assert_eq!(&result.await, "[1] hello".as_bytes());
+            }),
+        )
+        .await
+        .unwrap();
+
+        let replica = replica.join().await;
+        net.join().await;
+        assert_eq!(replica.log.len(), 1);
     }
 }

@@ -26,12 +26,3 @@ pub trait App {
     #[allow(unused_variables)]
     fn commit_upcall(&mut self, op_number: OpNumber) {}
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
-}

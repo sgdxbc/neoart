@@ -1,14 +1,23 @@
-use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use std::{
+    collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin, sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use rand::{thread_rng, Rng};
 use tokio::{
     net::UdpSocket,
-    pin, select,
-    sync::mpsc,
+    pin, select, spawn,
+    sync::{mpsc, Notify},
+    task::JoinHandle,
     time::{sleep, Instant, Sleep},
 };
 
-use crate::{crypto::Signature, meta::Config};
+use crate::{
+    crypto::Signature,
+    meta::{Config, OpNumber},
+    App,
+};
 
 pub trait Receiver: Sized {
     fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]);
@@ -27,7 +36,7 @@ pub trait Receiver: Sized {
 pub struct Transport<T: Receiver> {
     pub config: Config,
     crypto_channel: (mpsc::Sender<CryptoEvent<T>>, mpsc::Receiver<CryptoEvent<T>>),
-    socket: UdpSocket,
+    socket: Socket,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
 }
@@ -44,8 +53,14 @@ pub type CryptoEvent<T> = (
 );
 type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
 
+#[derive(Debug)]
+pub enum Socket {
+    Os(UdpSocket),
+    Simulated(SimulatedSocket),
+}
+
 impl<T: Receiver> Transport<T> {
-    pub fn new(config: Config, socket: UdpSocket) -> Self {
+    pub fn new(config: Config, socket: Socket) -> Self {
         let mut timer_table = HashMap::new();
         // insert a sentinel entry to make sure we get always get a `sleep` to
         // select from timer table in `run`
@@ -54,7 +69,7 @@ impl<T: Receiver> Transport<T> {
             Timer {
                 sleep: Box::pin(sleep(Duration::from_secs(3600))),
                 duration: Duration::ZERO,
-                event: Box::new(|_| {}),
+                event: Box::new(|_| unreachable!("you forget to shutdown benchmark for an hour")),
             },
         );
         Self {
@@ -73,7 +88,21 @@ impl<T: Receiver> Transport<T> {
     ) {
         let mut buf = [0; 1400];
         let len = message(&mut buf);
-        self.socket.try_send_to(&buf[..len], destination).unwrap();
+        match &self.socket {
+            Socket::Os(socket) => {
+                socket.try_send_to(&buf[..len], destination).unwrap();
+            }
+            Socket::Simulated(SimulatedSocket { addr, network, .. }) => {
+                network
+                    .try_send(Message {
+                        source: *addr,
+                        destination,
+                        buf: buf[..len].to_vec(),
+                    })
+                    .map_err(|_| panic!())
+                    .unwrap();
+            }
+        }
     }
 
     pub fn create_timer(
@@ -108,6 +137,19 @@ impl<T: Receiver> Transport<T> {
     }
 }
 
+impl Socket {
+    async fn receive_from(&mut self, buf: &mut [u8]) -> (usize, SocketAddr) {
+        match self {
+            Self::Os(socket) => socket.recv_from(buf).await.unwrap(),
+            Self::Simulated(SimulatedSocket { inbox, .. }) => {
+                let (remote, message) = inbox.recv().await.unwrap();
+                buf[..message.len()].copy_from_slice(&message);
+                (message.len(), remote)
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait Run {
     async fn run(&mut self, close: impl Future<Output = ()> + Send);
@@ -139,11 +181,131 @@ where
                     let (message, on_message) = event.unwrap();
                     on_message(self, message);
                 },
-                message = transport.socket.recv_from(&mut buf) => {
-                    let (len, remote) = message.unwrap();
+                (len, remote) = transport.socket.receive_from(&mut buf) => {
                     self.receive_message(remote, &buf[..len]);
                 }
             }
         }
+    }
+}
+
+pub struct SimulatedNetwork {
+    send_channel: (mpsc::Sender<Message>, mpsc::Receiver<Message>),
+    inboxes: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+}
+
+struct Message {
+    source: SocketAddr,
+    destination: SocketAddr,
+    buf: Vec<u8>,
+}
+
+impl Default for SimulatedNetwork {
+    fn default() -> Self {
+        Self {
+            send_channel: mpsc::channel(64),
+            inboxes: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SimulatedSocket {
+    addr: SocketAddr,
+    network: mpsc::Sender<Message>,
+    inbox: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+}
+
+impl SimulatedNetwork {
+    pub fn insert_socket(&mut self, addr: SocketAddr) -> Socket {
+        let (inbox_sender, inbox) = mpsc::channel(64);
+        self.inboxes.insert(addr, inbox_sender);
+        Socket::Simulated(SimulatedSocket {
+            addr,
+            network: self.send_channel.0.clone(),
+            inbox,
+        })
+    }
+
+    pub fn config(n: usize, f: usize) -> Config {
+        let mut config = String::new();
+        writeln!(config, "f {f}").unwrap();
+        for i in 0..n {
+            writeln!(config, "replica 5.9.0.{i}:2023").unwrap();
+        }
+        let mut config: Config = config.parse().unwrap();
+        config.gen_keys();
+        config
+    }
+
+    pub fn client(i: usize) -> SocketAddr {
+        format!("20.23.7.10:{}", i + 1).parse().unwrap()
+    }
+}
+
+#[async_trait]
+impl Run for SimulatedNetwork {
+    async fn run(&mut self, close: impl Future<Output = ()> + Send) {
+        pin!(close);
+        loop {
+            select! {
+                _ = &mut close => return,
+                message = self.send_channel.1.recv() => {
+                    self.handle_message(message.unwrap()).await
+                }
+            }
+        }
+    }
+}
+
+impl SimulatedNetwork {
+    async fn handle_message(&self, message: Message) {
+        // TODO filter
+        let inbox = self.inboxes[&message.destination].clone();
+        let delay = Duration::from_millis(thread_rng().gen_range(1..10));
+        spawn(async move {
+            sleep(delay).await;
+            println!(
+                "* [{:?}] [{} -> {}] message length {}",
+                Instant::now(),
+                message.source,
+                message.destination,
+                message.buf.len()
+            );
+            inbox.send((message.source, message.buf)).await.unwrap();
+        });
+    }
+}
+
+pub struct Concurrent<T>(Arc<Notify>, JoinHandle<T>);
+impl<T> Concurrent<T> {
+    pub fn run(mut runnable: T) -> Self
+    where
+        T: Run + Send + 'static,
+    {
+        let notify = Arc::new(Notify::new());
+        Self(
+            notify.clone(),
+            spawn(async move {
+                runnable.run(notify.notified()).await;
+                runnable
+            }),
+        )
+    }
+
+    pub async fn join(self) -> T {
+        self.0.notify_one();
+        self.1.await.unwrap()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TestApp {
+    //
+}
+
+impl App for TestApp {
+    fn replica_upcall(&mut self, op_number: OpNumber, op: &[u8]) -> Vec<u8> {
+        [format!("[{op_number}] ").as_bytes(), op].concat()
     }
 }

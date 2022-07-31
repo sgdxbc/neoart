@@ -9,7 +9,7 @@ use std::{
 use neoart::{
     latency::{merge_latency_with, push_latency, Latency},
     meta::Config,
-    transport::{Run, Transport},
+    transport::{Run, Socket, Transport},
     unreplicated, Client,
 };
 use tokio::{net::UdpSocket, pin, select, spawn, sync::Notify, time::sleep};
@@ -36,7 +36,7 @@ async fn main() {
         clients.push(spawn(async move {
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             socket.writable().await.unwrap();
-            let transport = Transport::new(config, socket);
+            let transport = Transport::new(config, Socket::Os(socket));
             let mut client = unreplicated::Client::new(transport);
             let notified = notify.notified();
             pin!(notified);

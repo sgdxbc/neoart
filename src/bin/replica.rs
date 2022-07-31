@@ -3,10 +3,9 @@ use std::future::pending;
 use neoart::{
     crypto::ExecutorSetting,
     meta::{Config, OpNumber},
-    transport::{Run, Transport},
+    transport::{Run, Socket, Transport},
     unreplicated, App,
 };
-use secp256k1::{Secp256k1, SecretKey};
 use tokio::net::UdpSocket;
 
 struct Null;
@@ -24,15 +23,10 @@ async fn main() {
     "
     .parse()
     .unwrap();
-    config
-        .secret_keys
-        .push(SecretKey::from_slice(&[0xab; 32]).unwrap());
-    config
-        .public_keys
-        .push(config.secret_keys[0].public_key(&Secp256k1::new()));
+    config.gen_keys();
 
     let socket = UdpSocket::bind(config.replicas[0]).await.unwrap();
-    let transport = Transport::new(config, socket);
+    let transport = Transport::new(config, Socket::Os(socket));
     let mut replica = unreplicated::Replica::new(transport, ExecutorSetting::Rayon(8), 0, Null);
     replica.run(pending()).await;
 }

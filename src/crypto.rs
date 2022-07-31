@@ -2,7 +2,9 @@ use std::thread::spawn;
 
 use bincode::Options;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use secp256k1::{hashes::sha256, Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly};
+use secp256k1::{
+    hashes::sha256, KeyPair, Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly,
+};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
@@ -16,8 +18,8 @@ pub type Signature = secp256k1::ecdsa::Signature;
 #[derive(Debug)]
 pub struct Crypto<T: Receiver> {
     sender: Sender<CryptoEvent<T>>,
-    secret_key: SecretKey,
-    public_keys: Vec<PublicKey>,
+    keys: Vec<KeyPair>,
+    replica_id: ReplicaId,
     executor: Executor,
 }
 
@@ -50,8 +52,8 @@ impl<T: Receiver> Crypto<T> {
         };
         Self {
             sender: transport.crypto_sender(),
-            secret_key: transport.config.secret_keys[id as usize].clone(),
-            public_keys: transport.config.public_keys.clone(),
+            keys: transport.config.keys.clone(),
+            replica_id: id,
             executor,
         }
     }
@@ -65,11 +67,14 @@ impl<T: Receiver> Crypto<T> {
         T: 'static,
     {
         match &self.executor {
-            Executor::Inline => {
-                Self::sign_task(message, on_message, &self.secret_key, &self.sender)
-            }
+            Executor::Inline => Self::sign_task(
+                message,
+                on_message,
+                &self.keys[self.replica_id as usize].secret_key(),
+                &self.sender,
+            ),
             Executor::Rayon(executor) => {
-                let secret_key = self.secret_key.clone();
+                let secret_key = self.keys[self.replica_id as usize].secret_key();
                 let sender = self.sender.clone();
                 executor.spawn(move || Self::sign_task(message, on_message, &secret_key, &sender))
             }
@@ -111,11 +116,11 @@ impl<T: Receiver> Crypto<T> {
             Executor::Inline => Self::verify_task(
                 message,
                 on_message,
-                &self.public_keys[id as usize],
+                &self.keys[id as usize].public_key(),
                 &self.sender,
             ),
             Executor::Rayon(executor) => {
-                let public_key = self.public_keys[id as usize].clone();
+                let public_key = self.keys[id as usize].public_key();
                 let sender = self.sender.clone();
                 executor.spawn(move || Self::verify_task(message, on_message, &public_key, &sender))
             }

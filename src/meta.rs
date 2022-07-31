@@ -2,7 +2,7 @@ use std::{convert::Infallible, io::Read, net::SocketAddr, str::FromStr};
 
 use bincode::Options;
 use rand::random;
-use secp256k1::{PublicKey, SecretKey};
+use secp256k1::{KeyPair, Secp256k1};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub type ClientId = [u8; 4];
@@ -34,8 +34,7 @@ pub struct Config {
     pub n: usize,
     pub f: usize,
     pub replicas: Vec<SocketAddr>,
-    pub secret_keys: Vec<SecretKey>,
-    pub public_keys: Vec<PublicKey>,
+    pub keys: Vec<KeyPair>,
 }
 
 impl FromStr for Config {
@@ -55,8 +54,17 @@ impl FromStr for Config {
             n: replicas.len(),
             f: f.unwrap(),
             replicas,
-            secret_keys: vec![],
-            public_keys: vec![],
+            keys: vec![],
         })
+    }
+}
+
+impl Config {
+    pub fn gen_keys(&mut self) {
+        let secp = Secp256k1::signing_only();
+        for i in 0..self.replicas.len() {
+            self.keys
+                .push(KeyPair::from_seckey_slice(&secp, &[(i + 1) as _; 32]).unwrap());
+        }
     }
 }
