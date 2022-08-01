@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    mem::replace,
     net::SocketAddr,
     pin::Pin,
     time::Duration,
@@ -10,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    crypto::{CryptoMessage, Signature},
-    meta::{deserialize, digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber},
+    crypto::{verify_message, CryptoMessage, Signature},
+    meta::{
+        deserialize, digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber,
+        ViewNumber,
+    },
     transport::{
         Destination::{To, ToAll},
         InboundAction, Receiver, SignedMessage, Transport,
@@ -64,7 +68,7 @@ pub struct Commit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitCertificate {
-    spec_response: SpecResponse,
+    spec_response: SpecResponse, // signature cleared
     signatures: Vec<(ReplicaId, Signature)>,
 }
 
@@ -92,8 +96,41 @@ impl CryptoMessage for Message {
         match self {
             Self::OrderReq(message, _) => digest(message),
             Self::SpecResponse(message, ..) => digest(message),
-            message => digest(message),
+            _ => digest(self),
         }
+    }
+}
+
+// for calling `verify_message` below
+impl CryptoMessage for SpecResponse {
+    fn signature_mut(&mut self) -> &mut Signature {
+        &mut self.signature
+    }
+}
+
+impl Message {
+    fn verify_commit(&mut self, config: &Config) -> bool {
+        let certificate = if let Self::Commit(message) = self {
+            &message.certificate
+        } else {
+            unreachable!()
+        };
+        if certificate.signatures.len() < config.f * 2 + 1 {
+            return false;
+        }
+        for &(replica_id, signature) in &certificate.signatures {
+            let mut spec_response = SpecResponse {
+                signature,
+                ..certificate.spec_response
+            };
+            if !verify_message(
+                &mut spec_response,
+                &config.keys[replica_id as usize].public_key(),
+            ) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -163,7 +200,7 @@ impl Receiver for Client {
             Message::SpecResponse(message, replica_id, result, _) => {
                 self.handle_spec_response(remote, message, replica_id, result)
             }
-            Message::LocalCommit(message) => self.handle_local_commit(message),
+            Message::LocalCommit(message) => self.handle_local_commit(remote, message),
             _ => unreachable!(),
         }
     }
@@ -173,7 +210,7 @@ impl Client {
     fn handle_spec_response(
         &mut self,
         _remote: SocketAddr,
-        message: SpecResponse,
+        mut message: SpecResponse,
         replica_id: ReplicaId,
         result: Vec<u8>,
     ) {
@@ -186,7 +223,10 @@ impl Client {
             return;
         };
 
-        let signature = message.signature;
+        let signature = replace(
+            &mut message.signature,
+            Signature::from_compact(&[0; 32]).unwrap(),
+        );
         if invoke.certificate.signatures.is_empty() {
             invoke.certificate.spec_response = message;
             invoke.result = result;
@@ -216,7 +256,7 @@ impl Client {
         }
     }
 
-    fn handle_local_commit(&mut self, message: LocalCommit) {
+    fn handle_local_commit(&mut self, _remote: SocketAddr, message: LocalCommit) {
         if message.client_id != self.id {
             return;
         }
@@ -239,7 +279,8 @@ impl Client {
         let invoke = self.invoke.as_mut().unwrap();
         if invoke.certificate.signatures.len() < self.transport.config.f * 2 + 1 {
             // timer not set already => this is not a resending
-            if invoke.timer_id == 0 {
+            // force broadcasting first request to let replicas learn routing
+            if invoke.timer_id == 0 && self.request_number > 1 {
                 let primary = self.transport.config.primary(self.view_number);
                 self.transport.send_message(
                     To(self.transport.config.replicas[primary as usize]),
@@ -284,18 +325,20 @@ pub struct Replica {
     transport: Transport<Self>,
     id: ReplicaId,
     view_number: ViewNumber,
-    op_number: OpNumber,
+    op_number: OpNumber, // speculative committed up to
     app: Box<dyn App + Send>,
     client_table: HashMap<ClientId, (RequestNumber, SignedMessage)>, // always SpecResponse
     log: Vec<LogEntry>,
+    commit_certificate: CommitCertificate, // highest
+    routes: HashMap<ClientId, SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogEntry {
     view_number: ViewNumber,
     request: Request,
-    spec_response: SpecResponse,
-    speculative: bool,
+    spec_response: SignedMessage,
+    message_digest: Digest,
     history_digest: Digest,
 }
 
@@ -305,10 +348,11 @@ impl Receiver for Replica {
     fn inbound_action(&self, buf: &[u8]) -> InboundAction<Self::Message> {
         let message = deserialize(buf);
         match message {
-            Message::Request(_) | Message::Commit(_) => InboundAction::Allow(message),
+            Message::Request(_) => InboundAction::Allow(message),
             Message::OrderReq(OrderReq { view_number, .. }, _) => {
-                InboundAction::Verify(message, self.transport.config.primary(view_number))
+                InboundAction::VerifyReplica(message, self.transport.config.primary(view_number))
             }
+            Message::Commit(_) => InboundAction::Verify(message, Message::verify_commit),
             _ => {
                 println!("! unexpected {message:?}");
                 InboundAction::Block
@@ -319,15 +363,24 @@ impl Receiver for Replica {
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
         match message {
             Message::Request(message) => self.handle_request(remote, message),
-            Message::OrderReq(message, request) => todo!(),
-            Message::Commit(message) => todo!(),
+            Message::OrderReq(message, request) => self.handle_order_req(remote, message, request),
+            Message::Commit(message) => self.handle_commit(remote, message),
             _ => unreachable!(),
+        }
+    }
+
+    fn on_signed(&mut self, id: SignedMessage) {
+        if let Message::OrderReq(message, request) = self.transport.signed_message(id).unwrap() {
+            if self.transport.config.primary(self.view_number) == self.id {
+                self.spec_commit(message.clone(), request.clone());
+            }
         }
     }
 }
 
 impl Replica {
     fn handle_request(&mut self, remote: SocketAddr, message: Request) {
+        self.routes.insert(message.client_id, remote);
         if let Some(&(request_number, spec_response)) = self.client_table.get(&message.client_id) {
             if message.request_number < request_number {
                 return;
@@ -350,6 +403,7 @@ impl Replica {
         } else {
             self.log[(self.op_number - 1) as usize].history_digest
         };
+        let history_digest = digest([previous_digest, message_digest]);
         let order_req = self.transport.sign_message(
             self.id,
             Message::OrderReq(
@@ -357,12 +411,118 @@ impl Replica {
                     view_number: self.view_number,
                     op_number: self.op_number,
                     message_digest,
-                    history_digest: digest([previous_digest, message_digest]),
+                    history_digest,
                     signature: Signature::from_compact(&[0; 32]).unwrap(),
                 },
                 message,
             ),
         );
         self.transport.send_signed_message(ToAll, order_req);
+
+        // locally speculative commit in `Receiver::on_signed`
+    }
+
+    fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Request) {
+        if message.message_digest != digest(&request) {
+            println!(
+                "! OrderReq incorrect message digest op {}",
+                message.op_number
+            );
+            return;
+        }
+        if message.view_number < self.view_number {
+            return;
+        }
+        if message.view_number > self.view_number {
+            todo!()
+        }
+
+        if message.op_number != self.op_number + 1 {
+            todo!("reorder request")
+        }
+        let previous_digest = if self.op_number == 0 {
+            Digest::default()
+        } else {
+            self.log[(self.op_number - 1) as usize].history_digest
+        };
+        if message.history_digest != digest([previous_digest, message.message_digest]) {
+            println!(
+                "! OrderReq mismatched history digest op {}",
+                message.op_number
+            );
+            return;
+        }
+
+        self.op_number += 1;
+        self.spec_commit(message, request);
+    }
+
+    fn spec_commit(&mut self, message: OrderReq, request: Request) {
+        let result = self.app.replica_upcall(self.op_number, &request.op);
+        let history_digest = message.history_digest;
+        let message_digest = message.message_digest;
+        let spec_response = self.transport.sign_message(
+            self.id,
+            Message::SpecResponse(
+                SpecResponse {
+                    view_number: self.view_number,
+                    op_number: self.op_number,
+                    result_digest: digest(&result),
+                    history_digest,
+                    client_id: request.client_id,
+                    request_number: request.request_number,
+                    signature: Signature::from_compact(&[0; 32]).unwrap(),
+                },
+                self.id,
+                result,
+                message,
+            ),
+        );
+        let client_id = request.client_id;
+        self.log.push(LogEntry {
+            view_number: self.view_number,
+            request,
+            spec_response,
+            message_digest,
+            history_digest,
+        });
+        self.transport
+            .send_signed_message(To(self.routes[&client_id]), spec_response);
+    }
+
+    fn handle_commit(&mut self, remote: SocketAddr, message: Commit) {
+        let spec_response = &message.certificate.spec_response;
+        if self.view_number > spec_response.view_number {
+            return;
+        }
+        if self.view_number < spec_response.view_number {
+            todo!()
+        }
+
+        let entry = if let Some(entry) = self.log.get_mut((spec_response.op_number - 1) as usize) {
+            entry
+        } else {
+            todo!()
+        };
+        if spec_response.history_digest != entry.history_digest {
+            todo!()
+        }
+
+        if spec_response.op_number <= self.commit_certificate.spec_response.op_number {
+            return; // should this go above the previous check?
+        }
+        self.commit_certificate = message.certificate;
+        let local_commit = self.transport.sign_message(
+            self.id,
+            Message::LocalCommit(LocalCommit {
+                view_number: self.view_number,
+                message_digest: entry.message_digest,
+                history_digest: entry.history_digest,
+                replica_id: self.id,
+                client_id: message.client_id,
+                signature: Signature::from_compact(&[0; 32]).unwrap(),
+            }),
+        );
+        self.transport.send_signed_message(To(remote), local_commit);
     }
 }

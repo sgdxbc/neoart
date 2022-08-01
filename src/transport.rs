@@ -26,12 +26,15 @@ pub trait Receiver: Sized {
         InboundAction::Allow(deserialize(buf))
     }
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
+    #[allow(unused_variables)]
+    fn on_signed(&mut self, signed_id: SignedMessage) {}
 }
 
 pub enum InboundAction<M> {
     Allow(M),
     Block,
-    Verify(M, ReplicaId),
+    VerifyReplica(M, ReplicaId),
+    Verify(M, fn(&mut M, &Config) -> bool),
     // verify multicast
 }
 
@@ -256,6 +259,7 @@ where
                             receiver.as_mut().send_message(destination, &message);
                         }
                         receiver.as_mut().signed_messages.insert(id, message);
+                        receiver.on_signed(id);
                     }
                 }
             }
@@ -267,9 +271,13 @@ where
             {
                 match receiver.inbound_action(buf) {
                     InboundAction::Allow(message) => receiver.receive_message(remote, message),
-                    InboundAction::Block => return,
-                    InboundAction::Verify(message, replica_id) => {
-                        receiver.as_mut().crypto.verify(message, replica_id)
+                    InboundAction::Block => {}
+                    InboundAction::VerifyReplica(message, replica_id) => receiver
+                        .as_mut()
+                        .crypto
+                        .verify_replica(remote, message, replica_id),
+                    InboundAction::Verify(message, verify) => {
+                        receiver.as_mut().crypto.verify(remote, message, verify)
                     }
                 }
             }
