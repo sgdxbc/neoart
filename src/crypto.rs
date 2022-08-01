@@ -1,8 +1,8 @@
-use std::{mem::replace, net::SocketAddr, sync::Arc, thread::spawn};
+use std::{mem::take, net::SocketAddr, sync::Arc, thread::spawn};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
@@ -10,7 +10,13 @@ use crate::{
     transport::{CryptoEvent, SignedMessage},
 };
 
-pub type Signature = secp256k1::ecdsa::Signature;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Signature(secp256k1::ecdsa::Signature);
+impl Default for Signature {
+    fn default() -> Self {
+        Self(secp256k1::ecdsa::Signature::from_compact(&[0; 64]).unwrap())
+    }
+}
 
 pub trait CryptoMessage: Serialize {
     fn signature_mut(&mut self) -> &mut Signature {
@@ -27,10 +33,7 @@ pub fn verify_message(message: &mut impl CryptoMessage, public_key: &PublicKey) 
         static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
     }
 
-    let signature = replace(
-        message.signature_mut(),
-        Signature::from_compact(&[0; 32]).unwrap(),
-    );
+    let Signature(signature) = take(message.signature_mut());
     let result = SECP
         .with(|secp| {
             secp.verify_ecdsa(
@@ -40,7 +43,7 @@ pub fn verify_message(message: &mut impl CryptoMessage, public_key: &PublicKey) 
             )
         })
         .is_ok();
-    *message.signature_mut() = signature;
+    *message.signature_mut() = Signature(signature);
     result
 }
 
@@ -182,7 +185,7 @@ impl<M> Crypto<M> {
         let signature = SECP.with(|secp| {
             secp.sign_ecdsa(&Message::from_slice(&message.digest()).unwrap(), secret_key)
         });
-        *message.signature_mut() = signature;
+        *message.signature_mut() = Signature(signature);
         sender
             .try_send(CryptoEvent::Signed(id, message))
             .map_err(|_| panic!())

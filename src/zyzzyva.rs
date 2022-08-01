@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    mem::replace,
+    mem::take,
     net::SocketAddr,
     pin::Pin,
     time::Duration,
@@ -13,8 +13,8 @@ use tokio::sync::oneshot;
 use crate::{
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
-        deserialize, digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber,
-        ViewNumber,
+        deserialize, digest, random_id, ClientId, Config, Digest, OpNumber, ReplicaId,
+        RequestNumber, ViewNumber,
     },
     transport::{
         Destination::{To, ToAll},
@@ -39,7 +39,7 @@ pub struct Request {
     op: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrderReq {
     view_number: ViewNumber,
     op_number: OpNumber,
@@ -49,7 +49,7 @@ pub struct OrderReq {
     signature: Signature,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SpecResponse {
     view_number: ViewNumber,
     op_number: OpNumber,
@@ -66,7 +66,7 @@ pub struct Commit {
     certificate: CommitCertificate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CommitCertificate {
     spec_response: SpecResponse, // signature cleared
     signatures: Vec<(ReplicaId, Signature)>,
@@ -151,6 +151,18 @@ struct Invoke {
     timer_id: u32,
 }
 
+impl Client {
+    pub fn new(transport: Transport<Self>) -> Self {
+        Self {
+            transport,
+            id: random_id(),
+            request_number: 0,
+            invoke: None,
+            view_number: 0,
+        }
+    }
+}
+
 impl AsMut<Transport<Self>> for Client {
     fn as_mut(&mut self) -> &mut Transport<Self> {
         &mut self.transport
@@ -167,23 +179,11 @@ impl crate::Client for Client {
             op: op.to_vec(),
         };
         let (continuation, result) = oneshot::channel();
-        let spec_response = SpecResponse {
-            view_number: 0,
-            op_number: 0,
-            history_digest: Digest::default(),
-            result_digest: Digest::default(),
-            client_id: ClientId::default(),
-            request_number: 0,
-            signature: Signature::from_compact(&[0; 32]).unwrap(),
-        };
         self.invoke = Some(Invoke {
             request,
             timer_id: 0,
             continuation,
-            certificate: CommitCertificate {
-                spec_response,
-                signatures: Vec::new(),
-            },
+            certificate: CommitCertificate::default(),
             local_committed: HashSet::new(),
             result: Vec::new(),
         });
@@ -223,10 +223,7 @@ impl Client {
             return;
         };
 
-        let signature = replace(
-            &mut message.signature,
-            Signature::from_compact(&[0; 32]).unwrap(),
-        );
+        let signature = take(&mut message.signature);
         if invoke.certificate.signatures.is_empty() {
             invoke.certificate.spec_response = message;
             invoke.result = result;
@@ -279,8 +276,7 @@ impl Client {
         let invoke = self.invoke.as_mut().unwrap();
         if invoke.certificate.signatures.len() < self.transport.config.f * 2 + 1 {
             // timer not set already => this is not a resending
-            // force broadcasting first request to let replicas learn routing
-            if invoke.timer_id == 0 && self.request_number > 1 {
+            if invoke.timer_id == 0 {
                 let primary = self.transport.config.primary(self.view_number);
                 self.transport.send_message(
                     To(self.transport.config.replicas[primary as usize]),
@@ -342,6 +338,28 @@ struct LogEntry {
     history_digest: Digest,
 }
 
+impl Replica {
+    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
+        Self {
+            transport,
+            id,
+            view_number: 0,
+            op_number: 0,
+            app: Box::new(app),
+            client_table: HashMap::new(),
+            routes: HashMap::new(),
+            log: Vec::new(),
+            commit_certificate: CommitCertificate::default(),
+        }
+    }
+}
+
+impl AsMut<Transport<Self>> for Replica {
+    fn as_mut(&mut self) -> &mut Transport<Self> {
+        &mut self.transport
+    }
+}
+
 impl Receiver for Replica {
     type Message = Message;
 
@@ -354,7 +372,7 @@ impl Receiver for Replica {
             }
             Message::Commit(_) => InboundAction::Verify(message, Message::verify_commit),
             _ => {
-                println!("! unexpected {message:?}");
+                println!("! [{}] unexpected {message:?}", self.id);
                 InboundAction::Block
             }
         }
@@ -412,7 +430,7 @@ impl Replica {
                     op_number: self.op_number,
                     message_digest,
                     history_digest,
-                    signature: Signature::from_compact(&[0; 32]).unwrap(),
+                    signature: Signature::default(),
                 },
                 message,
             ),
@@ -471,7 +489,7 @@ impl Replica {
                     history_digest,
                     client_id: request.client_id,
                     request_number: request.request_number,
-                    signature: Signature::from_compact(&[0; 32]).unwrap(),
+                    signature: Signature::default(),
                 },
                 self.id,
                 result,
@@ -479,6 +497,7 @@ impl Replica {
             ),
         );
         let client_id = request.client_id;
+        let request_number = request.request_number;
         self.log.push(LogEntry {
             view_number: self.view_number,
             request,
@@ -486,8 +505,13 @@ impl Replica {
             message_digest,
             history_digest,
         });
-        self.transport
-            .send_signed_message(To(self.routes[&client_id]), spec_response);
+        // is this SpecResponse always up to date?
+        self.client_table
+            .insert(client_id, (request_number, spec_response));
+        if let Some(&remote) = self.routes.get(&client_id) {
+            self.transport
+                .send_signed_message(To(remote), spec_response);
+        }
     }
 
     fn handle_commit(&mut self, remote: SocketAddr, message: Commit) {
@@ -520,9 +544,64 @@ impl Replica {
                 history_digest: entry.history_digest,
                 replica_id: self.id,
                 client_id: message.client_id,
-                signature: Signature::from_compact(&[0; 32]).unwrap(),
+                signature: Signature::default(),
             }),
         );
         self.transport.send_signed_message(To(remote), local_commit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use crate::{
+        crypto::ExecutorSetting,
+        meta::ReplicaId,
+        transport::{Concurrent, Run, SimulatedNetwork, TestApp, Transport},
+        zyzzyva::{Client, Replica},
+        Client as _,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn single_op() {
+        let config = SimulatedNetwork::config(4, 1);
+        let mut net = SimulatedNetwork::default();
+        let replicas = (0..4)
+            .map(|i| {
+                Concurrent::run(Replica::new(
+                    Transport::new(
+                        config.clone(),
+                        net.insert_socket(config.replicas[i]),
+                        ExecutorSetting::Inline,
+                    ),
+                    i as ReplicaId,
+                    TestApp::default(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut client = Client::new(Transport::new(
+            config.clone(),
+            net.insert_socket(SimulatedNetwork::client(0)),
+            ExecutorSetting::Inline,
+        ));
+
+        let net = Concurrent::run(net);
+        let result = client.invoke("hello".as_bytes());
+        timeout(
+            Duration::from_millis(1020),
+            client.run(async {
+                assert_eq!(&result.await, "[1] hello".as_bytes());
+            }),
+        )
+        .await
+        .unwrap();
+
+        for replica in replicas {
+            assert_eq!(replica.join().await.log.len(), 1);
+        }
+        net.join().await;
     }
 }

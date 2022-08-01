@@ -196,7 +196,7 @@ impl Receiver for Replica {
             Message::Reply(Reply {
                 request_number: message.request_number,
                 result,
-                signature: Signature::from_compact(&[0; 64]).unwrap(),
+                signature: Signature::default(),
             }),
         );
         self.log.push(LogEntry {
@@ -223,7 +223,7 @@ mod tests {
     use super::{Client, Replica};
 
     #[tokio::test(start_paused = true)]
-    async fn test_single_op() {
+    async fn single_op() {
         let config = SimulatedNetwork::config(1, 0);
         let mut net = SimulatedNetwork::default();
         let replica = Replica::new(

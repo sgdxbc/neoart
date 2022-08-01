@@ -1,3 +1,57 @@
+//! Transport abstracts underlying details away from protocol implementations,
+//! including packet receving and sending, timer management, and efficiently
+//! signing and verifying messages with cryptographic.
+//!
+//! The abstraction is basically following specpaxos codebase. The struct
+//! `Transport` interacts with types that implement `Receiver` in the same way,
+//! as `Transport` and `TransportReceiver` in spexpaxos. The following describes
+//! significant modifications.
+//!
+//! The original model requires circular mutable references between every
+//! receiver and its transport, which is quite awkward in Rust semantic. Instead
+//! of one shared transport, in NeoArt every `Receiver` should own a
+//! `Transport`. The OS transport is fine to be separated, while the simulated
+//! transports need to be connected with each other for packet passing. This is
+//! solved by `SimulatedNetwork`.
+//!
+//! This codebase follows asynchronized programming model. There is no single
+//! `transport.run()` as main event loop (there is no single transport already),
+//! instead main event loop should be provided by underlying async framework,
+//! i.e. Tokio. All `Transport`, `Receiver` and `SimulatedNetwork` implement
+//! `Run` trait, which has an async `run` method that enables cooperation. The
+//! `Concurrent` wrapper is provided to simplify spawning and joining.
+//!
+//! A client-side receiver should implement both `Run` and `Client`. Notice that
+//! `Client::invoke` method is not an async method, but instead return a
+//! `Future`, so it will not "contest" with `Run::run` for `&mut self`. A simple
+//! demostration to run a client until invocation is done:
+//! ```
+//! let result;
+//! let result_f = client.invoke("my operation".as_bytes());
+//! client.run(async { result = result_f.await; }).await;
+//! ```
+//!
+//! The `Crypto` is intergrated into `Transport` through two sets of interfaces
+//! for inbound and outbound messages. Every inbound message must go through
+//! verification, where exact policy is returned by `Receiver::inbound_action`.
+//! A replica message basically can be verified by `VerifyReplica` while
+//! `Verify` can be used for customization.
+//!
+//! The outbound interface is `Transport::sign_message` which returns a
+//! `SignedMessage`, which represents a `Receiver::Message` that has been
+//! submitted for signing. The message will be stored by transport, and be
+//! asynchronized signed. `Transport::signed_message` returns `None` before the
+//! signing is finished. If certain action is required after the message is
+//! signed, it could be put in `Receiver::on_signed`, where it is safe to
+//! `unwrap` the result of `signed_message`. It is a common operation to send
+//! signed message after signing, so it has been built into transport as
+//! `Transport::send_signed_message` method.
+//!
+//! `Crypto`'s executor has `Inline` and `Rayon` variants. The `Inline` executor
+//! finishes cryptographic task on current thread before returning from calling,
+//! so e.g. `signed_message` never returns `None`. It is suitable for testing,
+//! and client which doesn't actually do any signing or verifying. `Rayon`
+//! executor uses a Rayon thread pool and is suitable for benchmarking.
 use std::{
     borrow::Borrow, collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin,
     sync::Arc, time::Duration,
@@ -108,7 +162,14 @@ impl<T: Receiver> Transport<T> {
     fn send_message_interal(socket: &Socket, destinations: &[SocketAddr], message: impl Serialize) {
         let mut buf = [0; 1400];
         let len = serialize(&mut buf, message);
+        let local = match socket {
+            Socket::Os(socket) => socket.local_addr().unwrap(),
+            &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,
+        };
         for &destination in destinations {
+            if destination == local {
+                continue;
+            }
             match socket {
                 Socket::Os(socket) => {
                     socket.try_send_to(&buf[..len], destination).unwrap();
@@ -288,6 +349,7 @@ where
 pub struct SimulatedNetwork {
     send_channel: (mpsc::Sender<Message>, mpsc::Receiver<Message>),
     inboxes: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    epoch: Instant,
 }
 
 struct Message {
@@ -301,6 +363,7 @@ impl Default for SimulatedNetwork {
         Self {
             send_channel: mpsc::channel(64),
             inboxes: HashMap::new(),
+            epoch: Instant::now(),
         }
     }
 }
@@ -359,11 +422,12 @@ impl SimulatedNetwork {
         // TODO filter
         let inbox = self.inboxes[&message.destination].clone();
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));
+        let epoch = self.epoch;
         spawn(async move {
             sleep(delay).await;
             println!(
                 "* [{:?}] [{} -> {}] message length {}",
-                Instant::now(),
+                Instant::now() - epoch,
                 message.source,
                 message.destination,
                 message.buf.len()
