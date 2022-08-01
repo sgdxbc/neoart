@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    crypto::{Crypto, ExecutorSetting, Signature},
+    crypto::{Crypto, CryptoTask, ExecutorSetting, Signature},
     meta::{deserialize, random_id, serialize, ClientId, OpNumber, ReplicaId, RequestNumber},
     transport::{Receiver, Transport},
     App,
@@ -119,7 +119,7 @@ pub struct Replica {
     crypto: Crypto<Self>,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, Reply>,
+    client_table: HashMap<ClientId, (RequestNumber, Option<Reply>)>,
     log: Vec<LogEntry>,
 }
 
@@ -155,13 +155,15 @@ impl Receiver for Replica {
 
     fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]) {
         let message: Request = deserialize(buf);
-        if let Some(reply) = self.client_table.get(&message.client_id) {
-            if reply.request_number > message.request_number {
+        if let Some((request_number, reply)) = self.client_table.get(&message.client_id) {
+            if request_number > &message.request_number {
                 return;
             }
-            if reply.request_number == message.request_number {
-                self.transport
-                    .send_message(remote, |buf| serialize(buf, reply));
+            if request_number == &message.request_number {
+                if let Some(reply) = reply {
+                    self.transport
+                        .send_message(remote, |buf| serialize(buf, reply));
+                }
                 return;
             }
         }
@@ -181,13 +183,23 @@ impl Receiver for Replica {
 
         let client_id = message.client_id;
         let op_number = self.op_number;
-        self.crypto.sign(reply, move |receiver, reply| {
-            receiver.log[op_number as usize - 1].reply = Some(reply.clone());
-            receiver.client_table.insert(client_id, reply.clone());
-            receiver
-                .transport
-                .send_message(remote, |buf| serialize(buf, reply));
-        });
+        self.crypto
+            .submit(CryptoTask::Sign, reply, move |receiver, reply| {
+                receiver.log[op_number as usize - 1].reply = Some(reply.clone());
+                if receiver
+                    .client_table
+                    .get(&client_id)
+                    .map(|&(request_number, _)| request_number < reply.request_number)
+                    .unwrap_or(true)
+                {
+                    receiver
+                        .client_table
+                        .insert(client_id, (reply.request_number, Some(reply.clone())));
+                }
+                receiver
+                    .transport
+                    .send_message(remote, |buf| serialize(buf, reply));
+            });
     }
 
     type SignedMessage = Reply;

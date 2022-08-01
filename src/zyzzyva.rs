@@ -1,14 +1,22 @@
-use std::{collections::HashSet, future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    crypto::Signature,
+    crypto::{Crypto, CryptoTask, Signature},
     meta::{
-        deserialize, serialize, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
+        deserialize, digest, serialize, ClientId, Digest, OpNumber, ReplicaId, RequestNumber,
+        ViewNumber,
     },
     transport::{Receiver, Transport},
+    App,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +40,7 @@ struct Request {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OrderReq {
+pub struct OrderReq {
     view_number: ViewNumber,
     op_number: OpNumber,
     history_digest: Digest,
@@ -42,7 +50,7 @@ struct OrderReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SpecResponse {
+pub struct SpecResponse {
     view_number: ViewNumber,
     op_number: OpNumber,
     history_digest: Digest,
@@ -65,7 +73,7 @@ struct CommitCertificate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LocalCommit {
+pub struct LocalCommit {
     view_number: ViewNumber,
     message_digest: Digest,
     history_digest: Digest,
@@ -251,5 +259,111 @@ impl Client {
         invoke.timer_id = self
             .transport
             .create_timer(Duration::from_secs(1), on_resend);
+    }
+}
+
+pub struct Replica {
+    transport: Transport<Self>,
+    crypto: Crypto<Self>,
+    id: ReplicaId,
+    view_number: ViewNumber,
+    op_number: OpNumber,
+    app: Box<dyn App + Send>,
+    client_table: HashMap<ClientId, (RequestNumber, Option<ToClient>)>, // always SpecResponse
+    log: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LogEntry {
+    view_number: ViewNumber,
+    request: Request,
+    spec_response: SpecResponse,
+    speculative: bool,
+    history_digest: Digest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SignedMessage {
+    OrderReq(OrderReq),
+    SpecResponse(SpecResponse),
+    LocalCommit(LocalCommit),
+}
+
+impl Receiver for Replica {
+    type SignedMessage = SignedMessage;
+
+    fn signature(message: &Self::SignedMessage) -> &Signature {
+        match message {
+            SignedMessage::OrderReq(message) => &message.signature,
+            SignedMessage::SpecResponse(message) => &message.signature,
+            SignedMessage::LocalCommit(message) => &message.signature,
+        }
+    }
+
+    fn set_signature(message: &mut Self::SignedMessage, signature: Signature) {
+        match message {
+            SignedMessage::OrderReq(message) => message.signature = signature,
+            SignedMessage::SpecResponse(message) => message.signature = signature,
+            SignedMessage::LocalCommit(message) => message.signature = signature,
+        }
+    }
+
+    fn transport(&mut self) -> &mut Transport<Self> {
+        &mut self.transport
+    }
+
+    fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]) {
+        match deserialize(buf) {
+            ToReplica::Request(message) => self.handle_request(remote, message),
+            ToReplica::OrderReq(message, request) => todo!(),
+            ToReplica::Commit(message) => todo!(),
+        }
+    }
+}
+
+impl Replica {
+    fn handle_request(&mut self, remote: SocketAddr, message: Request) {
+        if let Some((request_number, spec_response)) = self.client_table.get(&message.client_id) {
+            if &message.request_number < request_number {
+                return;
+            }
+            if &message.request_number == request_number {
+                if let Some(spec_response) = spec_response {
+                    self.transport
+                        .send_message(remote, |buf| serialize(buf, spec_response));
+                }
+                return;
+            }
+        }
+
+        if self.transport.config.primary(self.view_number) != self.id {
+            todo!()
+        }
+
+        self.op_number += 1;
+        let message_digest = digest(&message);
+        let previous_digest = if self.op_number == 1 {
+            Digest::default()
+        } else {
+            self.log[(self.op_number - 1) as usize].history_digest
+        };
+        let order_req = OrderReq {
+            view_number: self.view_number,
+            op_number: self.op_number,
+            message_digest,
+            history_digest: digest([previous_digest, message_digest]),
+            signature: Signature::from_compact(&[0; 32]).unwrap(),
+        };
+        self.crypto.submit(
+            CryptoTask::Sign,
+            SignedMessage::OrderReq(order_req),
+            |receiver: &mut Self, message| {
+                if let SignedMessage::OrderReq(message) = message {
+                    receiver
+                        .transport
+                        .send_message_to_all(|buf| serialize(buf, message));
+                }
+            },
+        );
     }
 }

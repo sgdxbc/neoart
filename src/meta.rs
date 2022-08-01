@@ -2,7 +2,7 @@ use std::{convert::Infallible, io::Read, net::SocketAddr, str::FromStr};
 
 use bincode::Options;
 use rand::random;
-use secp256k1::{KeyPair, Secp256k1};
+use secp256k1::{hashes::sha256, KeyPair, Message, Secp256k1};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub type ClientId = [u8; 4];
@@ -29,6 +29,11 @@ pub fn serialize(mut buf: &mut [u8], message: impl Serialize) -> usize {
         .serialize_into(&mut buf, &message)
         .unwrap();
     len - buf.len()
+}
+
+pub fn digest(message: impl Serialize) -> Digest {
+    *Message::from_hashed_data::<sha256::Hash>(&bincode::options().serialize(&message).unwrap())
+        .as_ref()
 }
 
 #[derive(Debug, Clone)]

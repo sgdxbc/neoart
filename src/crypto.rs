@@ -1,15 +1,12 @@
 use std::thread::spawn;
 
-use bincode::Options;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use secp256k1::{
-    hashes::sha256, KeyPair, Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly,
-};
+use secp256k1::{KeyPair, Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
 use crate::{
-    meta::ReplicaId,
+    meta::{digest, ReplicaId},
     transport::{CryptoEvent, Receiver, Transport},
 };
 
@@ -57,26 +54,48 @@ impl<T: Receiver> Crypto<T> {
             executor,
         }
     }
+}
 
-    pub fn sign(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoTask {
+    Sign,
+    Verify(ReplicaId),
+    // multicast
+}
+
+impl<T: Receiver> Crypto<T> {
+    pub fn submit(
         &mut self,
+        task: CryptoTask,
         message: T::SignedMessage,
         on_message: impl FnOnce(&mut T, T::SignedMessage) + Send + 'static,
     ) where
         T::SignedMessage: Serialize + Send + 'static,
         T: 'static,
     {
-        match &self.executor {
-            Executor::Inline => Self::sign_task(
+        match (&self.executor, task) {
+            (Executor::Inline, CryptoTask::Sign) => Self::sign_task(
                 message,
                 on_message,
                 &self.keys[self.replica_id as usize].secret_key(),
                 &self.sender,
             ),
-            Executor::Rayon(executor) => {
+            (Executor::Inline, CryptoTask::Verify(id)) => Self::verify_task(
+                message,
+                on_message,
+                &self.keys[id as usize].public_key(),
+                &self.sender,
+            ),
+            (Executor::Rayon(executor), CryptoTask::Sign) => {
                 let secret_key = self.keys[self.replica_id as usize].secret_key();
                 let sender = self.sender.clone();
-                executor.spawn(move || Self::sign_task(message, on_message, &secret_key, &sender))
+                executor.spawn(move || Self::sign_task(message, on_message, &secret_key, &sender));
+            }
+            (Executor::Rayon(executor), CryptoTask::Verify(id)) => {
+                let public_key = self.keys[id as usize].public_key();
+                let sender = self.sender.clone();
+                executor
+                    .spawn(move || Self::verify_task(message, on_message, &public_key, &sender));
             }
         }
     }
@@ -92,39 +111,14 @@ impl<T: Receiver> Crypto<T> {
         thread_local! {
             static SECP: Secp256k1<SignOnly> = Secp256k1::signing_only();
         }
-        let digest = Message::from_hashed_data::<sha256::Hash>(
-            &bincode::options().serialize(&message).unwrap(),
-        );
-        let signature = SECP.with(|secp| secp.sign_ecdsa(&digest, secret_key));
+        let signature = SECP.with(|secp| {
+            secp.sign_ecdsa(&Message::from_slice(&digest(&message)).unwrap(), secret_key)
+        });
         T::set_signature(&mut message, signature);
         sender
             .try_send((message, Box::new(on_message)))
             .map_err(|_| panic!())
             .unwrap();
-    }
-
-    pub fn verify(
-        &mut self,
-        message: T::SignedMessage,
-        id: ReplicaId,
-        on_message: impl FnOnce(&mut T, T::SignedMessage) + Send + 'static,
-    ) where
-        T::SignedMessage: Serialize + Send + 'static,
-        T: 'static,
-    {
-        match &self.executor {
-            Executor::Inline => Self::verify_task(
-                message,
-                on_message,
-                &self.keys[id as usize].public_key(),
-                &self.sender,
-            ),
-            Executor::Rayon(executor) => {
-                let public_key = self.keys[id as usize].public_key();
-                let sender = self.sender.clone();
-                executor.spawn(move || Self::verify_task(message, on_message, &public_key, &sender))
-            }
-        }
     }
 
     fn verify_task(
@@ -138,11 +132,14 @@ impl<T: Receiver> Crypto<T> {
         thread_local! {
             static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
         }
-        let digest = Message::from_hashed_data::<sha256::Hash>(
-            &bincode::options().serialize(&message).unwrap(),
-        );
         if SECP
-            .with(|secp| secp.verify_ecdsa(&digest, T::signature(&message), public_key))
+            .with(|secp| {
+                secp.verify_ecdsa(
+                    &Message::from_slice(&digest(&message)).unwrap(),
+                    T::signature(&message),
+                    public_key,
+                )
+            })
             .is_ok()
         {
             sender
