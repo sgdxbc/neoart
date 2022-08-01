@@ -26,9 +26,18 @@ pub struct Reply {
     signature: Signature,
 }
 
-impl AsMut<Signature> for Reply {
-    fn as_mut(&mut self) -> &mut Signature {
-        &mut self.signature
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Message {
+    Request(Request),
+    Reply(Reply),
+}
+
+impl CryptoMessage for Message {
+    fn signature_mut(&mut self) -> &mut Signature {
+        match self {
+            Self::Request(_) => unreachable!(),
+            Self::Reply(Reply { signature, .. }) => signature,
+        }
     }
 }
 
@@ -83,10 +92,14 @@ impl crate::Client for Client {
 }
 
 impl Receiver for Client {
-    type InboundMessage = Reply;
-    type OutboundMessage = Request;
+    type Message = Message;
 
-    fn receive_message(&mut self, _remote: SocketAddr, message: Self::InboundMessage) {
+    fn receive_message(&mut self, _remote: SocketAddr, message: Self::Message) {
+        let message = if let Message::Reply(message) = message {
+            message
+        } else {
+            unreachable!()
+        };
         if self.invoke.is_none() {
             return;
         }
@@ -103,7 +116,8 @@ impl Client {
     fn send_request(&mut self) {
         let replica = self.transport.config.replicas[0];
         let request = &self.invoke.as_ref().unwrap().request;
-        self.transport.send_message(To(replica), request);
+        self.transport
+            .send_message(To(replica), Message::Request(request.clone()));
         let request_number = request.request_number;
         let on_resend = move |receiver: &mut Self| {
             assert_eq!(
@@ -157,10 +171,14 @@ impl AsMut<Transport<Self>> for Replica {
 }
 
 impl Receiver for Replica {
-    type InboundMessage = Request;
-    type OutboundMessage = Reply;
+    type Message = Message;
 
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::InboundMessage) {
+    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
+        let message = if let Message::Request(message) = message {
+            message
+        } else {
+            unreachable!()
+        };
         if let Some(&(request_number, reply)) = self.client_table.get(&message.client_id) {
             if request_number > message.request_number {
                 return;
@@ -175,11 +193,11 @@ impl Receiver for Replica {
         let result = self.app.replica_upcall(self.op_number, &message.op);
         let reply = self.transport.sign_message(
             0,
-            Reply {
+            Message::Reply(Reply {
                 request_number: message.request_number,
                 result,
                 signature: Signature::from_compact(&[0; 64]).unwrap(),
-            },
+            }),
         );
         self.log.push(LogEntry {
             request: message.clone(),

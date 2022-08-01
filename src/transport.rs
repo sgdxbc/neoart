@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin, sync::Arc,
-    time::Duration,
+    borrow::Borrow, collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin,
+    sync::Arc, time::Duration,
 };
 
 use async_trait::async_trait;
@@ -21,12 +21,11 @@ use crate::{
 };
 
 pub trait Receiver: Sized {
-    type InboundMessage: Send + 'static + DeserializeOwned;
-    type OutboundMessage: Send + 'static;
-    fn inbound_action(buf: &[u8]) -> InboundAction<Self::InboundMessage> {
+    type Message: Send + 'static + DeserializeOwned;
+    fn inbound_action(&self, buf: &[u8]) -> InboundAction<Self::Message> {
         InboundAction::Allow(deserialize(buf))
     }
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::InboundMessage);
+    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
 }
 
 pub enum InboundAction<M> {
@@ -38,12 +37,12 @@ pub enum InboundAction<M> {
 
 pub struct Transport<T: Receiver> {
     pub config: Config,
-    crypto: Crypto<T::InboundMessage, T::OutboundMessage>,
-    crypto_channel: mpsc::Receiver<CryptoEvent<T::InboundMessage, T::OutboundMessage>>,
+    crypto: Crypto<T::Message>,
+    crypto_channel: mpsc::Receiver<CryptoEvent<T::Message>>,
     socket: Socket,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
-    signed_messages: HashMap<SignedMessage, T::OutboundMessage>,
+    signed_messages: HashMap<SignedMessage, T::Message>,
     signed_id: u32,
     send_signed: HashMap<SignedMessage, Destination>,
 }
@@ -54,9 +53,9 @@ pub enum Destination {
     ToAll,
 }
 
-pub enum CryptoEvent<V, S> {
-    Verified(SocketAddr, V),
-    Signed(SignedMessage, S),
+pub enum CryptoEvent<M> {
+    Verified(SocketAddr, M),
+    Signed(SignedMessage, M),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -125,18 +124,25 @@ impl<T: Receiver> Transport<T> {
         }
     }
 
-    pub fn send_message(&self, destination: Destination, message: impl Serialize) {
+    pub fn send_message(&self, destination: Destination, message: impl Borrow<T::Message>)
+    where
+        T::Message: Serialize,
+    {
         match destination {
-            Destination::To(addr) => Self::send_message_interal(&self.socket, &[addr], message),
-            Destination::ToAll => {
-                Self::send_message_interal(&self.socket, &self.config.replicas[..], message)
+            Destination::To(addr) => {
+                Self::send_message_interal(&self.socket, &[addr], message.borrow())
             }
+            Destination::ToAll => Self::send_message_interal(
+                &self.socket,
+                &self.config.replicas[..],
+                message.borrow(),
+            ),
         }
     }
 
     pub fn send_signed_message(&mut self, destination: Destination, message: SignedMessage)
     where
-        T::OutboundMessage: Serialize,
+        T::Message: Serialize,
     {
         if let Some(message) = self.signed_message(message) {
             self.send_message(destination, message);
@@ -173,9 +179,9 @@ impl<T: Receiver> Transport<T> {
         self.timer_table.remove(&id);
     }
 
-    pub fn sign_message(&mut self, id: ReplicaId, message: T::OutboundMessage) -> SignedMessage
+    pub fn sign_message(&mut self, id: ReplicaId, message: T::Message) -> SignedMessage
     where
-        T::OutboundMessage: CryptoMessage + Send + 'static,
+        T::Message: CryptoMessage + Send + 'static,
     {
         self.signed_id += 1;
         let signed_id = SignedMessage(self.signed_id);
@@ -183,7 +189,7 @@ impl<T: Receiver> Transport<T> {
         signed_id
     }
 
-    pub fn signed_message(&self, id: SignedMessage) -> Option<&T::OutboundMessage> {
+    pub fn signed_message(&self, id: SignedMessage) -> Option<&T::Message> {
         self.signed_messages.get(&id)
     }
 }
@@ -210,8 +216,7 @@ pub trait Run {
 impl<T> Run for T
 where
     T: Receiver + AsMut<Transport<T>> + Send,
-    T::InboundMessage: CryptoMessage,
-    T::OutboundMessage: Serialize,
+    T::Message: CryptoMessage,
 {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
@@ -237,12 +242,10 @@ where
                 }
             }
 
-            fn handle_crypto_event<T>(
-                receiver: &mut T,
-                event: CryptoEvent<T::InboundMessage, T::OutboundMessage>,
-            ) where
+            fn handle_crypto_event<T>(receiver: &mut T, event: CryptoEvent<T::Message>)
+            where
                 T: Receiver + AsMut<Transport<T>>,
-                T::OutboundMessage: Serialize,
+                T::Message: Serialize,
             {
                 match event {
                     CryptoEvent::Verified(remote, message) => {
@@ -260,9 +263,9 @@ where
             fn handle_raw_message<T>(receiver: &mut T, remote: SocketAddr, buf: &[u8])
             where
                 T: Receiver + AsMut<Transport<T>>,
-                T::InboundMessage: CryptoMessage + Send + 'static,
+                T::Message: CryptoMessage + Send + 'static,
             {
-                match T::inbound_action(buf) {
+                match receiver.inbound_action(buf) {
                     InboundAction::Allow(message) => receiver.receive_message(remote, message),
                     InboundAction::Block => return,
                     InboundAction::Verify(message, replica_id) => {

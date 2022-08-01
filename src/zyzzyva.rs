@@ -10,30 +10,26 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    crypto::{Crypto, CryptoTask, Signature},
-    meta::{
-        deserialize, digest, serialize, ClientId, Digest, OpNumber, ReplicaId, RequestNumber,
-        ViewNumber,
+    crypto::{CryptoMessage, Signature},
+    meta::{deserialize, digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber},
+    transport::{
+        Destination::{To, ToAll},
+        InboundAction, Receiver, SignedMessage, Transport,
     },
-    transport::{Receiver, Transport},
     App,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum ToReplica {
+pub enum Message {
     Request(Request),
     OrderReq(OrderReq, Request),
-    Commit(Commit),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum ToClient {
     SpecResponse(SpecResponse, ReplicaId, Vec<u8>, OrderReq),
+    Commit(Commit),
     LocalCommit(LocalCommit),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Request {
+pub struct Request {
     client_id: ClientId,
     request_number: RequestNumber,
     op: Vec<u8>,
@@ -61,7 +57,7 @@ pub struct SpecResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Commit {
+pub struct Commit {
     client_id: ClientId,
     certificate: CommitCertificate,
 }
@@ -82,6 +78,25 @@ pub struct LocalCommit {
     signature: Signature,
 }
 
+impl CryptoMessage for Message {
+    fn signature_mut(&mut self) -> &mut Signature {
+        match self {
+            Self::OrderReq(OrderReq { signature, .. }, _)
+            | Self::SpecResponse(SpecResponse { signature, .. }, ..)
+            | Self::LocalCommit(LocalCommit { signature, .. }) => signature,
+            _ => unreachable!(),
+        }
+    }
+
+    fn digest(&self) -> Digest {
+        match self {
+            Self::OrderReq(message, _) => digest(message),
+            Self::SpecResponse(message, ..) => digest(message),
+            message => digest(message),
+        }
+    }
+}
+
 pub struct Client {
     transport: Transport<Self>,
     id: ClientId,
@@ -97,6 +112,12 @@ struct Invoke {
     local_committed: HashSet<ReplicaId>,
     continuation: oneshot::Sender<Vec<u8>>,
     timer_id: u32,
+}
+
+impl AsMut<Transport<Self>> for Client {
+    fn as_mut(&mut self) -> &mut Transport<Self> {
+        &mut self.transport
+    }
 }
 
 impl crate::Client for Client {
@@ -135,17 +156,15 @@ impl crate::Client for Client {
 }
 
 impl Receiver for Client {
-    type SignedMessage = ();
-    fn transport(&mut self) -> &mut Transport<Self> {
-        &mut self.transport
-    }
+    type Message = Message;
 
-    fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]) {
-        match deserialize(buf) {
-            ToClient::SpecResponse(message, replica_id, result, _) => {
+    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
+        match message {
+            Message::SpecResponse(message, replica_id, result, _) => {
                 self.handle_spec_response(remote, message, replica_id, result)
             }
-            ToClient::LocalCommit(message) => self.handle_local_commit(message),
+            Message::LocalCommit(message) => self.handle_local_commit(message),
+            _ => unreachable!(),
         }
     }
 }
@@ -222,13 +241,13 @@ impl Client {
             // timer not set already => this is not a resending
             if invoke.timer_id == 0 {
                 let primary = self.transport.config.primary(self.view_number);
-                self.transport
-                    .send_message(self.transport.config.replicas[primary as usize], |buf| {
-                        serialize(buf, &invoke.request)
-                    });
+                self.transport.send_message(
+                    To(self.transport.config.replicas[primary as usize]),
+                    Message::Request(invoke.request.clone()),
+                );
             } else {
                 self.transport
-                    .send_message_to_all(|buf| serialize(buf, &invoke.request));
+                    .send_message(ToAll, Message::Request(invoke.request.clone()));
             }
         } else {
             let commit = Commit {
@@ -239,8 +258,7 @@ impl Client {
                         .to_vec(),
                 },
             };
-            self.transport
-                .send_message_to_all(|buf| serialize(buf, commit));
+            self.transport.send_message(ToAll, Message::Commit(commit));
         }
 
         let request_number = self.request_number;
@@ -264,12 +282,11 @@ impl Client {
 
 pub struct Replica {
     transport: Transport<Self>,
-    crypto: Crypto<Self>,
     id: ReplicaId,
     view_number: ViewNumber,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, (RequestNumber, Option<ToClient>)>, // always SpecResponse
+    client_table: HashMap<ClientId, (RequestNumber, SignedMessage)>, // always SpecResponse
     log: Vec<LogEntry>,
 }
 
@@ -282,56 +299,42 @@ struct LogEntry {
     history_digest: Digest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SignedMessage {
-    OrderReq(OrderReq),
-    SpecResponse(SpecResponse),
-    LocalCommit(LocalCommit),
-}
-
 impl Receiver for Replica {
-    type SignedMessage = SignedMessage;
+    type Message = Message;
 
-    fn signature(message: &Self::SignedMessage) -> &Signature {
+    fn inbound_action(&self, buf: &[u8]) -> InboundAction<Self::Message> {
+        let message = deserialize(buf);
         match message {
-            SignedMessage::OrderReq(message) => &message.signature,
-            SignedMessage::SpecResponse(message) => &message.signature,
-            SignedMessage::LocalCommit(message) => &message.signature,
+            Message::Request(_) | Message::Commit(_) => InboundAction::Allow(message),
+            Message::OrderReq(OrderReq { view_number, .. }, _) => {
+                InboundAction::Verify(message, self.transport.config.primary(view_number))
+            }
+            _ => {
+                println!("! unexpected {message:?}");
+                InboundAction::Block
+            }
         }
     }
 
-    fn set_signature(message: &mut Self::SignedMessage, signature: Signature) {
+    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
         match message {
-            SignedMessage::OrderReq(message) => message.signature = signature,
-            SignedMessage::SpecResponse(message) => message.signature = signature,
-            SignedMessage::LocalCommit(message) => message.signature = signature,
-        }
-    }
-
-    fn transport(&mut self) -> &mut Transport<Self> {
-        &mut self.transport
-    }
-
-    fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]) {
-        match deserialize(buf) {
-            ToReplica::Request(message) => self.handle_request(remote, message),
-            ToReplica::OrderReq(message, request) => todo!(),
-            ToReplica::Commit(message) => todo!(),
+            Message::Request(message) => self.handle_request(remote, message),
+            Message::OrderReq(message, request) => todo!(),
+            Message::Commit(message) => todo!(),
+            _ => unreachable!(),
         }
     }
 }
 
 impl Replica {
     fn handle_request(&mut self, remote: SocketAddr, message: Request) {
-        if let Some((request_number, spec_response)) = self.client_table.get(&message.client_id) {
-            if &message.request_number < request_number {
+        if let Some(&(request_number, spec_response)) = self.client_table.get(&message.client_id) {
+            if message.request_number < request_number {
                 return;
             }
-            if &message.request_number == request_number {
-                if let Some(spec_response) = spec_response {
-                    self.transport
-                        .send_message(remote, |buf| serialize(buf, spec_response));
-                }
+            if message.request_number == request_number {
+                self.transport
+                    .send_signed_message(To(remote), spec_response);
                 return;
             }
         }
@@ -347,23 +350,19 @@ impl Replica {
         } else {
             self.log[(self.op_number - 1) as usize].history_digest
         };
-        let order_req = OrderReq {
-            view_number: self.view_number,
-            op_number: self.op_number,
-            message_digest,
-            history_digest: digest([previous_digest, message_digest]),
-            signature: Signature::from_compact(&[0; 32]).unwrap(),
-        };
-        self.crypto.submit(
-            CryptoTask::Sign,
-            SignedMessage::OrderReq(order_req),
-            |receiver: &mut Self, message| {
-                if let SignedMessage::OrderReq(message) = message {
-                    receiver
-                        .transport
-                        .send_message_to_all(|buf| serialize(buf, message));
-                }
-            },
+        let order_req = self.transport.sign_message(
+            self.id,
+            Message::OrderReq(
+                OrderReq {
+                    view_number: self.view_number,
+                    op_number: self.op_number,
+                    message_digest,
+                    history_digest: digest([previous_digest, message_digest]),
+                    signature: Signature::from_compact(&[0; 32]).unwrap(),
+                },
+                message,
+            ),
         );
+        self.transport.send_signed_message(ToAll, order_req);
     }
 }
