@@ -4,24 +4,32 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    crypto::{Crypto, CryptoTask, ExecutorSetting, Signature},
-    meta::{deserialize, random_id, serialize, ClientId, OpNumber, ReplicaId, RequestNumber},
-    transport::{Receiver, Transport},
+    crypto::{CryptoMessage, Signature},
+    meta::{random_id, ClientId, OpNumber, ReplicaId, RequestNumber},
+    transport::{Destination::To, Receiver, SignedMessage, Transport},
     App,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Request {
+pub struct Request {
     client_id: ClientId,
     request_number: RequestNumber,
     op: Vec<u8>,
 }
+
+impl CryptoMessage for Request {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reply {
     request_number: RequestNumber,
     result: Vec<u8>,
     signature: Signature,
+}
+
+impl AsMut<Signature> for Reply {
+    fn as_mut(&mut self) -> &mut Signature {
+        &mut self.signature
+    }
 }
 
 pub struct Client {
@@ -48,6 +56,12 @@ impl Client {
     }
 }
 
+impl AsMut<Transport<Self>> for Client {
+    fn as_mut(&mut self) -> &mut Transport<Self> {
+        &mut self.transport
+    }
+}
+
 impl crate::Client for Client {
     fn invoke(&mut self, op: &[u8]) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> {
         assert!(self.invoke.is_none());
@@ -69,15 +83,13 @@ impl crate::Client for Client {
 }
 
 impl Receiver for Client {
-    fn transport(&mut self) -> &mut Transport<Self> {
-        &mut self.transport
-    }
+    type InboundMessage = Reply;
+    type OutboundMessage = Request;
 
-    fn receive_message(&mut self, _remote: SocketAddr, buf: &[u8]) {
+    fn receive_message(&mut self, _remote: SocketAddr, message: Self::InboundMessage) {
         if self.invoke.is_none() {
             return;
         }
-        let message: Reply = deserialize(buf);
         if message.request_number != self.invoke.as_ref().unwrap().request.request_number {
             return;
         }
@@ -85,16 +97,13 @@ impl Receiver for Client {
         self.transport.cancel_timer(invoke.timer_id);
         invoke.continuation.send(message.result).unwrap();
     }
-
-    type SignedMessage = ();
 }
 
 impl Client {
     fn send_request(&mut self) {
         let replica = self.transport.config.replicas[0];
         let request = &self.invoke.as_ref().unwrap().request;
-        self.transport
-            .send_message(replica, |buf| serialize(buf, request));
+        self.transport.send_message(To(replica), request);
         let request_number = request.request_number;
         let on_resend = move |receiver: &mut Self| {
             assert_eq!(
@@ -116,29 +125,22 @@ impl Client {
 
 pub struct Replica {
     transport: Transport<Self>,
-    crypto: Crypto<Self>,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, (RequestNumber, Option<Reply>)>,
+    client_table: HashMap<ClientId, (RequestNumber, SignedMessage)>,
     log: Vec<LogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogEntry {
     request: Request,
-    reply: Option<Reply>,
+    reply: SignedMessage,
 }
 
 impl Replica {
-    pub fn new(
-        transport: Transport<Self>,
-        setting: ExecutorSetting,
-        id: ReplicaId,
-        app: impl App + Send + 'static,
-    ) -> Self {
+    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
         assert_eq!(id, 0);
         Self {
-            crypto: Crypto::new(&transport, id, setting),
             transport,
             op_number: 0,
             app: Box::new(app),
@@ -148,66 +150,43 @@ impl Replica {
     }
 }
 
-impl Receiver for Replica {
-    fn transport(&mut self) -> &mut Transport<Self> {
+impl AsMut<Transport<Self>> for Replica {
+    fn as_mut(&mut self) -> &mut Transport<Self> {
         &mut self.transport
     }
+}
 
-    fn receive_message(&mut self, remote: SocketAddr, buf: &[u8]) {
-        let message: Request = deserialize(buf);
-        if let Some((request_number, reply)) = self.client_table.get(&message.client_id) {
-            if request_number > &message.request_number {
+impl Receiver for Replica {
+    type InboundMessage = Request;
+    type OutboundMessage = Reply;
+
+    fn receive_message(&mut self, remote: SocketAddr, message: Self::InboundMessage) {
+        if let Some(&(request_number, reply)) = self.client_table.get(&message.client_id) {
+            if request_number > message.request_number {
                 return;
             }
-            if request_number == &message.request_number {
-                if let Some(reply) = reply {
-                    self.transport
-                        .send_message(remote, |buf| serialize(buf, reply));
-                }
+            if request_number == message.request_number {
+                self.transport.send_signed_message(To(remote), reply);
                 return;
             }
         }
 
         self.op_number += 1;
+        let result = self.app.replica_upcall(self.op_number, &message.op);
+        let reply = self.transport.sign_message(
+            0,
+            Reply {
+                request_number: message.request_number,
+                result,
+                signature: Signature::from_compact(&[0; 64]).unwrap(),
+            },
+        );
         self.log.push(LogEntry {
             request: message.clone(),
-            reply: None,
+            reply,
         });
         assert_eq!(self.log.len() as OpNumber, self.op_number);
-        let result = self.app.replica_upcall(self.op_number, &message.op);
-        let reply = Reply {
-            request_number: message.request_number,
-            result,
-            signature: Signature::from_compact(&[0; 64]).unwrap(),
-        };
-
-        let client_id = message.client_id;
-        let op_number = self.op_number;
-        self.crypto
-            .submit(CryptoTask::Sign, reply, move |receiver, reply| {
-                receiver.log[op_number as usize - 1].reply = Some(reply.clone());
-                if receiver
-                    .client_table
-                    .get(&client_id)
-                    .map(|&(request_number, _)| request_number < reply.request_number)
-                    .unwrap_or(true)
-                {
-                    receiver
-                        .client_table
-                        .insert(client_id, (reply.request_number, Some(reply.clone())));
-                }
-                receiver
-                    .transport
-                    .send_message(remote, |buf| serialize(buf, reply));
-            });
-    }
-
-    type SignedMessage = Reply;
-    fn signature(message: &Self::SignedMessage) -> &Signature {
-        &message.signature
-    }
-    fn set_signature(message: &mut Self::SignedMessage, signature: Signature) {
-        message.signature = signature;
+        self.transport.send_signed_message(To(remote), reply);
     }
 }
 
@@ -230,14 +209,18 @@ mod tests {
         let config = SimulatedNetwork::config(1, 0);
         let mut net = SimulatedNetwork::default();
         let replica = Replica::new(
-            Transport::new(config.clone(), net.insert_socket(config.replicas[0])),
-            ExecutorSetting::Inline,
+            Transport::new(
+                config.clone(),
+                net.insert_socket(config.replicas[0]),
+                ExecutorSetting::Inline,
+            ),
             0,
             TestApp::default(),
         );
         let mut client = Client::new(Transport::new(
             config.clone(),
             net.insert_socket(SimulatedNetwork::client(0)),
+            ExecutorSetting::Inline,
         ));
 
         let net = Concurrent::run(net);

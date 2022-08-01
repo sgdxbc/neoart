@@ -26,7 +26,7 @@ async fn main() {
     config.gen_keys();
 
     let socket = UdpSocket::bind(config.replicas[0]).await.unwrap();
-    let transport = Transport::new(config, Socket::Os(socket));
-    let mut replica = unreplicated::Replica::new(transport, ExecutorSetting::Rayon(8), 0, Null);
+    let transport = Transport::new(config, Socket::Os(socket), ExecutorSetting::Rayon(8));
+    let mut replica = unreplicated::Replica::new(transport, 0, Null);
     replica.run(pending()).await;
 }

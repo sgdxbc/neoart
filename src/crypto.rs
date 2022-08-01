@@ -1,22 +1,33 @@
-use std::thread::spawn;
+use std::{mem::replace, net::SocketAddr, thread::spawn};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use secp256k1::{KeyPair, Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly};
+use secp256k1::{Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
 use crate::{
-    meta::{digest, ReplicaId},
-    transport::{CryptoEvent, Receiver, Transport},
+    meta::{digest, Config, ReplicaId},
+    transport::{CryptoEvent, SignedMessage},
 };
 
 pub type Signature = secp256k1::ecdsa::Signature;
 
+pub trait CryptoMessage: Serialize {
+    fn signature_mut(&mut self) -> &mut Signature {
+        unreachable!()
+    }
+}
+
+impl<T: Serialize + AsMut<Signature>> CryptoMessage for T {
+    fn signature_mut(&mut self) -> &mut Signature {
+        self.as_mut()
+    }
+}
+
 #[derive(Debug)]
-pub struct Crypto<T: Receiver> {
-    sender: Sender<CryptoEvent<T>>,
-    keys: Vec<KeyPair>,
-    replica_id: ReplicaId,
+pub struct Crypto<V, S> {
+    sender: Sender<CryptoEvent<V, S>>,
+    config: Config,
     executor: Executor,
 }
 
@@ -31,8 +42,12 @@ pub enum ExecutorSetting {
     Rayon(usize),
 }
 
-impl<T: Receiver> Crypto<T> {
-    pub fn new(transport: &Transport<T>, id: ReplicaId, setting: ExecutorSetting) -> Self {
+impl<V, S> Crypto<V, S> {
+    pub fn new(
+        config: Config,
+        setting: ExecutorSetting,
+        sender: Sender<CryptoEvent<V, S>>,
+    ) -> Self {
         let executor = match setting {
             ExecutorSetting::Inline => Executor::Inline,
             ExecutorSetting::Rayon(num_threads) => Executor::Rayon(
@@ -48,65 +63,98 @@ impl<T: Receiver> Crypto<T> {
             ),
         };
         Self {
-            sender: transport.crypto_sender(),
-            keys: transport.config.keys.clone(),
-            replica_id: id,
+            sender,
+            config,
             executor,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CryptoTask {
-    Sign,
-    Verify(ReplicaId),
-    // multicast
-}
-
-impl<T: Receiver> Crypto<T> {
-    pub fn submit(
-        &mut self,
-        task: CryptoTask,
-        message: T::SignedMessage,
-        on_message: impl FnOnce(&mut T, T::SignedMessage) + Send + 'static,
-    ) where
-        T::SignedMessage: Serialize + Send + 'static,
-        T: 'static,
+impl<V, S> Crypto<V, S> {
+    pub fn verify(&mut self, message: V, id: ReplicaId)
+    where
+        V: CryptoMessage + Send + 'static,
+        CryptoEvent<V, S>: Send + 'static,
     {
-        match (&self.executor, task) {
-            (Executor::Inline, CryptoTask::Sign) => Self::sign_task(
+        match &self.executor {
+            Executor::Inline => Self::verify_task(
+                self.config.replicas[id as usize],
                 message,
-                on_message,
-                &self.keys[self.replica_id as usize].secret_key(),
+                &self.config.keys[id as usize].public_key(),
                 &self.sender,
             ),
-            (Executor::Inline, CryptoTask::Verify(id)) => Self::verify_task(
-                message,
-                on_message,
-                &self.keys[id as usize].public_key(),
-                &self.sender,
-            ),
-            (Executor::Rayon(executor), CryptoTask::Sign) => {
-                let secret_key = self.keys[self.replica_id as usize].secret_key();
+            Executor::Rayon(executor) => {
+                let public_key = self.config.keys[id as usize].public_key();
+                let remote = self.config.replicas[id as usize];
                 let sender = self.sender.clone();
-                executor.spawn(move || Self::sign_task(message, on_message, &secret_key, &sender));
+                executor.spawn(move || Self::verify_task(remote, message, &public_key, &sender));
             }
-            (Executor::Rayon(executor), CryptoTask::Verify(id)) => {
-                let public_key = self.keys[id as usize].public_key();
+        }
+    }
+
+    fn verify_task(
+        remote: SocketAddr,
+        mut message: V,
+        public_key: &PublicKey,
+        sender: &Sender<CryptoEvent<V, S>>,
+    ) where
+        V: CryptoMessage,
+    {
+        thread_local! {
+            static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
+        }
+
+        let signature = replace(
+            message.signature_mut(),
+            Signature::from_compact(&[0; 32]).unwrap(),
+        );
+        if SECP
+            .with(|secp| {
+                secp.verify_ecdsa(
+                    &Message::from_slice(&digest(&message)).unwrap(),
+                    &signature,
+                    public_key,
+                )
+            })
+            .is_ok()
+        {
+            *message.signature_mut() = signature;
+            sender
+                .try_send(CryptoEvent::Verified(remote, message))
+                .map_err(|_| panic!())
+                .unwrap();
+        } else {
+            println!("! verify signature error");
+        }
+    }
+
+    pub fn sign(&mut self, signed_id: SignedMessage, message: S, id: ReplicaId)
+    where
+        S: CryptoMessage + Send + 'static,
+        CryptoEvent<V, S>: Send + 'static,
+    {
+        match &self.executor {
+            Executor::Inline => Self::sign_task(
+                signed_id,
+                message,
+                &self.config.keys[id as usize].secret_key(),
+                &self.sender,
+            ),
+            Executor::Rayon(executor) => {
+                let secret_key = self.config.keys[id as usize].secret_key();
                 let sender = self.sender.clone();
-                executor
-                    .spawn(move || Self::verify_task(message, on_message, &public_key, &sender));
+                executor.spawn(move || Self::sign_task(signed_id, message, &secret_key, &sender));
             }
         }
     }
 
     fn sign_task(
-        mut message: T::SignedMessage,
-        on_message: impl FnOnce(&mut T, T::SignedMessage) + Send + 'static,
+        id: SignedMessage,
+        mut message: S,
         secret_key: &SecretKey,
-        sender: &Sender<CryptoEvent<T>>,
+        sender: &Sender<CryptoEvent<V, S>>,
     ) where
-        T::SignedMessage: Serialize,
+        S: CryptoMessage,
     {
         thread_local! {
             static SECP: Secp256k1<SignOnly> = Secp256k1::signing_only();
@@ -114,40 +162,10 @@ impl<T: Receiver> Crypto<T> {
         let signature = SECP.with(|secp| {
             secp.sign_ecdsa(&Message::from_slice(&digest(&message)).unwrap(), secret_key)
         });
-        T::set_signature(&mut message, signature);
+        *message.signature_mut() = signature;
         sender
-            .try_send((message, Box::new(on_message)))
+            .try_send(CryptoEvent::Signed(id, message))
             .map_err(|_| panic!())
             .unwrap();
-    }
-
-    fn verify_task(
-        message: T::SignedMessage,
-        on_message: impl FnOnce(&mut T, T::SignedMessage) + Send + 'static,
-        public_key: &PublicKey,
-        sender: &Sender<CryptoEvent<T>>,
-    ) where
-        T::SignedMessage: Serialize,
-    {
-        thread_local! {
-            static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
-        }
-        if SECP
-            .with(|secp| {
-                secp.verify_ecdsa(
-                    &Message::from_slice(&digest(&message)).unwrap(),
-                    T::signature(&message),
-                    public_key,
-                )
-            })
-            .is_ok()
-        {
-            sender
-                .try_send((message, Box::new(on_message)))
-                .map_err(|_| panic!())
-                .unwrap();
-        } else {
-            println!("! verify signature error");
-        }
     }
 }

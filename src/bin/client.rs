@@ -7,6 +7,7 @@ use std::{
 };
 
 use neoart::{
+    crypto::ExecutorSetting,
     latency::{merge_latency_with, push_latency, Latency},
     meta::Config,
     transport::{Run, Socket, Transport},
@@ -36,7 +37,7 @@ async fn main() {
             spawn(async move {
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 socket.writable().await.unwrap();
-                let transport = Transport::new(config, Socket::Os(socket));
+                let transport = Transport::new(config, Socket::Os(socket), ExecutorSetting::Inline);
                 let mut client = unreplicated::Client::new(transport);
                 let notified = notify.notified();
                 pin!(notified);
