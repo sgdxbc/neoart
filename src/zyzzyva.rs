@@ -141,6 +141,7 @@ pub struct Client {
     request_number: RequestNumber,
     invoke: Option<Invoke>,
     view_number: ViewNumber,
+    is_byz: bool,
 }
 
 struct Invoke {
@@ -153,13 +154,14 @@ struct Invoke {
 }
 
 impl Client {
-    pub fn new(transport: Transport<Self>) -> Self {
+    pub fn new(transport: Transport<Self>, is_byz: bool) -> Self {
         Self {
             transport,
             id: random_id(),
             request_number: 0,
             invoke: None,
             view_number: 0,
+            is_byz,
         }
     }
 }
@@ -247,8 +249,11 @@ impl Client {
         {
             invoke.certificate.signatures.push((replica_id, signature));
         }
-        // TODO Byzantine mode
-        if invoke.certificate.signatures.len() == self.transport.config.n {
+
+        if self.is_byz && invoke.certificate.signatures.len() == self.transport.config.f * 2 + 1 {
+            self.transport.cancel_timer(invoke.timer_id);
+            self.send_request();
+        } else if invoke.certificate.signatures.len() == self.transport.config.n {
             let invoke = self.invoke.take().unwrap();
             self.transport.cancel_timer(invoke.timer_id);
             self.view_number = invoke.certificate.spec_response.view_number;
@@ -555,10 +560,9 @@ impl Replica {
             todo!()
         }
 
-        if spec_response.op_number <= self.commit_certificate.spec_response.op_number {
-            return; // should this go above the previous check?
+        if spec_response.op_number > self.commit_certificate.spec_response.op_number {
+            self.commit_certificate = message.certificate;
         }
-        self.commit_certificate = message.certificate;
         let local_commit = self.transport.sign_message(
             self.id,
             Message::LocalCommit(LocalCommit {
@@ -576,10 +580,11 @@ impl Replica {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{str::from_utf8, time::Duration};
 
     use tokio::{
         spawn,
+        task::JoinHandle,
         time::{sleep, timeout},
     };
 
@@ -592,112 +597,150 @@ mod tests {
         Client as _,
     };
 
+    struct System {
+        net: Concurrent<SimulatedNetwork>,
+        replicas: Vec<Concurrent<Replica>>,
+        clients: Vec<Client>,
+    }
+
+    impl System {
+        fn new(num_client: usize, is_byz: bool) -> Self {
+            let config = SimulatedNetwork::config(4, 1);
+            let mut net = SimulatedNetwork::default();
+            let (client_ids, clients) = (0..num_client)
+                .map(|i| {
+                    let client = Client::new(
+                        Transport::new(
+                            config.clone(),
+                            net.insert_socket(SimulatedNetwork::client(i)),
+                            ExecutorSetting::Inline,
+                        ),
+                        is_byz,
+                    );
+                    (client.id, client)
+                })
+                .unzip::<_, _, Vec<_>, Vec<_>>();
+            let replicas = (0..4)
+                .map(|i| {
+                    let mut replica = Replica::new(
+                        Transport::new(
+                            config.clone(),
+                            net.insert_socket(config.replicas[i]),
+                            ExecutorSetting::Inline,
+                        ),
+                        i as ReplicaId,
+                        TestApp::default(),
+                    );
+                    for (i, &id) in client_ids.iter().enumerate() {
+                        replica.routes.insert(id, SimulatedNetwork::client(i));
+                    }
+                    Concurrent::run(replica)
+                })
+                .collect::<Vec<_>>();
+
+            Self {
+                net: Concurrent::run(net),
+                replicas,
+                clients,
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn single_op() {
-        let config = SimulatedNetwork::config(4, 1);
-        let mut net = SimulatedNetwork::default();
-        let replicas = (0..4)
-            .map(|i| {
-                Concurrent::run(Replica::new(
-                    Transport::new(
-                        config.clone(),
-                        net.insert_socket(config.replicas[i]),
-                        ExecutorSetting::Inline,
-                    ),
-                    i as ReplicaId,
-                    TestApp::default(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let mut client = Client::new(Transport::new(
-            config.clone(),
-            net.insert_socket(SimulatedNetwork::client(0)),
-            ExecutorSetting::Inline,
-        ));
-
-        let net = Concurrent::run(net);
-        let result = client.invoke("hello".as_bytes());
+        let mut system = System::new(1, false);
+        let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
-            Duration::from_millis(1020),
-            client.run(async {
+            Duration::from_millis(30),
+            system.clients[0].run(async {
                 assert_eq!(&result.await, "[1] hello".as_bytes());
             }),
         )
         .await
         .unwrap();
 
-        for replica in replicas {
+        for replica in system.replicas {
             assert_eq!(replica.join().await.log.len(), 1);
         }
-        net.join().await;
+        system.net.join().await;
+    }
+
+    fn closed_loop(index: usize, mut client: Client) -> JoinHandle<()> {
+        spawn(async move {
+            for i in 0.. {
+                let result = client.invoke(format!("op{index}-{i}").as_bytes());
+                client
+                    .run(async move {
+                        let result = result.await;
+                        assert!(
+                            result
+                                .strip_suffix(format!("op{index}-{i}").as_bytes())
+                                .is_some(),
+                            "expect op{index}-{i} get {}",
+                            from_utf8(&result).unwrap()
+                        );
+                    })
+                    .await;
+            }
+        })
     }
 
     #[tokio::test(start_paused = true)]
-    async fn concurrent_close_loop() {
-        let config = SimulatedNetwork::config(4, 1);
+    async fn concurrent_closed_loop() {
         let num_client = 10;
-        let mut net = SimulatedNetwork::default();
-        let mut replicas = (0..4)
-            .map(|i| {
-                Concurrent::run(Replica::new(
-                    Transport::new(
-                        config.clone(),
-                        net.insert_socket(config.replicas[i]),
-                        ExecutorSetting::Inline,
-                    ),
-                    i as ReplicaId,
-                    TestApp::default(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let mut clients = (0..num_client)
-            .map(|i| {
-                Client::new(Transport::new(
-                    config.clone(),
-                    net.insert_socket(SimulatedNetwork::client(i)),
-                    ExecutorSetting::Inline,
-                ))
-            })
-            .collect::<Vec<_>>();
-
-        let _ = Concurrent::run(net);
-        // warm up
-        for (i, client) in clients.iter_mut().enumerate() {
-            let result = client.invoke("hello".as_bytes());
-            timeout(
-                Duration::from_millis(1020),
-                client.run(async {
-                    assert_eq!(&result.await, format!("[{}] hello", i + 1).as_bytes());
-                }),
-            )
-            .await
-            .unwrap();
+        let mut system = System::new(num_client, false);
+        for (index, client) in system.clients.into_iter().enumerate() {
+            closed_loop(index, client);
         }
-
-        for (index, mut client) in clients.into_iter().enumerate() {
-            spawn(async move {
-                for i in 0.. {
-                    let result = client.invoke(format!("op{index}-{i}").as_bytes());
-                    client
-                        .run(async move {
-                            assert!(result
-                                .await
-                                .strip_suffix(format!("op{index}-{i}").as_bytes())
-                                .is_some());
-                        })
-                        .await;
-                }
-            });
-        }
-
         sleep(Duration::from_secs(1)).await;
-        let primary_len = replicas.remove(0).join().await.log.len();
-        assert!(primary_len >= 33 * num_client);
-        for replica in replicas {
+        let primary_len = system.replicas.remove(0).join().await.log.len();
+        assert!(primary_len >= 1000 / 30 * num_client);
+        for replica in system.replicas {
             let backup_len = replica.join().await.log.len();
             // stronger assertions?
             assert!(backup_len <= primary_len);
             assert!(backup_len >= primary_len - num_client);
         }
+        system.net.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_op_byzantine() {
+        let mut system = System::new(1, true);
+        system.replicas.remove(3).join().await;
+        let result = system.clients[0].invoke("hello".as_bytes());
+        timeout(
+            Duration::from_millis(50),
+            system.clients[0].run(async {
+                assert_eq!(&result.await, "[1] hello".as_bytes());
+            }),
+        )
+        .await
+        .unwrap();
+
+        for replica in system.replicas {
+            assert_eq!(replica.join().await.log.len(), 1);
+        }
+        system.net.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_closed_loop_byzantine() {
+        let num_client = 10;
+        let mut system = System::new(num_client, true);
+        system.replicas.remove(3).join().await;
+        for (index, client) in system.clients.into_iter().enumerate() {
+            closed_loop(index, client);
+        }
+        sleep(Duration::from_secs(1)).await;
+        let primary_len = system.replicas.remove(0).join().await.log.len();
+        assert!(primary_len >= 1000 / 50 * num_client);
+        for replica in system.replicas {
+            let backup_len = replica.join().await.log.len();
+            // stronger assertions?
+            assert!(backup_len <= primary_len);
+            assert!(backup_len >= primary_len - num_client);
+        }
+        system.net.join().await;
     }
 }

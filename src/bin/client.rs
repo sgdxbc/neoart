@@ -20,6 +20,7 @@ use tokio::{net::UdpSocket, pin, select, spawn, sync::Notify, time::sleep};
 enum Mode {
     Ur, // unreplicated
     Zyzzyva,
+    ZyzzyvaByz,
 }
 
 #[derive(Parser)]
@@ -105,6 +106,11 @@ async fn main() {
     let args = Args::parse();
     match args.mode {
         Mode::Ur => main_internal(args, unreplicated::Client::new).await,
-        Mode::Zyzzyva => main_internal(args, zyzzyva::Client::new).await,
+        Mode::Zyzzyva => {
+            main_internal(args, |transport| zyzzyva::Client::new(transport, false)).await
+        }
+        Mode::ZyzzyvaByz => {
+            main_internal(args, |transport| zyzzyva::Client::new(transport, true)).await
+        }
     }
 }
