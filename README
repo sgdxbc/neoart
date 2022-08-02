@@ -1,0 +1,9 @@
+Developed with stable Rust 1.62.1, on Ubuntu.
+
+Run sanity check:
+$ cargo test --lib
+
+Run benchmark:
+First copy src/bin/config.example.txt to src/bin/config.txt, and modify content
+according to evaluation system.
+$ cargo run --release --bin [replica|client] -- [options]
