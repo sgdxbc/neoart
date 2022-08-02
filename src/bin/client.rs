@@ -104,7 +104,7 @@ async fn main_internal<T>(
 async fn main() {
     let args = Args::parse();
     match args.mode {
-        Mode::Ur => main_internal(args, |transport| unreplicated::Client::new(transport)).await,
-        Mode::Zyzzyva => main_internal(args, |transport| zyzzyva::Client::new(transport)).await,
+        Mode::Ur => main_internal(args, unreplicated::Client::new).await,
+        Mode::Zyzzyva => main_internal(args, zyzzyva::Client::new).await,
     }
 }
