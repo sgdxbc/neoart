@@ -17,7 +17,7 @@ use crate::{
         RequestNumber, ViewNumber,
     },
     transport::{
-        Destination::{To, ToAll},
+        Destination::{To, ToAll, ToReplica},
         InboundAction, Receiver, SignedMessage, Transport,
     },
     App,
@@ -276,16 +276,13 @@ impl Client {
         let invoke = self.invoke.as_mut().unwrap();
         if invoke.certificate.signatures.len() < self.transport.config.f * 2 + 1 {
             // timer not set already => this is not a resending
-            if invoke.timer_id == 0 {
-                let primary = self.transport.config.primary(self.view_number);
-                self.transport.send_message(
-                    To(self.transport.config.replicas[primary as usize]),
-                    Message::Request(invoke.request.clone()),
-                );
+            let destination = if invoke.timer_id == 0 {
+                ToReplica(self.transport.config.primary(self.view_number))
             } else {
-                self.transport
-                    .send_message(ToAll, Message::Request(invoke.request.clone()));
-            }
+                ToAll
+            };
+            self.transport
+                .send_message(destination, Message::Request(invoke.request.clone()));
         } else {
             let commit = Commit {
                 client_id: self.id,

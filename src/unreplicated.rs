@@ -6,7 +6,10 @@ use tokio::sync::oneshot;
 use crate::{
     crypto::{CryptoMessage, Signature},
     meta::{random_id, ClientId, OpNumber, ReplicaId, RequestNumber},
-    transport::{Destination::To, Receiver, SignedMessage, Transport},
+    transport::{
+        Destination::{To, ToReplica},
+        Receiver, SignedMessage, Transport,
+    },
     App,
 };
 
@@ -114,10 +117,9 @@ impl Receiver for Client {
 
 impl Client {
     fn send_request(&mut self) {
-        let replica = self.transport.config.replicas[0];
         let request = &self.invoke.as_ref().unwrap().request;
         self.transport
-            .send_message(To(replica), Message::Request(request.clone()));
+            .send_message(ToReplica(0), Message::Request(request.clone()));
         let request_number = request.request_number;
         let on_resend = move |receiver: &mut Self| {
             assert_eq!(

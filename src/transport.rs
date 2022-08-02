@@ -26,9 +26,8 @@
 //! `Future`, so it will not "contest" with `Run::run` for `&mut self`. A simple
 //! demostration to run a client until invocation is done:
 //! ```
-//! let result;
-//! let result_f = client.invoke("my operation".as_bytes());
-//! client.run(async { result = result_f.await; }).await;
+//! let result = client.invoke("my operation".as_bytes());
+//! client.run(async { println!("{:?}", result.await); }).await;
 //! ```
 //!
 //! The `Crypto` is intergrated into `Transport` through two sets of interfaces
@@ -107,6 +106,7 @@ pub struct Transport<T: Receiver> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Destination {
     To(SocketAddr),
+    ToReplica(ReplicaId),
     ToAll,
 }
 
@@ -196,6 +196,11 @@ impl<T: Receiver> Transport<T> {
             Destination::To(addr) => {
                 Self::send_message_interal(&self.socket, &[addr], message.borrow())
             }
+            Destination::ToReplica(id) => Self::send_message_interal(
+                &self.socket,
+                &[self.config.replicas[id as usize]],
+                message.borrow(),
+            ),
             Destination::ToAll => Self::send_message_interal(
                 &self.socket,
                 &self.config.replicas[..],
