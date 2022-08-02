@@ -8,7 +8,8 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.56"
 bincode = "1.3.3"
-clap = { version = "3.2.16", features = ["derive"] }
+# for unknown reason clap ^3.2 (3.2.16 currently) breaks latency measurement
+clap = { version = "=3.2.14", features = ["derive"] }
 rand = "0.8.5"
 rayon = "1.5.3"
 secp256k1 = { version = "0.24.0", features = ["serde", "bitcoin_hashes"] }

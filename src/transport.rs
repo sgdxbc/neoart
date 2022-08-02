@@ -69,8 +69,7 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
-    meta::{deserialize, serialize, Config, OpNumber, ReplicaId},
-    App,
+    meta::{deserialize, serialize, Config, ReplicaId},
 };
 
 pub trait Receiver: Sized {
@@ -431,13 +430,17 @@ impl SimulatedNetwork {
         spawn(async move {
             sleep(delay).await;
             println!(
-                "* [{:?}] [{} -> {}] message length {}",
+                "* [{:6?}] [{} -> {}] message length {} {}",
                 Instant::now() - epoch,
                 message.source,
                 message.destination,
-                message.buf.len()
+                message.buf.len(),
+                if inbox.send((message.source, message.buf)).await.is_err() {
+                    "(failed)"
+                } else {
+                    ""
+                }
             );
-            inbox.send((message.source, message.buf)).await.unwrap();
         });
     }
 }
@@ -461,16 +464,5 @@ impl<T> Concurrent<T> {
     pub async fn join(self) -> T {
         self.0.notify_one();
         self.1.await.unwrap()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TestApp {
-    //
-}
-
-impl App for TestApp {
-    fn replica_upcall(&mut self, op_number: OpNumber, op: &[u8]) -> Vec<u8> {
-        [format!("[{op_number}] ").as_bytes(), op].concat()
     }
 }

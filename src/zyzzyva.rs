@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
+    common::Reorder,
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
         deserialize, digest, random_id, ClientId, Config, Digest, OpNumber, ReplicaId,
@@ -227,13 +228,15 @@ impl Client {
         if invoke.certificate.signatures.is_empty() {
             invoke.certificate.spec_response = message;
             invoke.result = result;
-        } else if message != invoke.certificate.spec_response {
+        } else if message != invoke.certificate.spec_response || result != invoke.result {
             println!(
                 "! client {:08x} mismatched result request {} replica {}",
                 u32::from_ne_bytes(self.id),
                 message.request_number,
                 replica_id
             );
+            println!("{:?}", message);
+            println!("{:?}", invoke.certificate.spec_response);
             return;
         }
         if invoke
@@ -318,11 +321,17 @@ pub struct Replica {
     transport: Transport<Self>,
     id: ReplicaId,
     view_number: ViewNumber,
-    op_number: OpNumber, // speculative committed up to
+    // the high #op that should be speculative committed up to, and the
+    // corresponded history hash
+    // on primary replica the log record could be a little bit delayed to these
+    // because of signing `OrderReq`
+    op_number: OpNumber,
+    history_digest: Digest,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, (RequestNumber, SignedMessage)>, // always SpecResponse
+    client_table: HashMap<ClientId, (RequestNumber, Option<SignedMessage>)>, // always SpecResponse
     log: Vec<LogEntry>,
     commit_certificate: CommitCertificate, // highest
+    reorder_order_req: Reorder<(OrderReq, Request)>,
     routes: HashMap<ClientId, SocketAddr>,
 }
 
@@ -342,10 +351,12 @@ impl Replica {
             id,
             view_number: 0,
             op_number: 0,
+            history_digest: Digest::default(),
             app: Box::new(app),
             client_table: HashMap::new(),
             routes: HashMap::new(),
             log: Vec::new(),
+            reorder_order_req: Reorder::new(1),
             commit_certificate: CommitCertificate::default(),
         }
     }
@@ -386,8 +397,15 @@ impl Receiver for Replica {
 
     fn on_signed(&mut self, id: SignedMessage) {
         if let Message::OrderReq(message, request) = self.transport.signed_message(id).unwrap() {
-            if self.transport.config.primary(self.view_number) == self.id {
-                self.spec_commit(message.clone(), request.clone());
+            if self.view_number == message.view_number {
+                assert_eq!(self.id, self.transport.config.primary(self.view_number));
+                let mut ordered = self
+                    .reorder_order_req
+                    .insert_reorder(message.op_number, (message.clone(), request.clone()));
+                while let Some((message, request)) = ordered {
+                    self.spec_commit(message, request);
+                    ordered = self.reorder_order_req.expect_next();
+                }
             }
         }
     }
@@ -396,13 +414,16 @@ impl Receiver for Replica {
 impl Replica {
     fn handle_request(&mut self, remote: SocketAddr, message: Request) {
         self.routes.insert(message.client_id, remote);
+
         if let Some(&(request_number, spec_response)) = self.client_table.get(&message.client_id) {
             if message.request_number < request_number {
                 return;
             }
             if message.request_number == request_number {
-                self.transport
-                    .send_signed_message(To(remote), spec_response);
+                if let Some(spec_response) = spec_response {
+                    self.transport
+                        .send_signed_message(To(remote), spec_response);
+                }
                 return;
             }
         }
@@ -412,13 +433,11 @@ impl Replica {
         }
 
         self.op_number += 1;
+        self.client_table
+            .insert(message.client_id, (message.request_number, None));
+
         let message_digest = digest(&message);
-        let previous_digest = if self.op_number == 1 {
-            Digest::default()
-        } else {
-            self.log[(self.op_number - 1) as usize].history_digest
-        };
-        let history_digest = digest([previous_digest, message_digest]);
+        self.history_digest = digest([self.history_digest, message_digest]);
         let order_req = self.transport.sign_message(
             self.id,
             Message::OrderReq(
@@ -426,7 +445,7 @@ impl Replica {
                     view_number: self.view_number,
                     op_number: self.op_number,
                     message_digest,
-                    history_digest,
+                    history_digest: self.history_digest,
                     signature: Signature::default(),
                 },
                 message,
@@ -451,29 +470,36 @@ impl Replica {
         if message.view_number > self.view_number {
             todo!()
         }
+        assert_ne!(self.id, self.transport.config.primary(self.view_number));
 
-        if message.op_number != self.op_number + 1 {
-            todo!("reorder request")
-        }
-        let previous_digest = if self.op_number == 0 {
-            Digest::default()
-        } else {
-            self.log[(self.op_number - 1) as usize].history_digest
-        };
-        if message.history_digest != digest([previous_digest, message.message_digest]) {
-            println!(
-                "! OrderReq mismatched history digest op {}",
-                message.op_number
-            );
-            return;
-        }
+        let mut ordered = self
+            .reorder_order_req
+            .insert_reorder(message.op_number, (message, request));
+        while let Some((message, request)) = ordered {
+            let previous_digest = if self.op_number == 0 {
+                Digest::default()
+            } else {
+                self.log[(self.op_number - 1) as usize].history_digest
+            };
+            if message.history_digest != digest([previous_digest, message.message_digest]) {
+                println!(
+                    "! OrderReq mismatched history digest op {}",
+                    message.op_number
+                );
+                break;
+            }
 
-        self.op_number += 1;
-        self.spec_commit(message, request);
+            self.op_number += 1;
+            self.history_digest = message.history_digest;
+            self.spec_commit(message, request);
+
+            ordered = self.reorder_order_req.expect_next();
+        }
     }
 
     fn spec_commit(&mut self, message: OrderReq, request: Request) {
-        let result = self.app.replica_upcall(self.op_number, &request.op);
+        assert_eq!(message.view_number, self.view_number);
+        let result = self.app.replica_upcall(message.op_number, &request.op);
         let history_digest = message.history_digest;
         let message_digest = message.message_digest;
         let spec_response = self.transport.sign_message(
@@ -481,7 +507,7 @@ impl Replica {
             Message::SpecResponse(
                 SpecResponse {
                     view_number: self.view_number,
-                    op_number: self.op_number,
+                    op_number: message.op_number,
                     result_digest: digest(&result),
                     history_digest,
                     client_id: request.client_id,
@@ -504,7 +530,7 @@ impl Replica {
         });
         // is this SpecResponse always up to date?
         self.client_table
-            .insert(client_id, (request_number, spec_response));
+            .insert(client_id, (request_number, Some(spec_response)));
         if let Some(&remote) = self.routes.get(&client_id) {
             self.transport
                 .send_signed_message(To(remote), spec_response);
@@ -552,12 +578,16 @@ impl Replica {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::timeout;
+    use tokio::{
+        spawn,
+        time::{sleep, timeout},
+    };
 
     use crate::{
+        common::TestApp,
         crypto::ExecutorSetting,
         meta::ReplicaId,
-        transport::{Concurrent, Run, SimulatedNetwork, TestApp, Transport},
+        transport::{Concurrent, Run, SimulatedNetwork, Transport},
         zyzzyva::{Client, Replica},
         Client as _,
     };
@@ -600,5 +630,74 @@ mod tests {
             assert_eq!(replica.join().await.log.len(), 1);
         }
         net.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_close_loop() {
+        let config = SimulatedNetwork::config(4, 1);
+        let num_client = 10;
+        let mut net = SimulatedNetwork::default();
+        let mut replicas = (0..4)
+            .map(|i| {
+                Concurrent::run(Replica::new(
+                    Transport::new(
+                        config.clone(),
+                        net.insert_socket(config.replicas[i]),
+                        ExecutorSetting::Inline,
+                    ),
+                    i as ReplicaId,
+                    TestApp::default(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut clients = (0..num_client)
+            .map(|i| {
+                Client::new(Transport::new(
+                    config.clone(),
+                    net.insert_socket(SimulatedNetwork::client(i)),
+                    ExecutorSetting::Inline,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let _ = Concurrent::run(net);
+        // warm up
+        for (i, client) in clients.iter_mut().enumerate() {
+            let result = client.invoke("hello".as_bytes());
+            timeout(
+                Duration::from_millis(1020),
+                client.run(async {
+                    assert_eq!(&result.await, format!("[{}] hello", i + 1).as_bytes());
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (index, mut client) in clients.into_iter().enumerate() {
+            spawn(async move {
+                for i in 0.. {
+                    let result = client.invoke(format!("op{index}-{i}").as_bytes());
+                    client
+                        .run(async move {
+                            assert!(result
+                                .await
+                                .strip_suffix(format!("op{index}-{i}").as_bytes())
+                                .is_some());
+                        })
+                        .await;
+                }
+            });
+        }
+
+        sleep(Duration::from_secs(1)).await;
+        let primary_len = replicas.remove(0).join().await.log.len();
+        assert!(primary_len >= 33 * num_client);
+        for replica in replicas {
+            let backup_len = replica.join().await.log.len();
+            // stronger assertions?
+            assert!(backup_len <= primary_len);
+            assert!(backup_len >= primary_len - num_client);
+        }
     }
 }

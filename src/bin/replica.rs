@@ -37,12 +37,7 @@ where
     T: Receiver + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage,
 {
-    let mut config: Config = "
-        f 0
-        replica 127.0.0.1:2023
-    "
-    .parse()
-    .unwrap();
+    let mut config: Config = include_str!("config.txt").parse().unwrap();
     config.gen_keys();
 
     let socket = UdpSocket::bind(config.replicas[args.index as usize])

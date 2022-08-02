@@ -6,39 +6,55 @@ use std::{
     time::Duration,
 };
 
+use clap::{clap_derive::ArgEnum, Parser};
 use neoart::{
-    crypto::ExecutorSetting,
+    crypto::{CryptoMessage, ExecutorSetting},
     latency::{merge_latency_with, push_latency, Latency},
     meta::Config,
-    transport::{Run, Socket, Transport},
-    unreplicated, Client,
+    transport::{Receiver, Run, Socket, Transport},
+    unreplicated, zyzzyva, Client,
 };
 use tokio::{net::UdpSocket, pin, select, spawn, sync::Notify, time::sleep};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
+enum Mode {
+    Ur, // unreplicated
+    Zyzzyva,
+}
+
+#[derive(Parser)]
+struct Args {
+    #[clap(short, long, arg_enum)]
+    mode: Mode,
+    #[clap(short = 't', long = "num", default_value_t = 1)]
+    n: u32,
+}
 
 struct RequestBegin;
 struct RequestEnd;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let config: Config = "
-        f 0
-        replica 127.0.0.1:2023
-    "
-    .parse()
-    .unwrap();
+async fn main_internal<T>(
+    args: Args,
+    new_client: impl FnOnce(Transport<T>) -> T + Clone + Send + 'static,
+) where
+    T: Receiver + Client + AsMut<Transport<T>> + Send,
+    T::Message: CryptoMessage,
+{
+    let config: Config = include_str!("config.txt").parse().unwrap();
 
     let notify = Arc::new(Notify::new());
     let throughput = Arc::new(AtomicU32::new(0));
-    let clients = (0..10)
+    let clients = (0..args.n)
         .map(|i| {
             let config = config.clone();
             let notify = notify.clone();
             let throughput = throughput.clone();
+            let new_client = new_client.clone();
             spawn(async move {
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 socket.writable().await.unwrap();
                 let transport = Transport::new(config, Socket::Os(socket), ExecutorSetting::Inline);
-                let mut client = unreplicated::Client::new(transport);
+                let mut client = new_client(transport);
                 let notified = notify.notified();
                 pin!(notified);
 
@@ -77,9 +93,18 @@ async fn main() {
 
     let mut aggregated = Latency::default();
     merge_latency_with(&mut aggregated);
-    let intervals = aggregated.intervals::<RequestBegin, RequestEnd>();
-    println!(
-        "* average latency: {:?}",
-        intervals.iter().sum::<Duration>() / intervals.len() as u32
-    );
+    let mut intervals = aggregated.intervals::<RequestBegin, RequestEnd>();
+    if !intervals.is_empty() {
+        intervals.sort_unstable();
+        println!("* 50th latency: {:?}", intervals[intervals.len() / 2]);
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let args = Args::parse();
+    match args.mode {
+        Mode::Ur => main_internal(args, |transport| unreplicated::Client::new(transport)).await,
+        Mode::Zyzzyva => main_internal(args, |transport| zyzzyva::Client::new(transport)).await,
+    }
 }

@@ -217,8 +217,9 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::{
+        common::TestApp,
         crypto::ExecutorSetting,
-        transport::{Concurrent, Run, SimulatedNetwork, TestApp, Transport},
+        transport::{Concurrent, Run, SimulatedNetwork, Transport},
         Client as _,
     };
 
