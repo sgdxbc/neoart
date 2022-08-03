@@ -8,6 +8,7 @@ pub mod latency;
 pub mod meta;
 pub mod transport;
 pub mod unreplicated;
+pub mod ycsb;
 pub mod zyzzyva;
 
 pub trait Client {

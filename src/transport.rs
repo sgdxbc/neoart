@@ -26,8 +26,36 @@
 //! `Future`, so it will not "contest" with `Run::run` for `&mut self`. A simple
 //! demostration to run a client until invocation is done:
 //! ```
-//! let result = client.invoke("my operation".as_bytes());
-//! client.run(async { println!("{:?}", result.await); }).await;
+//! # use neoart::{common::*, transport::*, unreplicated::*, Client as _};
+//! # #[tokio::main]
+//! # async fn main() {
+//! #     let config = SimulatedNetwork::config(1, 0);
+//! #     let mut net = SimulatedNetwork::default();
+//! #     let replica = Replica::new(
+//! #         Transport::new(
+//! #             config.clone(),
+//! #             net.insert_socket(config.replicas[0]),
+//! #             neoart::crypto::ExecutorSetting::Inline,
+//! #         ),
+//! #         0,
+//! #         TestApp::default(),
+//! #     );
+//! #     let mut client = Client::new(Transport::new(
+//! #         config.clone(),
+//! #         net.insert_socket(SimulatedNetwork::client(0)),
+//! #         neoart::crypto::ExecutorSetting::Inline,
+//! #     ));
+//! #     let net = Concurrent::run(net);
+//! #     let replica = Concurrent::run(replica);
+//! let result = client.invoke("hello".as_bytes());
+//! client
+//!     .run(async {
+//!         println!("{:?}", result.await);
+//!     })
+//!     .await;
+//! #     let replica = replica.join().await;
+//! #     net.join().await;
+//! # }
 //! ```
 //!
 //! The `Crypto` is intergrated into `Transport` through two sets of interfaces
@@ -51,6 +79,8 @@
 //! so e.g. `signed_message` never returns `None`. It is suitable for testing,
 //! and client which doesn't actually do any signing or verifying. `Rayon`
 //! executor uses a Rayon thread pool and is suitable for benchmarking.
+
+
 use std::{
     borrow::Borrow, collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin,
     sync::Arc, time::Duration,
@@ -160,7 +190,7 @@ impl<T: Receiver> Transport<T> {
 
     fn send_message_interal(socket: &Socket, destinations: &[SocketAddr], message: impl Serialize) {
         let mut buf = [0; 1400];
-        let len = serialize(&mut buf, message);
+        let len = serialize(&mut buf[..], message);
         let local = match socket {
             Socket::Os(socket) => socket.local_addr().unwrap(),
             &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,

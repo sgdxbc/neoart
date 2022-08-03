@@ -237,8 +237,6 @@ impl Client {
                 message.request_number,
                 replica_id
             );
-            println!("{:?}", message);
-            println!("{:?}", invoke.certificate.spec_response);
             return;
         }
         if invoke
@@ -326,12 +324,13 @@ pub struct Replica {
     transport: Transport<Self>,
     id: ReplicaId,
     view_number: ViewNumber,
-    // the high #op that should be speculative committed up to, and the
-    // corresponded history hash
+    // the #op that should be speculative committed up to, and the corresponded
+    // history hash
     // on primary replica the log record could be a little bit delayed to these
     // because of signing `OrderReq`
     op_number: OpNumber,
     history_digest: Digest,
+
     app: Box<dyn App + Send>,
     client_table: HashMap<ClientId, (RequestNumber, Option<SignedMessage>)>, // always SpecResponse
     log: Vec<LogEntry>,

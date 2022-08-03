@@ -1,4 +1,9 @@
-use std::{convert::Infallible, io::Read, net::SocketAddr, str::FromStr};
+use std::{
+    convert::Infallible,
+    io::{Cursor, Read, Write},
+    net::SocketAddr,
+    str::FromStr,
+};
 
 use bincode::Options;
 use rand::random;
@@ -23,12 +28,15 @@ pub fn deserialize<M: DeserializeOwned>(buf: impl Read) -> M {
         .unwrap()
 }
 
-pub fn serialize(mut buf: &mut [u8], message: impl Serialize) -> usize {
-    let len = buf.len();
+pub fn serialize<B>(buf: B, message: impl Serialize) -> usize
+where
+    Cursor<B>: Write,
+{
+    let mut cursor = Cursor::new(buf);
     bincode::options()
-        .serialize_into(&mut buf, &message)
+        .serialize_into(&mut cursor, &message)
         .unwrap();
-    len - buf.len()
+    cursor.position() as _
 }
 
 pub fn digest(message: impl Serialize) -> Digest {
