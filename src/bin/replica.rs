@@ -1,13 +1,21 @@
-use std::future::pending;
+use std::time::Duration;
 
 use clap::{clap_derive::ArgEnum, Parser};
 use neoart::{
     crypto::{CryptoMessage, ExecutorSetting},
+    latency::{merge_latency_with, Latency},
     meta::{Config, OpNumber, ReplicaId},
-    transport::{Receiver, Run, Socket, Transport},
+    transport::{
+        CryptoBegin, CryptoEnd, ReceiveBegin, ReceiveEnd, Receiver, ReceiverBegin, ReceiverEnd,
+        Run, SendBegin, SendEnd, Socket, Transport,
+    },
     unreplicated, zyzzyva, App,
 };
-use tokio::net::UdpSocket;
+use nix::{
+    sched::{sched_setaffinity, CpuSet},
+    unistd::Pid,
+};
+use tokio::{net::UdpSocket, signal::ctrl_c};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
 enum Mode {
@@ -21,7 +29,7 @@ struct Args {
     mode: Mode,
     #[clap(short, long)]
     index: ReplicaId,
-    #[clap(long = "worker", default_value_t = 0)]
+    #[clap(short = 't', long = "worker", default_value_t = 0)]
     num_worker: usize,
 }
 
@@ -40,6 +48,10 @@ where
     let mut config: Config = include_str!("config.txt").parse().unwrap();
     config.gen_keys();
 
+    let mut cpu_set = CpuSet::new();
+    cpu_set.set(0).unwrap();
+    sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+
     let socket = UdpSocket::bind(config.replicas[args.index as usize])
         .await
         .unwrap();
@@ -50,7 +62,31 @@ where
 
     let transport = Transport::new(config, Socket::Os(socket), setting);
     let mut replica = new_replica(transport);
-    replica.run(pending()).await;
+    replica.run(async { ctrl_c().await.unwrap() }).await;
+
+    println!();
+    let mut aggregated = Latency::default();
+    merge_latency_with(&mut aggregated);
+    println!(
+        "receive {:.3?} send {:.3?} crypto {:.3?} receiver {:.3?}",
+        aggregated
+            .intervals::<ReceiveBegin, ReceiveEnd>()
+            .into_iter()
+            .skip(1) // before client initialized
+            .sum::<Duration>(),
+        aggregated
+            .intervals::<SendBegin, SendEnd>()
+            .into_iter()
+            .sum::<Duration>(),
+        aggregated
+            .intervals::<CryptoBegin, CryptoEnd>()
+            .into_iter()
+            .sum::<Duration>(),
+        aggregated
+            .intervals::<ReceiverBegin, ReceiverEnd>()
+            .into_iter()
+            .sum::<Duration>(),
+    );
 }
 
 #[tokio::main(flavor = "current_thread")]

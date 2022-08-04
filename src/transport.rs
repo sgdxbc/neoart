@@ -80,7 +80,6 @@
 //! and client which doesn't actually do any signing or verifying. `Rayon`
 //! executor uses a Rayon thread pool and is suitable for benchmarking.
 
-
 use std::{
     borrow::Borrow, collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin,
     sync::Arc, time::Duration,
@@ -99,6 +98,7 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
+    latency::push_latency,
     meta::{deserialize, serialize, Config, ReplicaId},
 };
 
@@ -283,7 +283,9 @@ impl<T: Receiver> Transport<T> {
     {
         self.signed_id += 1;
         let signed_id = SignedMessage(self.signed_id);
+        push_latency::<CryptoBegin>(0);
         self.crypto.sign(signed_id, message, id);
+        push_latency::<CryptoEnd>(0);
         signed_id
     }
 
@@ -320,6 +322,7 @@ where
         pin!(close);
         let mut buf = [0; 1400];
         loop {
+            push_latency::<ReceiveBegin>(0);
             let transport = self.as_mut();
             let (&id, timer) = transport
                 .timer_table
@@ -336,6 +339,7 @@ where
                     handle_crypto_event(self, event.unwrap());
                 },
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
+                    push_latency::<ReceiveEnd>(0);
                     handle_raw_message(self, remote, &buf[..len]);
                 }
             }
@@ -347,11 +351,15 @@ where
             {
                 match event {
                     CryptoEvent::Verified(remote, message) => {
+                        push_latency::<ReceiverBegin>(0);
                         receiver.receive_message(remote, message);
+                        push_latency::<ReceiverEnd>(0);
                     }
                     CryptoEvent::Signed(id, message) => {
                         if let Some(destination) = receiver.as_mut().send_signed.remove(&id) {
+                            push_latency::<SendBegin>(0);
                             receiver.as_mut().send_message(destination, &message);
+                            push_latency::<SendEnd>(0);
                         }
                         receiver.as_mut().signed_messages.insert(id, message);
                         receiver.on_signed(id);
@@ -365,14 +373,24 @@ where
                 T::Message: CryptoMessage + Send + 'static,
             {
                 match receiver.inbound_action(buf) {
-                    InboundAction::Allow(message) => receiver.receive_message(remote, message),
+                    InboundAction::Allow(message) => {
+                        push_latency::<ReceiverBegin>(0);
+                        receiver.receive_message(remote, message);
+                        push_latency::<ReceiverEnd>(0);
+                    }
                     InboundAction::Block => {}
-                    InboundAction::VerifyReplica(message, replica_id) => receiver
-                        .as_mut()
-                        .crypto
-                        .verify_replica(remote, message, replica_id),
+                    InboundAction::VerifyReplica(message, replica_id) => {
+                        push_latency::<CryptoBegin>(0);
+                        receiver
+                            .as_mut()
+                            .crypto
+                            .verify_replica(remote, message, replica_id);
+                        push_latency::<CryptoEnd>(0);
+                    }
                     InboundAction::Verify(message, verify) => {
-                        receiver.as_mut().crypto.verify(remote, message, verify)
+                        push_latency::<CryptoBegin>(0);
+                        receiver.as_mut().crypto.verify(remote, message, verify);
+                        push_latency::<CryptoEnd>(0);
                     }
                 }
             }
@@ -496,3 +514,12 @@ impl<T> Concurrent<T> {
         self.1.await.unwrap()
     }
 }
+
+pub struct ReceiveBegin;
+pub struct ReceiveEnd;
+pub struct SendBegin;
+pub struct SendEnd;
+pub struct CryptoBegin;
+pub struct CryptoEnd;
+pub struct ReceiverBegin;
+pub struct ReceiverEnd;

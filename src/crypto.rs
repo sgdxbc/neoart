@@ -1,5 +1,9 @@
 use std::{mem::take, net::SocketAddr, sync::Arc, thread::spawn};
 
+use nix::{
+    sched::{sched_setaffinity, CpuSet},
+    unistd::Pid,
+};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey, SignOnly, VerifyOnly};
 use serde::{Deserialize, Serialize};
@@ -74,8 +78,13 @@ impl<M> Crypto<M> {
                 ThreadPoolBuilder::new()
                     .num_threads(num_threads)
                     .spawn_handler(|thread| {
-                        // set affinity, etc.
-                        spawn(|| thread.run());
+                        spawn(|| {
+                            let mut cpu_set = CpuSet::new();
+                            // save cpu#0 for transport + receiver
+                            cpu_set.set(thread.index() + 1).unwrap();
+                            sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                            thread.run()
+                        });
                         Ok(())
                     })
                     .build()
@@ -97,7 +106,7 @@ impl<M> Crypto<M> {
         message: M,
         verify_message: impl FnOnce(&mut M, &Config) -> bool + Send + 'static,
     ) where
-        M: CryptoMessage + Send + 'static,
+        M: Send + 'static,
     {
         match &self.executor {
             Executor::Inline => {
@@ -128,7 +137,7 @@ impl<M> Crypto<M> {
         message: M,
         verify_message: fn(&mut M, &Config) -> bool,
     ) where
-        M: CryptoMessage + Send + 'static,
+        M: Send + 'static,
     {
         self.verify_internal(remote, message, verify_message);
     }
@@ -139,9 +148,7 @@ impl<M> Crypto<M> {
         verify_message: impl FnOnce(&mut M, &Config) -> bool,
         config: &Config,
         sender: &Sender<CryptoEvent<M>>,
-    ) where
-        M: CryptoMessage,
-    {
+    ) {
         if verify_message(&mut message, config) {
             sender
                 .try_send(CryptoEvent::Verified(remote, message))

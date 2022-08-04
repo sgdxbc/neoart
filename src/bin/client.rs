@@ -52,7 +52,7 @@ async fn main_internal<T>(
             let throughput = throughput.clone();
             let new_client = new_client.clone();
             spawn(async move {
-                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let socket = UdpSocket::bind("12.0.0.101:0").await.unwrap();
                 socket.writable().await.unwrap();
                 let transport = Transport::new(config, Socket::Os(socket), ExecutorSetting::Inline);
                 let mut client = new_client(transport);
