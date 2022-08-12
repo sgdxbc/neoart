@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     crypto::{CryptoMessage, Signature},
-    meta::{random_id, ClientId, OpNumber, ReplicaId, RequestNumber},
+    meta::{random_id, ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
         Destination::{To, ToReplica},
         Receiver, SignedMessage, Transport,
@@ -161,7 +161,7 @@ impl Replica {
             op_number: 0,
             app: Box::new(app),
             client_table: HashMap::new(),
-            log: Vec::new(),
+            log: Vec::with_capacity(ENTRY_NUMBER),
         }
     }
 }

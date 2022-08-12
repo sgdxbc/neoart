@@ -1,4 +1,9 @@
-use std::{mem::take, net::SocketAddr, sync::Arc, thread::spawn};
+use std::{
+    mem::take,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    thread::spawn,
+};
 
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -10,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
+    latency::{merge_latency_into, Latency},
     meta::{digest, Config, Digest, ReplicaId},
     transport::{CryptoEvent, SignedMessage},
 };
@@ -64,26 +70,28 @@ enum Executor {
     Rayon(ThreadPool),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum ExecutorSetting {
     Inline,
-    Rayon(usize),
+    Rayon(usize, Arc<Mutex<Latency>>),
 }
 
 impl<M> Crypto<M> {
     pub fn new(config: Config, setting: ExecutorSetting, sender: Sender<CryptoEvent<M>>) -> Self {
         let executor = match setting {
             ExecutorSetting::Inline => Executor::Inline,
-            ExecutorSetting::Rayon(num_threads) => Executor::Rayon(
+            ExecutorSetting::Rayon(num_threads, latency) => Executor::Rayon(
                 ThreadPoolBuilder::new()
                     .num_threads(num_threads)
                     .spawn_handler(|thread| {
-                        spawn(|| {
+                        let latency = latency.clone();
+                        spawn(move || {
                             let mut cpu_set = CpuSet::new();
                             // save cpu#0 for transport + receiver
                             cpu_set.set(thread.index() + 1).unwrap();
                             sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
-                            thread.run()
+                            thread.run();
+                            merge_latency_into(&mut latency.lock().unwrap());
                         });
                         Ok(())
                     })

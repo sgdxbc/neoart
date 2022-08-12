@@ -98,8 +98,8 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
-    latency::push_latency,
-    meta::{deserialize, serialize, Config, ReplicaId},
+    latency::{push_latency, Point},
+    meta::{deserialize, serialize, Config, ReplicaId, ENTRY_NUMBER},
 };
 
 pub trait Receiver: Sized {
@@ -128,6 +128,7 @@ pub struct Transport<T: Receiver> {
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
     signed_messages: HashMap<SignedMessage, T::Message>,
+    on_signed_message: Option<(SignedMessage, T::Message)>,
     signed_id: u32,
     send_signed: HashMap<SignedMessage, Destination>,
 }
@@ -182,7 +183,8 @@ impl<T: Receiver> Transport<T> {
             socket,
             timer_table,
             timer_id: 0,
-            signed_messages: HashMap::new(),
+            signed_messages: HashMap::with_capacity(ENTRY_NUMBER),
+            on_signed_message: None,
             signed_id: 0,
             send_signed: HashMap::new(),
         }
@@ -283,13 +285,18 @@ impl<T: Receiver> Transport<T> {
     {
         self.signed_id += 1;
         let signed_id = SignedMessage(self.signed_id);
-        push_latency::<CryptoBegin>(0);
+        push_latency(Point::CryptoSubmitBegin);
         self.crypto.sign(signed_id, message, id);
-        push_latency::<CryptoEnd>(0);
+        push_latency(Point::CryptoSubmitEnd);
         signed_id
     }
 
     pub fn signed_message(&self, id: SignedMessage) -> Option<&T::Message> {
+        if let Some((signed_id, message)) = &self.on_signed_message {
+            if signed_id == &id {
+                return Some(message);
+            }
+        }
         self.signed_messages.get(&id)
     }
 }
@@ -322,7 +329,7 @@ where
         pin!(close);
         let mut buf = [0; 1400];
         loop {
-            push_latency::<ReceiveBegin>(0);
+            push_latency(Point::TransportBegin);
             let transport = self.as_mut();
             let (&id, timer) = transport
                 .timer_table
@@ -339,7 +346,7 @@ where
                     handle_crypto_event(self, event.unwrap());
                 },
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
-                    push_latency::<ReceiveEnd>(0);
+                    push_latency(Point::TransportEnd);
                     handle_raw_message(self, remote, &buf[..len]);
                 }
             }
@@ -351,18 +358,21 @@ where
             {
                 match event {
                     CryptoEvent::Verified(remote, message) => {
-                        push_latency::<ReceiverBegin>(0);
+                        push_latency(Point::ReceiverBegin);
                         receiver.receive_message(remote, message);
-                        push_latency::<ReceiverEnd>(0);
+                        push_latency(Point::ReceiverEnd);
                     }
                     CryptoEvent::Signed(id, message) => {
                         if let Some(destination) = receiver.as_mut().send_signed.remove(&id) {
-                            push_latency::<SendBegin>(0);
                             receiver.as_mut().send_message(destination, &message);
-                            push_latency::<SendEnd>(0);
                         }
-                        receiver.as_mut().signed_messages.insert(id, message);
+                        push_latency(Point::TransportEnd);
+                        push_latency(Point::ReceiverBegin);
+                        receiver.as_mut().on_signed_message = Some((id, message));
                         receiver.on_signed(id);
+                        // let (id, message) = receiver.as_mut().on_signed_message.take().unwrap();
+                        // receiver.as_mut().signed_messages.insert(id, message);
+                        push_latency(Point::ReceiverEnd);
                     }
                 }
             }
@@ -374,23 +384,23 @@ where
             {
                 match receiver.inbound_action(buf) {
                     InboundAction::Allow(message) => {
-                        push_latency::<ReceiverBegin>(0);
+                        push_latency(Point::ReceiverBegin);
                         receiver.receive_message(remote, message);
-                        push_latency::<ReceiverEnd>(0);
+                        push_latency(Point::ReceiverEnd);
                     }
                     InboundAction::Block => {}
                     InboundAction::VerifyReplica(message, replica_id) => {
-                        push_latency::<CryptoBegin>(0);
+                        push_latency(Point::CryptoSubmitBegin);
                         receiver
                             .as_mut()
                             .crypto
                             .verify_replica(remote, message, replica_id);
-                        push_latency::<CryptoEnd>(0);
+                        push_latency(Point::CryptoSubmitEnd);
                     }
                     InboundAction::Verify(message, verify) => {
-                        push_latency::<CryptoBegin>(0);
+                        push_latency(Point::CryptoSubmitBegin);
                         receiver.as_mut().crypto.verify(remote, message, verify);
-                        push_latency::<CryptoEnd>(0);
+                        push_latency(Point::CryptoSubmitEnd);
                     }
                 }
             }
@@ -514,12 +524,3 @@ impl<T> Concurrent<T> {
         self.1.await.unwrap()
     }
 }
-
-pub struct ReceiveBegin;
-pub struct ReceiveEnd;
-pub struct SendBegin;
-pub struct SendEnd;
-pub struct CryptoBegin;
-pub struct CryptoEnd;
-pub struct ReceiverBegin;
-pub struct ReceiverEnd;

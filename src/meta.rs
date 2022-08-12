@@ -10,6 +10,9 @@ use rand::random;
 use secp256k1::{hashes::sha256, KeyPair, Message, Secp256k1};
 use serde::{de::DeserializeOwned, Serialize};
 
+// preallocate 8M entries, the expected usage is at most ~300K * 20s
+pub const ENTRY_NUMBER: usize = 8 << 20;
+
 pub type ClientId = [u8; 4];
 pub type ReplicaId = u8;
 pub type RequestNumber = u32;

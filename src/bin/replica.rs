@@ -1,14 +1,11 @@
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use clap::{clap_derive::ArgEnum, Parser};
 use neoart::{
     crypto::{CryptoMessage, ExecutorSetting},
-    latency::{merge_latency_with, Latency},
+    latency::{merge_latency_into, Latency},
     meta::{Config, OpNumber, ReplicaId},
-    transport::{
-        CryptoBegin, CryptoEnd, ReceiveBegin, ReceiveEnd, Receiver, ReceiverBegin, ReceiverEnd,
-        Run, SendBegin, SendEnd, Socket, Transport,
-    },
+    transport::{Receiver, Run, Socket, Transport},
     unreplicated, zyzzyva, App,
 };
 use nix::{
@@ -55,9 +52,10 @@ where
     let socket = UdpSocket::bind(config.replicas[args.index as usize])
         .await
         .unwrap();
+    let latency = Arc::new(Mutex::new(Latency::default()));
     let setting = match args.num_worker {
         0 => ExecutorSetting::Inline,
-        n => ExecutorSetting::Rayon(n),
+        n => ExecutorSetting::Rayon(n, latency.clone()),
     };
 
     let transport = Transport::new(config, Socket::Os(socket), setting);
@@ -65,28 +63,9 @@ where
     replica.run(async { ctrl_c().await.unwrap() }).await;
 
     println!();
-    let mut aggregated = Latency::default();
-    merge_latency_with(&mut aggregated);
-    println!(
-        "receive {:.3?} send {:.3?} crypto {:.3?} receiver {:.3?}",
-        aggregated
-            .intervals::<ReceiveBegin, ReceiveEnd>()
-            .into_iter()
-            .skip(1) // before client initialized
-            .sum::<Duration>(),
-        aggregated
-            .intervals::<SendBegin, SendEnd>()
-            .into_iter()
-            .sum::<Duration>(),
-        aggregated
-            .intervals::<CryptoBegin, CryptoEnd>()
-            .into_iter()
-            .sum::<Duration>(),
-        aggregated
-            .intervals::<ReceiverBegin, ReceiverEnd>()
-            .into_iter()
-            .sum::<Duration>(),
-    );
+    let aggregated = &mut latency.lock().unwrap();
+    merge_latency_into(aggregated);
+    aggregated.sort();
 }
 
 #[tokio::main(flavor = "current_thread")]
