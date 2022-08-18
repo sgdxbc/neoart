@@ -12,7 +12,7 @@ use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::Pid,
 };
-use tokio::{net::UdpSocket, signal::ctrl_c};
+use tokio::{fs::read_to_string, net::UdpSocket, signal::ctrl_c};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
 enum Mode {
@@ -22,12 +22,16 @@ enum Mode {
 
 #[derive(Parser)]
 struct Args {
+    #[clap(short, long)]
+    config: String,
     #[clap(short, long, arg_enum)]
     mode: Mode,
     #[clap(short, long)]
     index: ReplicaId,
     #[clap(short = 't', long = "worker", default_value_t = 0)]
     num_worker: usize,
+    #[clap(short = 'b', long)]
+    enable_batching: bool,
 }
 
 struct Null;
@@ -42,7 +46,7 @@ where
     T: Receiver + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage,
 {
-    let mut config: Config = include_str!("config.txt").parse().unwrap();
+    let mut config: Config = read_to_string(args.config).await.unwrap().parse().unwrap();
     config.gen_keys();
 
     let mut cpu_set = CpuSet::new();
@@ -72,6 +76,7 @@ where
 async fn main() {
     let args = Args::parse();
     let index = args.index;
+    let enable_batching = args.enable_batching;
     match args.mode {
         Mode::Ur => {
             main_internal(args, move |transport| {
@@ -81,7 +86,7 @@ async fn main() {
         }
         Mode::Zyzzyva => {
             main_internal(args, move |transport| {
-                zyzzyva::Replica::new(transport, index, Null)
+                zyzzyva::Replica::new(transport, index, Null, enable_batching)
             })
             .await
         }

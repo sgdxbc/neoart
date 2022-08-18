@@ -370,8 +370,8 @@ where
                         push_latency(Point::ReceiverBegin);
                         receiver.as_mut().on_signed_message = Some((id, message));
                         receiver.on_signed(id);
-                        // let (id, message) = receiver.as_mut().on_signed_message.take().unwrap();
-                        // receiver.as_mut().signed_messages.insert(id, message);
+                        let (id, message) = receiver.as_mut().on_signed_message.take().unwrap();
+                        receiver.as_mut().signed_messages.insert(id, message);
                         push_latency(Point::ReceiverEnd);
                     }
                 }

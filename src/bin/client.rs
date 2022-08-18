@@ -1,4 +1,6 @@
 use std::{
+    net::Ipv4Addr,
+    str::FromStr,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex,
@@ -17,7 +19,9 @@ use neoart::{
     transport::{Receiver, Run, Socket, Transport},
     unreplicated, zyzzyva, Client,
 };
-use tokio::{net::UdpSocket, pin, runtime, select, spawn, sync::Notify, time::sleep};
+use tokio::{
+    fs::read_to_string, net::UdpSocket, pin, runtime, select, spawn, sync::Notify, time::sleep,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
 enum Mode {
@@ -28,6 +32,10 @@ enum Mode {
 
 #[derive(Parser)]
 struct Args {
+    #[clap(short, long)]
+    config: String,
+    #[clap(short, long)]
+    host: String,
     #[clap(short, long, arg_enum)]
     mode: Mode,
     #[clap(short = 't', long = "num", default_value_t = 1)]
@@ -41,10 +49,11 @@ async fn main_internal<T>(
     T: Receiver + Client + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage,
 {
-    let config: Config = include_str!("config.txt").parse().unwrap();
+    let config: Config = read_to_string(args.config).await.unwrap().parse().unwrap();
 
     let notify = Arc::new(Notify::new());
     let throughput = Arc::new(AtomicU32::new(0));
+    let address = (Ipv4Addr::from_str(&args.host).unwrap(), 0);
     let clients = (0..args.n)
         .map(|i| {
             let config = config.clone();
@@ -52,7 +61,7 @@ async fn main_internal<T>(
             let throughput = throughput.clone();
             let new_client = new_client.clone();
             spawn(async move {
-                let socket = UdpSocket::bind("12.0.0.101:0").await.unwrap();
+                let socket = UdpSocket::bind(address).await.unwrap();
                 socket.writable().await.unwrap();
                 let transport = Transport::new(config, Socket::Os(socket), ExecutorSetting::Inline);
                 let mut client = new_client(transport);

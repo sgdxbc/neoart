@@ -27,7 +27,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     Request(Request),
-    OrderReq(OrderReq, Request),
+    OrderReq(OrderReq, Vec<Request>),
     SpecResponse(SpecResponse, ReplicaId, Vec<u8>, OrderReq),
     Commit(Commit),
     LocalCommit(LocalCommit),
@@ -141,7 +141,7 @@ pub struct Client {
     request_number: RequestNumber,
     invoke: Option<Invoke>,
     view_number: ViewNumber,
-    is_byz: bool,
+    assume_byz: bool,
 }
 
 struct Invoke {
@@ -154,14 +154,14 @@ struct Invoke {
 }
 
 impl Client {
-    pub fn new(transport: Transport<Self>, is_byz: bool) -> Self {
+    pub fn new(transport: Transport<Self>, assume_byz: bool) -> Self {
         Self {
             transport,
             id: random_id(),
             request_number: 0,
             invoke: None,
             view_number: 0,
-            is_byz,
+            assume_byz,
         }
     }
 }
@@ -248,7 +248,8 @@ impl Client {
             invoke.certificate.signatures.push((replica_id, signature));
         }
 
-        if self.is_byz && invoke.certificate.signatures.len() == self.transport.config.f * 2 + 1 {
+        if self.assume_byz && invoke.certificate.signatures.len() == self.transport.config.f * 2 + 1
+        {
             self.transport.cancel_timer(invoke.timer_id);
             self.send_request();
         } else if invoke.certificate.signatures.len() == self.transport.config.n {
@@ -337,21 +338,30 @@ pub struct Replica {
     client_table: HashMap<ClientId, (RequestNumber, Option<SignedMessage>)>, // always SpecResponse
     log: Vec<LogEntry>,
     commit_certificate: CommitCertificate, // highest
-    reorder_order_req: Reorder<(OrderReq, Request)>,
+    reorder_order_req: Reorder<(OrderReq, Vec<Request>)>,
     routes: HashMap<ClientId, SocketAddr>,
+    batch_size: usize,
+    batch: Vec<Request>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogEntry {
     view_number: ViewNumber,
-    request: Request,
-    spec_response: SignedMessage,
+    requests: Vec<Request>,
+    // spec_response: SignedMessage,
     message_digest: Digest,
     history_digest: Digest,
 }
 
 impl Replica {
-    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
+    const BATCH_SIZE: usize = 10; // is there a way to do adaptive batching?
+
+    pub fn new(
+        transport: Transport<Self>,
+        id: ReplicaId,
+        app: impl App + Send + 'static,
+        enable_batching: bool,
+    ) -> Self {
         Self {
             transport,
             id,
@@ -364,6 +374,8 @@ impl Replica {
             log: Vec::new(),
             reorder_order_req: Reorder::new(1),
             commit_certificate: CommitCertificate::default(),
+            batch_size: if enable_batching { Self::BATCH_SIZE } else { 1 },
+            batch: Vec::new(),
         }
     }
 }
@@ -384,6 +396,7 @@ impl Receiver for Replica {
             Message::OrderReq(OrderReq { view_number, .. }, _) => {
                 InboundAction::VerifyReplica(message, self.transport.config.primary(view_number))
             }
+            // reduce duplicated verification?
             Message::Commit(_) => InboundAction::Verify(message, Message::verify_commit),
             _ => {
                 println!("! [{}] unexpected {message:?}", self.id);
@@ -426,6 +439,9 @@ impl Replica {
                 return;
             }
             if message.request_number == request_number {
+                if request_number != 1 {
+                    panic!("{message:?}");
+                }
                 if let Some(spec_response) = spec_response {
                     self.transport
                         .send_signed_message(To(remote), spec_response);
@@ -438,11 +454,16 @@ impl Replica {
             todo!()
         }
 
-        self.op_number += 1;
         self.client_table
             .insert(message.client_id, (message.request_number, None));
+        self.batch.push(message);
+        if self.batch.len() < self.batch_size {
+            return;
+        }
 
-        let message_digest = digest(&message);
+        self.op_number += 1;
+        let batch = take(&mut self.batch);
+        let message_digest = digest(&batch);
         self.history_digest = digest([self.history_digest, message_digest]);
         let order_req = self.transport.sign_message(
             self.id,
@@ -454,7 +475,7 @@ impl Replica {
                     history_digest: self.history_digest,
                     signature: Signature::default(),
                 },
-                message,
+                batch,
             ),
         );
         self.transport.send_signed_message(ToAll, order_req);
@@ -462,7 +483,7 @@ impl Replica {
         // locally speculative commit in `Receiver::on_signed`
     }
 
-    fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Request) {
+    fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Vec<Request>) {
         if message.message_digest != digest(&request) {
             println!(
                 "! OrderReq incorrect message digest op {}",
@@ -503,44 +524,46 @@ impl Replica {
         }
     }
 
-    fn spec_commit(&mut self, message: OrderReq, request: Request) {
+    fn spec_commit(&mut self, message: OrderReq, batch: Vec<Request>) {
         assert_eq!(message.view_number, self.view_number);
-        let result = self.app.replica_upcall(message.op_number, &request.op);
-        let history_digest = message.history_digest;
-        let message_digest = message.message_digest;
-        let spec_response = self.transport.sign_message(
-            self.id,
-            Message::SpecResponse(
-                SpecResponse {
-                    view_number: self.view_number,
-                    op_number: message.op_number,
-                    result_digest: digest(&result),
-                    history_digest,
-                    client_id: request.client_id,
-                    request_number: request.request_number,
-                    signature: Signature::default(),
-                },
+
+        for request in &batch {
+            let result = self.app.replica_upcall(message.op_number, &request.op);
+            let spec_response = self.transport.sign_message(
                 self.id,
-                result,
-                message,
-            ),
-        );
-        let client_id = request.client_id;
-        let request_number = request.request_number;
+                Message::SpecResponse(
+                    SpecResponse {
+                        view_number: self.view_number,
+                        op_number: message.op_number,
+                        result_digest: digest(&result),
+                        history_digest: message.history_digest,
+                        client_id: request.client_id,
+                        request_number: request.request_number,
+                        signature: Signature::default(),
+                    },
+                    self.id,
+                    result,
+                    message.clone(),
+                ),
+            );
+            let client_id = request.client_id;
+            let request_number = request.request_number;
+            // is this SpecResponse always up to date?
+            self.client_table
+                .insert(client_id, (request_number, Some(spec_response)));
+            if let Some(&remote) = self.routes.get(&client_id) {
+                self.transport
+                    .send_signed_message(To(remote), spec_response);
+            }
+        }
+
         self.log.push(LogEntry {
             view_number: self.view_number,
-            request,
-            spec_response,
-            message_digest,
-            history_digest,
+            requests: batch,
+            // spec_response,
+            message_digest: message.message_digest,
+            history_digest: message.history_digest,
         });
-        // is this SpecResponse always up to date?
-        self.client_table
-            .insert(client_id, (request_number, Some(spec_response)));
-        if let Some(&remote) = self.routes.get(&client_id) {
-            self.transport
-                .send_signed_message(To(remote), spec_response);
-        }
     }
 
     fn handle_commit(&mut self, remote: SocketAddr, message: Commit) {
@@ -605,7 +628,7 @@ mod tests {
     }
 
     impl System {
-        fn new(num_client: usize, is_byz: bool) -> Self {
+        fn new(num_client: usize, assume_byz: bool, enable_batching: bool) -> Self {
             let config = SimulatedNetwork::config(4, 1);
             let mut net = SimulatedNetwork::default();
             let (client_ids, clients) = (0..num_client)
@@ -616,7 +639,7 @@ mod tests {
                             net.insert_socket(SimulatedNetwork::client(i)),
                             ExecutorSetting::Inline,
                         ),
-                        is_byz,
+                        assume_byz,
                     );
                     (client.id, client)
                 })
@@ -631,6 +654,7 @@ mod tests {
                         ),
                         i as ReplicaId,
                         TestApp::default(),
+                        enable_batching,
                     );
                     for (i, &id) in client_ids.iter().enumerate() {
                         replica.routes.insert(id, SimulatedNetwork::client(i));
@@ -649,7 +673,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_op() {
-        let mut system = System::new(1, false);
+        let mut system = System::new(1, false, false);
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
             Duration::from_millis(30),
@@ -689,7 +713,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop() {
         let num_client = 10;
-        let mut system = System::new(num_client, false);
+        let mut system = System::new(num_client, false, false);
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
         }
@@ -707,7 +731,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_op_byzantine() {
-        let mut system = System::new(1, true);
+        let mut system = System::new(1, true, false);
         system.replicas.remove(3).join().await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
@@ -728,7 +752,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop_byzantine() {
         let num_client = 10;
-        let mut system = System::new(num_client, true);
+        let mut system = System::new(num_client, true, false);
         system.replicas.remove(3).join().await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
@@ -736,6 +760,25 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         let primary_len = system.replicas.remove(0).join().await.log.len();
         assert!(primary_len >= 1000 / 50 * num_client);
+        for replica in system.replicas {
+            let backup_len = replica.join().await.log.len();
+            // stronger assertions?
+            assert!(backup_len <= primary_len);
+            assert!(backup_len >= primary_len - num_client);
+        }
+        system.net.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_closed_loop_batching() {
+        let num_client = Replica::BATCH_SIZE * 4;
+        let mut system = System::new(num_client, false, true);
+        for (index, client) in system.clients.into_iter().enumerate() {
+            closed_loop(index, client);
+        }
+        sleep(Duration::from_secs(1)).await;
+        let primary_len = system.replicas.remove(0).join().await.log.len();
+        assert!(primary_len >= 1000 / 30 * (num_client / Replica::BATCH_SIZE));
         for replica in system.replicas {
             let backup_len = replica.join().await.log.len();
             // stronger assertions?
