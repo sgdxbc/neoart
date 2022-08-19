@@ -17,7 +17,7 @@ use tokio::sync::mpsc::Sender;
 use crate::{
     latency::{merge_latency_into, Latency},
     meta::{digest, Config, Digest, ReplicaId},
-    transport::{CryptoEvent, SignedMessage},
+    transport::CryptoEvent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,7 +167,7 @@ impl<M> Crypto<M> {
         }
     }
 
-    pub fn sign(&mut self, signed_id: SignedMessage, message: M, id: ReplicaId)
+    pub fn sign(&mut self, signed_id: u32, message: M, id: ReplicaId)
     where
         M: CryptoMessage + Send + 'static,
     {
@@ -186,12 +186,8 @@ impl<M> Crypto<M> {
         }
     }
 
-    fn sign_task(
-        id: SignedMessage,
-        mut message: M,
-        secret_key: &SecretKey,
-        sender: &Sender<CryptoEvent<M>>,
-    ) where
+    fn sign_task(id: u32, mut message: M, secret_key: &SecretKey, sender: &Sender<CryptoEvent<M>>)
+    where
         M: CryptoMessage,
     {
         thread_local! {

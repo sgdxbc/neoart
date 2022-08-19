@@ -8,7 +8,7 @@ use crate::{
     meta::{random_id, ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
         Destination::{To, ToReplica},
-        Receiver, SignedMessage, Transport,
+        Receiver, Transport,
     },
     App,
 };
@@ -141,16 +141,16 @@ impl Client {
 
 pub struct Replica {
     transport: Transport<Self>,
+    id: ReplicaId,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, (RequestNumber, SignedMessage)>,
+    client_table: HashMap<ClientId, Reply>,
     log: Vec<LogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogEntry {
     request: Request,
-    reply: SignedMessage,
 }
 
 impl Replica {
@@ -158,6 +158,7 @@ impl Replica {
         assert_eq!(id, 0);
         Self {
             transport,
+            id,
             op_number: 0,
             app: Box::new(app),
             client_table: HashMap::new(),
@@ -181,32 +182,34 @@ impl Receiver for Replica {
         } else {
             unreachable!()
         };
-        if let Some(&(request_number, reply)) = self.client_table.get(&message.client_id) {
-            if request_number > message.request_number {
+        if let Some(reply) = self.client_table.get(&message.client_id) {
+            if reply.request_number > message.request_number {
                 return;
             }
-            if request_number == message.request_number {
-                self.transport.send_signed_message(To(remote), reply);
+            if reply.request_number == message.request_number {
+                println!("! resend");
+                self.transport.send_signed_message(
+                    To(remote),
+                    Message::Reply(reply.clone()),
+                    self.id,
+                );
                 return;
             }
         }
 
         self.op_number += 1;
         let result = self.app.replica_upcall(self.op_number, &message.op);
-        let reply = self.transport.sign_message(
-            0,
-            Message::Reply(Reply {
-                request_number: message.request_number,
-                result,
-                signature: Signature::default(),
-            }),
-        );
+        let reply = Message::Reply(Reply {
+            request_number: message.request_number,
+            result,
+            signature: Signature::default(),
+        });
         self.log.push(LogEntry {
             request: message.clone(),
-            reply,
         });
         assert_eq!(self.log.len() as OpNumber, self.op_number);
-        self.transport.send_signed_message(To(remote), reply);
+        self.transport
+            .send_signed_message(To(remote), reply, self.id);
     }
 }
 

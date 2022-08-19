@@ -19,7 +19,7 @@ use crate::{
     },
     transport::{
         Destination::{To, ToAll, ToReplica},
-        InboundAction, Receiver, SignedMessage, Transport,
+        InboundAction, Receiver, Transport,
     },
     App,
 };
@@ -335,7 +335,7 @@ pub struct Replica {
     history_digest: Digest,
 
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, (RequestNumber, Option<SignedMessage>)>, // always SpecResponse
+    client_table: HashMap<ClientId, (RequestNumber, Option<Message>)>, // always Message::SpecResponse
     log: Vec<LogEntry>,
     commit_certificate: CommitCertificate, // highest
     reorder_order_req: Reorder<(OrderReq, Vec<Request>)>,
@@ -414,17 +414,21 @@ impl Receiver for Replica {
         }
     }
 
-    fn on_signed(&mut self, id: SignedMessage) {
-        if let Message::OrderReq(message, request) = self.transport.signed_message(id).unwrap() {
-            if self.view_number == message.view_number {
-                assert_eq!(self.id, self.transport.config.primary(self.view_number));
-                let mut ordered = self
-                    .reorder_order_req
-                    .insert_reorder(message.op_number, (message.clone(), request.clone()));
-                while let Some((message, request)) = ordered {
-                    self.spec_commit(message, request);
-                    ordered = self.reorder_order_req.expect_next();
-                }
+    fn on_signed(&mut self, message: Message) {
+        if matches!(message, Message::OrderReq(..)) {
+            self.transport.send_message(ToAll, &message);
+        }
+
+        if let Message::OrderReq(message, request) = message {
+            // assert_eq!(self.id, self.transport.config.primary(self.view_number));
+
+            let mut ordered = self
+                .reorder_order_req
+                .insert_reorder(message.op_number, (message.clone(), request.clone()));
+            while let Some((message, request)) = ordered {
+                // TODO guard view number
+                self.spec_commit(message, request);
+                ordered = self.reorder_order_req.expect_next();
             }
         }
     }
@@ -434,17 +438,14 @@ impl Replica {
     fn handle_request(&mut self, remote: SocketAddr, message: Request) {
         self.routes.insert(message.client_id, remote);
 
-        if let Some(&(request_number, spec_response)) = self.client_table.get(&message.client_id) {
-            if message.request_number < request_number {
+        if let Some((request_number, spec_response)) = self.client_table.get(&message.client_id) {
+            if message.request_number < *request_number {
                 return;
             }
-            if message.request_number == request_number {
-                if request_number != 1 {
-                    panic!("{message:?}");
-                }
+            if message.request_number == *request_number {
                 if let Some(spec_response) = spec_response {
                     self.transport
-                        .send_signed_message(To(remote), spec_response);
+                        .send_signed_message(To(remote), spec_response.clone(), self.id);
                 }
                 return;
             }
@@ -465,7 +466,7 @@ impl Replica {
         let batch = take(&mut self.batch);
         let message_digest = digest(&batch);
         self.history_digest = digest([self.history_digest, message_digest]);
-        let order_req = self.transport.sign_message(
+        self.transport.sign_message(
             self.id,
             Message::OrderReq(
                 OrderReq {
@@ -478,9 +479,8 @@ impl Replica {
                 batch,
             ),
         );
-        self.transport.send_signed_message(ToAll, order_req);
 
-        // locally speculative commit in `Receiver::on_signed`
+        // broadcast & locally speculative commit in `Receiver::on_signed`
     }
 
     fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Vec<Request>) {
@@ -529,31 +529,28 @@ impl Replica {
 
         for request in &batch {
             let result = self.app.replica_upcall(message.op_number, &request.op);
-            let spec_response = self.transport.sign_message(
+            let spec_response = Message::SpecResponse(
+                SpecResponse {
+                    view_number: self.view_number,
+                    op_number: message.op_number,
+                    result_digest: digest(&result),
+                    history_digest: message.history_digest,
+                    client_id: request.client_id,
+                    request_number: request.request_number,
+                    signature: Signature::default(),
+                },
                 self.id,
-                Message::SpecResponse(
-                    SpecResponse {
-                        view_number: self.view_number,
-                        op_number: message.op_number,
-                        result_digest: digest(&result),
-                        history_digest: message.history_digest,
-                        client_id: request.client_id,
-                        request_number: request.request_number,
-                        signature: Signature::default(),
-                    },
-                    self.id,
-                    result,
-                    message.clone(),
-                ),
+                result,
+                message.clone(),
             );
             let client_id = request.client_id;
             let request_number = request.request_number;
             // is this SpecResponse always up to date?
             self.client_table
-                .insert(client_id, (request_number, Some(spec_response)));
+                .insert(client_id, (request_number, Some(spec_response.clone())));
             if let Some(&remote) = self.routes.get(&client_id) {
                 self.transport
-                    .send_signed_message(To(remote), spec_response);
+                    .send_signed_message(To(remote), spec_response, self.id);
             }
         }
 
@@ -587,18 +584,16 @@ impl Replica {
         if spec_response.op_number > self.commit_certificate.spec_response.op_number {
             self.commit_certificate = message.certificate;
         }
-        let local_commit = self.transport.sign_message(
-            self.id,
-            Message::LocalCommit(LocalCommit {
-                view_number: self.view_number,
-                message_digest: entry.message_digest,
-                history_digest: entry.history_digest,
-                replica_id: self.id,
-                client_id: message.client_id,
-                signature: Signature::default(),
-            }),
-        );
-        self.transport.send_signed_message(To(remote), local_commit);
+        let local_commit = Message::LocalCommit(LocalCommit {
+            view_number: self.view_number,
+            message_digest: entry.message_digest,
+            history_digest: entry.history_digest,
+            replica_id: self.id,
+            client_id: message.client_id,
+            signature: Signature::default(),
+        });
+        self.transport
+            .send_signed_message(To(remote), local_commit, self.id);
     }
 }
 

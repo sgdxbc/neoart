@@ -87,7 +87,7 @@ use std::{
 
 use async_trait::async_trait;
 use rand::{thread_rng, Rng};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     net::UdpSocket,
     pin, select, spawn,
@@ -99,7 +99,7 @@ use tokio::{
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
     latency::{push_latency, Point},
-    meta::{deserialize, serialize, Config, ReplicaId, ENTRY_NUMBER},
+    meta::{deserialize, serialize, Config, ReplicaId},
 };
 
 pub trait Receiver: Sized {
@@ -109,7 +109,7 @@ pub trait Receiver: Sized {
     }
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
     #[allow(unused_variables)]
-    fn on_signed(&mut self, signed_id: SignedMessage) {}
+    fn on_signed(&mut self, signed_message: Self::Message) {}
 }
 
 pub enum InboundAction<M> {
@@ -127,10 +127,8 @@ pub struct Transport<T: Receiver> {
     socket: Socket,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
-    signed_messages: HashMap<SignedMessage, T::Message>,
-    on_signed_message: Option<(SignedMessage, T::Message)>,
     signed_id: u32,
-    send_signed: HashMap<SignedMessage, Destination>,
+    send_signed: HashMap<u32, Destination>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,11 +140,8 @@ pub enum Destination {
 
 pub enum CryptoEvent<M> {
     Verified(SocketAddr, M),
-    Signed(SignedMessage, M),
+    Signed(u32, M),
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SignedMessage(u32);
 
 struct Timer<T> {
     sleep: Pin<Box<Sleep>>,
@@ -183,8 +178,6 @@ impl<T: Receiver> Transport<T> {
             socket,
             timer_table,
             timer_id: 0,
-            signed_messages: HashMap::with_capacity(ENTRY_NUMBER),
-            on_signed_message: None,
             signed_id: 0,
             send_signed: HashMap::new(),
         }
@@ -240,16 +233,25 @@ impl<T: Receiver> Transport<T> {
         }
     }
 
-    pub fn send_signed_message(&mut self, destination: Destination, message: SignedMessage)
-    where
-        T::Message: Serialize,
+    pub fn send_signed_message(
+        &mut self,
+        destination: Destination,
+        message: T::Message,
+        id: ReplicaId,
+    ) where
+        T::Message: CryptoMessage + Send + 'static,
     {
-        if let Some(message) = self.signed_message(message) {
-            self.send_message(destination, message);
-        } else {
-            let dest = self.send_signed.insert(message, destination);
-            assert!(dest.is_none());
-        }
+        self.signed_id += 1;
+        self.crypto.sign(self.signed_id, message, id);
+        self.send_signed.insert(self.signed_id, destination);
+    }
+
+    pub fn sign_message(&mut self, id: ReplicaId, message: T::Message)
+    where
+        T::Message: CryptoMessage + Send + 'static,
+    {
+        self.signed_id += 1;
+        self.crypto.sign(self.signed_id, message, id);
     }
 
     pub fn create_timer(
@@ -277,27 +279,6 @@ impl<T: Receiver> Transport<T> {
 
     pub fn cancel_timer(&mut self, id: u32) {
         self.timer_table.remove(&id);
-    }
-
-    pub fn sign_message(&mut self, id: ReplicaId, message: T::Message) -> SignedMessage
-    where
-        T::Message: CryptoMessage + Send + 'static,
-    {
-        self.signed_id += 1;
-        let signed_id = SignedMessage(self.signed_id);
-        push_latency(Point::CryptoSubmitBegin);
-        self.crypto.sign(signed_id, message, id);
-        push_latency(Point::CryptoSubmitEnd);
-        signed_id
-    }
-
-    pub fn signed_message(&self, id: SignedMessage) -> Option<&T::Message> {
-        if let Some((signed_id, message)) = &self.on_signed_message {
-            if signed_id == &id {
-                return Some(message);
-            }
-        }
-        self.signed_messages.get(&id)
     }
 }
 
@@ -368,10 +349,7 @@ where
                         }
                         push_latency(Point::TransportEnd);
                         push_latency(Point::ReceiverBegin);
-                        receiver.as_mut().on_signed_message = Some((id, message));
-                        receiver.on_signed(id);
-                        let (id, message) = receiver.as_mut().on_signed_message.take().unwrap();
-                        receiver.as_mut().signed_messages.insert(id, message);
+                        receiver.on_signed(message);
                         push_latency(Point::ReceiverEnd);
                     }
                 }
