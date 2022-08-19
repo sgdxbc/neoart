@@ -8,12 +8,12 @@ use std::{
 pub enum Point {
     RequestBegin(u32),
     RequestEnd(u32),
-    TransportBegin,
-    TransportEnd,
-    ReceiverBegin,
-    ReceiverEnd,
-    CryptoSubmitBegin,
-    CryptoSubmitEnd,
+    // TransportBegin,
+    // TransportEnd,
+    // ReceiverBegin,
+    // ReceiverEnd,
+    // CryptoSubmitBegin,
+    // CryptoSubmitEnd,
 }
 
 #[derive(Debug, Clone, Default)]

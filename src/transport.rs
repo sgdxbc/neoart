@@ -98,7 +98,7 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
-    latency::{push_latency, Point},
+    // latency::{push_latency, Point},
     meta::{deserialize, serialize, Config, ReplicaId},
 };
 
@@ -310,7 +310,6 @@ where
         pin!(close);
         let mut buf = [0; 1400];
         loop {
-            push_latency(Point::TransportBegin);
             let transport = self.as_mut();
             let (&id, timer) = transport
                 .timer_table
@@ -327,7 +326,6 @@ where
                     handle_crypto_event(self, event.unwrap());
                 },
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
-                    push_latency(Point::TransportEnd);
                     handle_raw_message(self, remote, &buf[..len]);
                 }
             }
@@ -339,18 +337,13 @@ where
             {
                 match event {
                     CryptoEvent::Verified(remote, message) => {
-                        push_latency(Point::ReceiverBegin);
                         receiver.receive_message(remote, message);
-                        push_latency(Point::ReceiverEnd);
                     }
                     CryptoEvent::Signed(id, message) => {
                         if let Some(destination) = receiver.as_mut().send_signed.remove(&id) {
                             receiver.as_mut().send_message(destination, &message);
                         }
-                        push_latency(Point::TransportEnd);
-                        push_latency(Point::ReceiverBegin);
                         receiver.on_signed(message);
-                        push_latency(Point::ReceiverEnd);
                     }
                 }
             }
@@ -362,23 +355,17 @@ where
             {
                 match receiver.inbound_action(buf) {
                     InboundAction::Allow(message) => {
-                        push_latency(Point::ReceiverBegin);
                         receiver.receive_message(remote, message);
-                        push_latency(Point::ReceiverEnd);
                     }
                     InboundAction::Block => {}
                     InboundAction::VerifyReplica(message, replica_id) => {
-                        push_latency(Point::CryptoSubmitBegin);
                         receiver
                             .as_mut()
                             .crypto
                             .verify_replica(remote, message, replica_id);
-                        push_latency(Point::CryptoSubmitEnd);
                     }
                     InboundAction::Verify(message, verify) => {
-                        push_latency(Point::CryptoSubmitBegin);
                         receiver.as_mut().crypto.verify(remote, message, verify);
-                        push_latency(Point::CryptoSubmitEnd);
                     }
                 }
             }
