@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     crypto::{CryptoMessage, Signature},
-    meta::{random_id, ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
+    meta::{ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
         Destination::{To, ToReplica},
         Receiver, Transport,
@@ -60,8 +60,8 @@ struct Invoke {
 impl Client {
     pub fn new(transport: Transport<Self>) -> Self {
         Self {
+            id: transport.create_id(),
             transport,
-            id: random_id(),
             request_number: 0,
             invoke: None,
         }
@@ -126,11 +126,7 @@ impl Client {
                 receiver.invoke.as_ref().unwrap().request.request_number,
                 request_number
             );
-            println!(
-                "! client {:08x} resend request {}",
-                u32::from_ne_bytes(receiver.id),
-                request_number
-            );
+            println!("! client {} resend request {}", receiver.id, request_number);
             receiver.send_request();
         };
         self.invoke.as_mut().unwrap().timer_id = self

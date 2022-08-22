@@ -99,7 +99,7 @@ use tokio::{
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
     // latency::{push_latency, Point},
-    meta::{deserialize, serialize, Config, ReplicaId},
+    meta::{deserialize, random_id, serialize, ClientId, Config, ReplicaId},
 };
 
 pub trait Receiver: Sized {
@@ -181,6 +181,14 @@ impl<T: Receiver> Transport<T> {
             signed_id: 0,
             send_signed: HashMap::new(),
         }
+    }
+
+    pub fn create_id(&self) -> ClientId {
+        let addr = match &self.socket {
+            Socket::Os(socket) => socket.local_addr().unwrap(),
+            &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,
+        };
+        random_id(addr)
     }
 
     fn send_message_interal(socket: &Socket, destinations: &[SocketAddr], message: impl Serialize) {

@@ -14,8 +14,8 @@ use crate::{
     common::Reorder,
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
-        deserialize, digest, random_id, ClientId, Config, Digest, OpNumber, ReplicaId,
-        RequestNumber, ViewNumber,
+        deserialize, digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber,
+        ViewNumber,
     },
     transport::{
         Destination::{To, ToAll, ToReplica},
@@ -156,8 +156,8 @@ struct Invoke {
 impl Client {
     pub fn new(transport: Transport<Self>, assume_byz: bool) -> Self {
         Self {
+            id: transport.create_id(),
             transport,
-            id: random_id(),
             request_number: 0,
             invoke: None,
             view_number: 0,
@@ -232,10 +232,8 @@ impl Client {
             invoke.result = result;
         } else if message != invoke.certificate.spec_response || result != invoke.result {
             println!(
-                "! client {:08x} mismatched result request {} replica {}",
-                u32::from_ne_bytes(self.id),
-                message.request_number,
-                replica_id
+                "! client {} mismatched result request {} replica {}",
+                self.id, message.request_number, replica_id
             );
             return;
         }
@@ -309,11 +307,7 @@ impl Client {
                 request_number
             );
             if request_number != 1 {
-                println!(
-                    "! client {:08x} resend request {}",
-                    u32::from_ne_bytes(receiver.id),
-                    request_number
-                );
+                println!("! client {} resend request {}", receiver.id, request_number);
             }
             receiver.send_request();
         };
@@ -339,7 +333,6 @@ pub struct Replica {
     log: Vec<LogEntry>,
     commit_certificate: CommitCertificate, // highest
     reorder_order_req: Reorder<(OrderReq, Vec<Request>)>,
-    routes: HashMap<ClientId, SocketAddr>,
     batch_size: usize,
     batch: Vec<Request>,
 }
@@ -370,7 +363,6 @@ impl Replica {
             history_digest: Digest::default(),
             app: Box::new(app),
             client_table: HashMap::new(),
-            routes: HashMap::new(),
             log: Vec::new(),
             reorder_order_req: Reorder::new(1),
             commit_certificate: CommitCertificate::default(),
@@ -436,8 +428,6 @@ impl Receiver for Replica {
 
 impl Replica {
     fn handle_request(&mut self, remote: SocketAddr, message: Request) {
-        self.routes.insert(message.client_id, remote);
-
         if let Some((request_number, spec_response)) = self.client_table.get(&message.client_id) {
             if message.request_number < *request_number {
                 return;
@@ -548,10 +538,8 @@ impl Replica {
             // is this SpecResponse always up to date?
             self.client_table
                 .insert(client_id, (request_number, Some(spec_response.clone())));
-            if let Some(&remote) = self.routes.get(&client_id) {
-                self.transport
-                    .send_signed_message(To(remote), spec_response, self.id);
-            }
+            self.transport
+                .send_signed_message(To(client_id.0), spec_response, self.id);
         }
 
         self.log.push(LogEntry {
@@ -626,22 +614,21 @@ mod tests {
         fn new(num_client: usize, assume_byz: bool, enable_batching: bool) -> Self {
             let config = SimulatedNetwork::config(4, 1);
             let mut net = SimulatedNetwork::default();
-            let (client_ids, clients) = (0..num_client)
+            let clients = (0..num_client)
                 .map(|i| {
-                    let client = Client::new(
+                    Client::new(
                         Transport::new(
                             config.clone(),
                             net.insert_socket(SimulatedNetwork::client(i)),
                             ExecutorSetting::Inline,
                         ),
                         assume_byz,
-                    );
-                    (client.id, client)
+                    )
                 })
-                .unzip::<_, _, Vec<_>, Vec<_>>();
+                .collect::<Vec<_>>();
             let replicas = (0..4)
                 .map(|i| {
-                    let mut replica = Replica::new(
+                    let replica = Replica::new(
                         Transport::new(
                             config.clone(),
                             net.insert_socket(config.replicas[i]),
@@ -651,9 +638,6 @@ mod tests {
                         TestApp::default(),
                         enable_batching,
                     );
-                    for (i, &id) in client_ids.iter().enumerate() {
-                        replica.routes.insert(id, SimulatedNetwork::client(i));
-                    }
                     Concurrent::run(replica)
                 })
                 .collect::<Vec<_>>();
