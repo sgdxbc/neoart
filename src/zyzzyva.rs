@@ -407,10 +407,6 @@ impl Receiver for Replica {
     }
 
     fn on_signed(&mut self, message: Message) {
-        if matches!(message, Message::OrderReq(..)) {
-            self.transport.send_message(ToAll, &message);
-        }
-
         if let Message::OrderReq(message, request) = message {
             // assert_eq!(self.id, self.transport.config.primary(self.view_number));
 
@@ -422,6 +418,8 @@ impl Receiver for Replica {
                 self.spec_commit(message, request);
                 ordered = self.reorder_order_req.expect_next();
             }
+        } else {
+            unreachable!()
         }
     }
 }
@@ -456,8 +454,8 @@ impl Replica {
         let batch = take(&mut self.batch);
         let message_digest = digest(&batch);
         self.history_digest = digest([self.history_digest, message_digest]);
-        self.transport.sign_message(
-            self.id,
+        self.transport.send_signed_message(
+            ToAll,
             Message::OrderReq(
                 OrderReq {
                     view_number: self.view_number,
@@ -468,9 +466,10 @@ impl Replica {
                 },
                 batch,
             ),
+            self.id,
         );
 
-        // broadcast & locally speculative commit in `Receiver::on_signed`
+        // locally speculative commit in `Receiver::on_signed`
     }
 
     fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Vec<Request>) {

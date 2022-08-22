@@ -167,7 +167,7 @@ impl<M> Crypto<M> {
         }
     }
 
-    pub fn sign(&mut self, signed_id: u32, message: M, id: ReplicaId)
+    pub fn sign(&mut self, signed_id: usize, message: M, id: ReplicaId)
     where
         M: CryptoMessage + Send + 'static,
     {
@@ -186,7 +186,7 @@ impl<M> Crypto<M> {
         }
     }
 
-    fn sign_task(id: u32, mut message: M, secret_key: &SecretKey, sender: &Sender<CryptoEvent<M>>)
+    fn sign_task(id: usize, mut message: M, secret_key: &SecretKey, sender: &Sender<CryptoEvent<M>>)
     where
         M: CryptoMessage,
     {

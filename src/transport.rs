@@ -99,7 +99,7 @@ use tokio::{
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
     // latency::{push_latency, Point},
-    meta::{deserialize, random_id, serialize, ClientId, Config, ReplicaId},
+    meta::{deserialize, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER},
 };
 
 pub trait Receiver: Sized {
@@ -109,7 +109,9 @@ pub trait Receiver: Sized {
     }
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
     #[allow(unused_variables)]
-    fn on_signed(&mut self, signed_message: Self::Message) {}
+    fn on_signed(&mut self, signed_message: Self::Message) {
+        unreachable!() // really?
+    }
 }
 
 pub enum InboundAction<M> {
@@ -127,12 +129,12 @@ pub struct Transport<T: Receiver> {
     socket: Socket,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
-    signed_id: u32,
-    send_signed: HashMap<u32, Destination>,
+    send_signed: Vec<Destination>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Destination {
+    ToNull, // reserved
     To(SocketAddr),
     ToReplica(ReplicaId),
     ToAll,
@@ -140,7 +142,7 @@ pub enum Destination {
 
 pub enum CryptoEvent<M> {
     Verified(SocketAddr, M),
-    Signed(u32, M),
+    Signed(usize, M),
 }
 
 struct Timer<T> {
@@ -178,8 +180,7 @@ impl<T: Receiver> Transport<T> {
             socket,
             timer_table,
             timer_id: 0,
-            signed_id: 0,
-            send_signed: HashMap::new(),
+            send_signed: Vec::with_capacity(ENTRY_NUMBER),
         }
     }
 
@@ -225,6 +226,9 @@ impl<T: Receiver> Transport<T> {
         T::Message: Serialize,
     {
         match destination {
+            Destination::ToNull => {
+                unreachable!() // really?
+            }
             Destination::To(addr) => {
                 Self::send_message_interal(&self.socket, &[addr], message.borrow())
             }
@@ -249,17 +253,8 @@ impl<T: Receiver> Transport<T> {
     ) where
         T::Message: CryptoMessage + Send + 'static,
     {
-        self.signed_id += 1;
-        self.crypto.sign(self.signed_id, message, id);
-        self.send_signed.insert(self.signed_id, destination);
-    }
-
-    pub fn sign_message(&mut self, id: ReplicaId, message: T::Message)
-    where
-        T::Message: CryptoMessage + Send + 'static,
-    {
-        self.signed_id += 1;
-        self.crypto.sign(self.signed_id, message, id);
+        self.crypto.sign(self.send_signed.len(), message, id);
+        self.send_signed.push(destination);
     }
 
     pub fn create_timer(
@@ -348,10 +343,17 @@ where
                         receiver.receive_message(remote, message);
                     }
                     CryptoEvent::Signed(id, message) => {
-                        if let Some(destination) = receiver.as_mut().send_signed.remove(&id) {
-                            receiver.as_mut().send_message(destination, &message);
+                        let dest = receiver.as_mut().send_signed[id];
+                        if !matches!(dest, Destination::ToNull) {
+                            receiver.as_mut().send_message(dest, &message);
                         }
-                        receiver.on_signed(message);
+                        // TODO Destination::ToReplica(self.id)
+                        // we don't have access to self.id here, and extract
+                        // replica address from config then compare is too
+                        // expensive (and not elegant)
+                        if matches!(dest, Destination::ToAll) {
+                            receiver.on_signed(message);
+                        }
                     }
                 }
             }

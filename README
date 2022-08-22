@@ -4,6 +4,8 @@ Run sanity check:
 $ cargo test --lib
 
 Run benchmark:
-First copy src/bin/config.example.txt to src/bin/config.txt, and modify content
-according to evaluation system.
-$ cargo run --release --bin [replica|client] -- [options]
+$ cargo build --release
+Copy master.example.py to master.py, and modify content `DB` according to the 
+evaluation system, and modify `TASK` as the evaulation run.
+On each server, run master script as the way you like, e.g.
+$ ssh user@host cat path/to/master.py | python
