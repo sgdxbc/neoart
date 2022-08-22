@@ -205,7 +205,7 @@ impl<T: Receiver> Transport<T> {
                             destination,
                             buf: buf[..len].to_vec(),
                         })
-                        .map_err(|_| panic!())
+                        .map_err(|_| ())
                         .unwrap();
                 }
             }
