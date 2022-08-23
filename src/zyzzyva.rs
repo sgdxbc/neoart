@@ -15,7 +15,7 @@ use crate::{
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
         deserialize, digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber,
-        ViewNumber,
+        ViewNumber, ENTRY_NUMBER,
     },
     transport::{
         Destination::{To, ToAll, ToReplica},
@@ -323,8 +323,10 @@ pub struct Replica {
     view_number: ViewNumber,
     // the #op that should be speculative committed up to, and the corresponded
     // history hash
-    // on primary replica the log record could be a little bit delayed to these
-    // because of signing `OrderReq`
+    // on primary replica this pair is aligned with latest proposed request,
+    // while on backup replicas this pair is aligned with latest received &
+    // ordered OrderReq
+    // well, maybe not a good idea to use states like this
     op_number: OpNumber,
     history_digest: Digest,
 
@@ -363,7 +365,7 @@ impl Replica {
             history_digest: Digest::default(),
             app: Box::new(app),
             client_table: HashMap::new(),
-            log: Vec::new(),
+            log: Vec::with_capacity(ENTRY_NUMBER),
             reorder_order_req: Reorder::new(1),
             commit_certificate: CommitCertificate::default(),
             batch_size: if enable_batching { Self::BATCH_SIZE } else { 1 },
@@ -403,23 +405,6 @@ impl Receiver for Replica {
             Message::OrderReq(message, request) => self.handle_order_req(remote, message, request),
             Message::Commit(message) => self.handle_commit(remote, message),
             _ => unreachable!(),
-        }
-    }
-
-    fn on_signed(&mut self, message: Message) {
-        if let Message::OrderReq(message, request) = message {
-            // assert_eq!(self.id, self.transport.config.primary(self.view_number));
-
-            let mut ordered = self
-                .reorder_order_req
-                .insert_reorder(message.op_number, (message.clone(), request.clone()));
-            while let Some((message, request)) = ordered {
-                // TODO guard view number
-                self.spec_commit(message, request);
-                ordered = self.reorder_order_req.expect_next();
-            }
-        } else {
-            unreachable!()
         }
     }
 }
@@ -473,42 +458,47 @@ impl Replica {
     }
 
     fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Vec<Request>) {
-        if message.message_digest != digest(&request) {
-            println!(
-                "! OrderReq incorrect message digest op {}",
-                message.op_number
-            );
-            return;
-        }
         if message.view_number < self.view_number {
             return;
         }
         if message.view_number > self.view_number {
             todo!()
         }
-        assert_ne!(self.id, self.transport.config.primary(self.view_number));
+        let is_primary = self.id == self.transport.config.primary(self.view_number);
+        if !is_primary && message.message_digest != digest(&request) {
+            println!(
+                "! OrderReq incorrect message digest op {}",
+                message.op_number
+            );
+            return;
+        }
 
         let mut ordered = self
             .reorder_order_req
             .insert_reorder(message.op_number, (message, request));
         while let Some((message, request)) = ordered {
-            let previous_digest = if self.op_number == 0 {
-                Digest::default()
-            } else {
-                self.log[(self.op_number - 1) as usize].history_digest
-            };
-            if message.history_digest != digest([previous_digest, message.message_digest]) {
-                println!(
-                    "! OrderReq mismatched history digest op {}",
-                    message.op_number
-                );
-                break;
+            if !is_primary {
+                let previous_digest = if self.op_number == 0 {
+                    Digest::default()
+                } else {
+                    self.log[(self.op_number - 1) as usize].history_digest
+                };
+                // revise this
+                if message.history_digest != digest([previous_digest, message.message_digest]) {
+                    println!(
+                        "! OrderReq mismatched history digest op {}",
+                        message.op_number
+                    );
+                    break;
+                }
+
+                // only update for backups here, primary updates when handle
+                // requests (again, reusing state may not be good idea...)
+                self.op_number += 1;
+                self.history_digest = message.history_digest;
             }
 
-            self.op_number += 1;
-            self.history_digest = message.history_digest;
             self.spec_commit(message, request);
-
             ordered = self.reorder_order_req.expect_next();
         }
     }

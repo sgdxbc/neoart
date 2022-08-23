@@ -131,6 +131,31 @@ header gre_h {
     bit<16> proto;
 }
 
+typedef bit<3> neo_variant_t;
+const neo_variant_t NEO_VARIANT_NULL = 0; // have not gone through switch yet
+const neo_variant_t NEO_VARIANT_R = 1;
+typedef bit<4> neo_type_t;
+const neo_type_t NEO_TYPE_UCAST = 0;
+const neo_type_t NEO_TYPE_MCAST_INGRESS = 1; // only send, never receive on endpoints
+const neo_type_t NEO_TYPE_MCAST_OUTGRESS = 2; // receive on endpoints
+const neo_type_t NEO_TYPE_MCAST_RELAY = 3; // receive and send by accelerator
+// common header for all udp packets, including unicast, multicast, etc.
+header neo_h {
+    neo_variant_t variant;
+    bit<1> is_extended;
+    neo_type_t ty;
+}
+
+header neo_extended_h {
+    // add fields when needed
+}
+
+header neo_ordering_h {
+    bit<32> sequence;
+    bit<256> hash;
+    bit<32> signature;
+}
+
 struct header_t {
     ethernet_h ethernet;
     vlan_tag_h vlan_tag;
@@ -139,7 +164,9 @@ struct header_t {
     tcp_h tcp;
     udp_h udp;
 
-    // Add more headers here.
+    neo_h neo;
+    neo_ordering_h neo_ordering;
+    neo_extended_h neo_extended;
 }
 
 struct empty_header_t {}
@@ -244,7 +271,7 @@ parser SwitchIngressParser(
         pkt.extract(hdr.ethernet);
         transition select (hdr.ethernet.ether_type) {
             ETHERTYPE_IPV4 : parse_ipv4;
-            default : reject;
+            default : accept;
         }
     }
 
@@ -252,13 +279,27 @@ parser SwitchIngressParser(
         pkt.extract(hdr.ipv4);
         transition select (hdr.ipv4.protocol) {
             IP_PROTOCOLS_UDP : parse_udp;
-            default : reject;
+            default : accept;
         }
     }
 
     state parse_udp {
         pkt.extract(hdr.udp);
-        transition accept;  // TODO neo header
+        // maybe better to filter out normal udp traffic with destination port
+        // (which still has false negative)
+        pkt.extract(hdr.neo);
+        transition select (hdr.neo.ty) {
+            NEO_TYPE_MCAST_INGRESS : parse_neo_ordering;
+            default: accept;
+        }
+    }
+
+    state parse_neo_ordering {
+        pkt.extract(hdr.neo_ordering);
+        if (hdr.neo.is_extended == 1) {
+            pkt.extract(hdr.neo_extended);
+        }
+        transition accept;
     }
 }
 

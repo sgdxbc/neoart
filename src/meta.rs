@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     fmt::Display,
     io::{Cursor, Read, Write},
-    net::SocketAddr,
+    net::{SocketAddr, Ipv4Addr},
     str::FromStr,
 };
 
@@ -13,6 +13,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 // preallocate 8M entries, the expected usage is at most ~300K * 20s
 pub const ENTRY_NUMBER: usize = 8 << 20;
+pub const MULTICAST: (Ipv4Addr, u16) = (Ipv4Addr::BROADCAST, 0x1fff);
 
 pub type ReplicaId = u8;
 pub type RequestNumber = u32;
@@ -33,7 +34,7 @@ pub fn random_id(addr: SocketAddr) -> ClientId {
 
 impl Default for ClientId {
     fn default() -> Self {
-        Self("0.0.0.0:0".parse().unwrap(), 0)
+        Self(SocketAddr::from(([0, 0, 0, 0], 0)), 0)
     }
 }
 

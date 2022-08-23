@@ -22,21 +22,9 @@ control SwitchIngress(
         ig_tm_md.rid = 0xffff;
     }
 
-    action nop() {}
-
     table dmac {
         key = { hdr.ethernet.dst_addr : exact; }
         actions = { send; }
-    }
-
-    table from_accel {
-        key = { ig_intr_md.ingress_port : exact; }
-        actions = { nop; }
-    }
-
-    table from_source {
-        // TODO udp port as key
-        actions = { nop; }
     }
 
     // keyless tables that always perform default action, need to be configured
@@ -55,14 +43,21 @@ control SwitchIngress(
     }
 
     apply {
-        if (from_accel.apply().hit) { 
+        hdr.neo.variant = NEO_VARIANT_R;
+        
+        if (!hdr.neo.isValid() || hdr.neo.ty == NEO_TYPE_UCAST) {
+            if (dmac.apply().miss) {
+                send_to_endpoints.apply();
+            }
+        } else if (hdr.neo.ty == NEO_TYPE_MCAST_RELAY) {
+            hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
             send_to_replicas.apply();
-        } else if (from_source.apply().hit) {
+        } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
+            hdr.neo.ty = NEO_TYPE_MCAST_RELAY;
             send_to_accel.apply();
-        } else if (dmac.apply().hit) {
-            // already sent in table's action
         } else {
-            send_to_endpoints.apply();
+            // unreachable
+            drop();
         }
 
         // No need for egress processing, skip it and use empty controls for egress.

@@ -7,5 +7,5 @@ Run benchmark:
 $ cargo build --release
 Copy master.example.py to master.py, and modify content `DB` according to the 
 evaluation system, and modify `TASK` as the evaulation run.
-On each server, run master script as the way you like, e.g.
+On each server, run master script in the way you like, e.g.
 $ ssh user@host cat path/to/master.py | python

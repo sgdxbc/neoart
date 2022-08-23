@@ -62,23 +62,29 @@
 //! for inbound and outbound messages. Every inbound message must go through
 //! verification, where exact policy is returned by `Receiver::inbound_action`.
 //! A replica message basically can be verified by `VerifyReplica` while
-//! `Verify` can be used for customization.
+//! `Verify` can be used for customized verification. The message will be
+//! verified in background worker thread, and be fed into 
+//! `Receiver::receive_message` if it is verified. The order of messages passing
+//! into `Receiver::receive_message` could be different to the order observed by
+//! `Receiver::inbound_action`, and both ordering could be different to the 
+//! sending order on the other side of network.
 //!
-//! The outbound interface is `Transport::sign_message` which returns a
-//! `SignedMessage`, which represents a `Receiver::Message` that has been
-//! submitted for signing. The message will be stored by transport, and be
-//! asynchronized signed. `Transport::signed_message` returns `None` before the
-//! signing is finished. If certain action is required after the message is
-//! signed, it could be put in `Receiver::on_signed`, where it is safe to
-//! `unwrap` the result of `signed_message`. It is a common operation to send
-//! signed message after signing, so it has been built into transport as
-//! `Transport::send_signed_message` method.
-//!
+//! The outbound interface is `Transport::send_signed_message`, which sign the
+//! message in background work thread and send it after signing. The sending
+//! semantic is different from plain `Transport::send_message`. The plain
+//! interface filters out loopback traffic, while 
+//! `Transport::send_signed_message` keeps it to allow "recirculated" processing
+//! on signed messages. This is basically a design tradeoff, because it is hard
+//! to recirculate in the synchronized `Transport::send_message`, while it is
+//! also hard to "inline" the receiving logic of the loopback copy with the
+//! asynchronized `Transport::send_signed_message`.
+//! 
 //! `Crypto`'s executor has `Inline` and `Rayon` variants. The `Inline` executor
 //! finishes cryptographic task on current thread before returning from calling,
-//! so e.g. `signed_message` never returns `None`. It is suitable for testing,
-//! and client which doesn't actually do any signing or verifying. `Rayon`
-//! executor uses a Rayon thread pool and is suitable for benchmarking.
+//! however because of queueing the packet processing is still not run to 
+//! completion. It is suitable for testing and client side usage which doesn't 
+//! actually do any signing or verifying. `Rayon` executor uses a Rayon thread 
+//! pool and is suitable for benchmarking.
 
 use std::{
     borrow::Borrow, collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin,
@@ -98,7 +104,6 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
-    // latency::{push_latency, Point},
     meta::{deserialize, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER},
 };
 
@@ -108,10 +113,6 @@ pub trait Receiver: Sized {
         InboundAction::Allow(deserialize(buf))
     }
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
-    #[allow(unused_variables)]
-    fn on_signed(&mut self, signed_message: Self::Message) {
-        unreachable!() // really?
-    }
 }
 
 pub enum InboundAction<M> {
@@ -352,7 +353,9 @@ where
                         // replica address from config then compare is too
                         // expensive (and not elegant)
                         if matches!(dest, Destination::ToAll) {
-                            receiver.on_signed(message);
+                            // assuming receiver does not care about remote
+                            // address of recirculation messages
+                            receiver.receive_message(SocketAddr::from(([0, 0, 0, 0], 0)), message);
                         }
                     }
                 }
