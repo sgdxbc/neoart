@@ -252,7 +252,9 @@ control EmptyEgress(
     apply {}
 }
 
-struct metadata_t {}
+struct metadata_t {
+    bit<1> is_extended;
+}
 
 parser SwitchIngressParser(
         packet_in pkt,
@@ -288,17 +290,22 @@ parser SwitchIngressParser(
         // maybe better to filter out normal udp traffic with destination port
         // (which still has false negative)
         pkt.extract(hdr.neo);
+        ig_md.is_extended = hdr.neo.is_extended;
         transition select (hdr.neo.ty) {
             NEO_TYPE_MCAST_INGRESS : parse_neo_ordering;
-            default: accept;
+            default: parse_neo_extended;
         }
     }
 
     state parse_neo_ordering {
         pkt.extract(hdr.neo_ordering);
-        if (hdr.neo.is_extended == 1) {
-            pkt.extract(hdr.neo_extended);
-        }
+        transition parse_neo_extended;
+    }
+
+    state parse_neo_extended {
+        // if (ig_md.is_extended == 1) {
+        //     pkt.extract(hdr.neo_extended);
+        // }
         transition accept;
     }
 }

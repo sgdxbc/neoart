@@ -63,27 +63,27 @@
 //! verification, where exact policy is returned by `Receiver::inbound_action`.
 //! A replica message basically can be verified by `VerifyReplica` while
 //! `Verify` can be used for customized verification. The message will be
-//! verified in background worker thread, and be fed into 
+//! verified in background worker thread, and be fed into
 //! `Receiver::receive_message` if it is verified. The order of messages passing
 //! into `Receiver::receive_message` could be different to the order observed by
-//! `Receiver::inbound_action`, and both ordering could be different to the 
+//! `Receiver::inbound_action`, and both ordering could be different to the
 //! sending order on the other side of network.
 //!
 //! The outbound interface is `Transport::send_signed_message`, which sign the
 //! message in background work thread and send it after signing. The sending
 //! semantic is different from plain `Transport::send_message`. The plain
-//! interface filters out loopback traffic, while 
+//! interface filters out loopback traffic, while
 //! `Transport::send_signed_message` keeps it to allow "recirculated" processing
 //! on signed messages. This is basically a design tradeoff, because it is hard
 //! to recirculate in the synchronized `Transport::send_message`, while it is
 //! also hard to "inline" the receiving logic of the loopback copy with the
 //! asynchronized `Transport::send_signed_message`.
-//! 
+//!
 //! `Crypto`'s executor has `Inline` and `Rayon` variants. The `Inline` executor
 //! finishes cryptographic task on current thread before returning from calling,
-//! however because of queueing the packet processing is still not run to 
-//! completion. It is suitable for testing and client side usage which doesn't 
-//! actually do any signing or verifying. `Rayon` executor uses a Rayon thread 
+//! however because of queueing the packet processing is still not run to
+//! completion. It is suitable for testing and client side usage which doesn't
+//! actually do any signing or verifying. `Rayon` executor uses a Rayon thread
 //! pool and is suitable for benchmarking.
 
 use std::{
@@ -104,7 +104,10 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
-    meta::{deserialize, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER},
+    meta::{
+        deserialize, digest, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER,
+        MULTICAST,
+    },
 };
 
 pub trait Receiver: Sized {
@@ -139,6 +142,7 @@ pub enum Destination {
     To(SocketAddr),
     ToReplica(ReplicaId),
     ToAll,
+    ToMulticast,
 }
 
 pub enum CryptoEvent<M> {
@@ -193,56 +197,74 @@ impl<T: Receiver> Transport<T> {
         random_id(addr)
     }
 
-    fn send_message_interal(socket: &Socket, destinations: &[SocketAddr], message: impl Serialize) {
-        let mut buf = [0; 1400];
-        let len = serialize(&mut buf[..], message);
-        let local = match socket {
-            Socket::Os(socket) => socket.local_addr().unwrap(),
-            &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,
-        };
-        for &destination in destinations {
-            if destination == local {
-                continue;
+    fn send_message_interal(socket: &Socket, destination: SocketAddr, buf: &[u8]) {
+        match socket {
+            Socket::Os(socket) => {
+                socket.try_send_to(buf, destination).unwrap();
             }
-            match socket {
-                Socket::Os(socket) => {
-                    socket.try_send_to(&buf[..len], destination).unwrap();
-                }
-                Socket::Simulated(SimulatedSocket { addr, network, .. }) => {
-                    network
-                        .try_send(Message {
-                            source: *addr,
-                            destination,
-                            buf: buf[..len].to_vec(),
-                        })
-                        .map_err(|_| ())
-                        .unwrap();
-                }
+            Socket::Simulated(SimulatedSocket { addr, network, .. }) => {
+                network
+                    .try_send(SimulatedMessage {
+                        source: *addr,
+                        destination,
+                        buf: buf.to_vec(),
+                    })
+                    .map_err(|_| ())
+                    .unwrap();
             }
         }
     }
+
+    const UNICAST_MESSAGE_OFFSET: usize = 1;
+    // 1 byte metadata, 4 bytes sequence number, 4 bytes signature
+    const MULTICAST_HASH_OFFSET: usize = 1 + 4 + 4;
+    const MULTICAST_MESSAGE_OFFSET: usize = Self::MULTICAST_HASH_OFFSET + 32;
 
     pub fn send_message(&self, destination: Destination, message: impl Borrow<T::Message>)
     where
         T::Message: Serialize,
     {
+        let mut buf = [0; 1400];
+        let message_offset;
+        if destination == Destination::ToMulticast {
+            buf[0] = 0x01; // null variant, not extended, multicast ingress
+            message_offset = Self::MULTICAST_MESSAGE_OFFSET;
+        } else {
+            // otherwise keep 0x00: null variant, not extended, unicast
+            message_offset = Self::UNICAST_MESSAGE_OFFSET;
+        }
+        let len = serialize(&mut buf[message_offset..], message.borrow()) + message_offset;
+        if destination == Destination::ToMulticast {
+            let d = digest(&buf[message_offset..message_offset + len]);
+            buf[Self::MULTICAST_HASH_OFFSET..Self::MULTICAST_MESSAGE_OFFSET]
+                .copy_from_slice(&d[..]);
+        }
+
         match destination {
             Destination::ToNull => {
                 unreachable!() // really?
             }
-            Destination::To(addr) => {
-                Self::send_message_interal(&self.socket, &[addr], message.borrow())
-            }
+            Destination::To(addr) => Self::send_message_interal(&self.socket, addr, &buf[..len]),
             Destination::ToReplica(id) => Self::send_message_interal(
                 &self.socket,
-                &[self.config.replicas[id as usize]],
-                message.borrow(),
+                self.config.replicas[id as usize],
+                &buf[..len],
             ),
-            Destination::ToAll => Self::send_message_interal(
-                &self.socket,
-                &self.config.replicas[..],
-                message.borrow(),
-            ),
+            Destination::ToAll => {
+                let local = match &self.socket {
+                    Socket::Os(socket) => socket.local_addr().unwrap(),
+                    &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,
+                };
+
+                for &address in &self.config.replicas {
+                    if address != local {
+                        Self::send_message_interal(&self.socket, address, &buf[..len]);
+                    }
+                }
+            }
+            Destination::ToMulticast => {
+                Self::send_message_interal(&self.socket, SocketAddr::from(MULTICAST), &buf[..len])
+            }
         }
     }
 
@@ -333,53 +355,62 @@ where
                     handle_raw_message(self, remote, &buf[..len]);
                 }
             }
+        }
 
-            fn handle_crypto_event<T>(receiver: &mut T, event: CryptoEvent<T::Message>)
-            where
-                T: Receiver + AsMut<Transport<T>>,
-                T::Message: Serialize,
-            {
-                match event {
-                    CryptoEvent::Verified(remote, message) => {
-                        receiver.receive_message(remote, message);
+        fn handle_crypto_event<T>(receiver: &mut T, event: CryptoEvent<T::Message>)
+        where
+            T: Receiver + AsMut<Transport<T>>,
+            T::Message: Serialize,
+        {
+            match event {
+                CryptoEvent::Verified(remote, message) => {
+                    receiver.receive_message(remote, message);
+                }
+                CryptoEvent::Signed(id, message) => {
+                    let dest = receiver.as_mut().send_signed[id];
+                    if !matches!(dest, Destination::ToNull) {
+                        receiver.as_mut().send_message(dest, &message);
                     }
-                    CryptoEvent::Signed(id, message) => {
-                        let dest = receiver.as_mut().send_signed[id];
-                        if !matches!(dest, Destination::ToNull) {
-                            receiver.as_mut().send_message(dest, &message);
-                        }
-                        // TODO Destination::ToReplica(self.id)
-                        // we don't have access to self.id here, and extract
-                        // replica address from config then compare is too
-                        // expensive (and not elegant)
-                        if matches!(dest, Destination::ToAll) {
-                            // assuming receiver does not care about remote
-                            // address of recirculation messages
-                            receiver.receive_message(SocketAddr::from(([0, 0, 0, 0], 0)), message);
-                        }
+                    // TODO Destination::ToReplica(self.id)
+                    // we don't have access to self.id here, and extract replica
+                    // address from config then compare is too expensive (and
+                    // not elegant)
+                    if matches!(dest, Destination::ToAll) {
+                        // assuming receiver does not care about remote address
+                        // of recirculation messages
+                        receiver.receive_message(SocketAddr::from(([0, 0, 0, 0], 0)), message);
                     }
                 }
             }
+        }
 
-            fn handle_raw_message<T>(receiver: &mut T, remote: SocketAddr, buf: &[u8])
-            where
-                T: Receiver + AsMut<Transport<T>>,
-                T::Message: CryptoMessage + Send + 'static,
-            {
-                match receiver.inbound_action(buf) {
-                    InboundAction::Allow(message) => {
-                        receiver.receive_message(remote, message);
-                    }
-                    InboundAction::Block => {}
-                    InboundAction::VerifyReplica(message, replica_id) => {
-                        receiver
-                            .as_mut()
-                            .crypto
-                            .verify_replica(remote, message, replica_id);
-                    }
-                    InboundAction::Verify(message, verify) => {
-                        receiver.as_mut().crypto.verify(remote, message, verify);
-                    }
+        fn handle_raw_message<T>(receiver: &mut T, remote: SocketAddr, buf: &[u8])
+        where
+            T: Receiver + AsMut<Transport<T>>,
+            T::Message: CryptoMessage + Send + 'static,
+        {
+            let metadata = buf[0];
+            let variant = metadata >> 5;
+            assert_ne!(variant, 0);
+            let action = if metadata & 0x1f == 0x00 {
+                receiver.inbound_action(&buf[Transport::<T>::UNICAST_MESSAGE_OFFSET..])
+            } else {
+                todo!()
+            };
+
+            match action {
+                InboundAction::Allow(message) => {
+                    receiver.receive_message(remote, message);
+                }
+                InboundAction::Block => {}
+                InboundAction::VerifyReplica(message, replica_id) => {
+                    receiver
+                        .as_mut()
+                        .crypto
+                        .verify_replica(remote, message, replica_id);
+                }
+                InboundAction::Verify(message, verify) => {
+                    receiver.as_mut().crypto.verify(remote, message, verify);
                 }
             }
         }
@@ -387,12 +418,15 @@ where
 }
 
 pub struct SimulatedNetwork {
-    send_channel: (mpsc::Sender<Message>, mpsc::Receiver<Message>),
+    send_channel: (
+        mpsc::Sender<SimulatedMessage>,
+        mpsc::Receiver<SimulatedMessage>,
+    ),
     inboxes: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>,
     epoch: Instant,
 }
 
-struct Message {
+struct SimulatedMessage {
     source: SocketAddr,
     destination: SocketAddr,
     buf: Vec<u8>,
@@ -411,7 +445,7 @@ impl Default for SimulatedNetwork {
 #[derive(Debug)]
 pub struct SimulatedSocket {
     addr: SocketAddr,
-    network: mpsc::Sender<Message>,
+    network: mpsc::Sender<SimulatedMessage>,
     inbox: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
 }
 
@@ -458,7 +492,7 @@ impl Run for SimulatedNetwork {
 }
 
 impl SimulatedNetwork {
-    async fn handle_message(&self, message: Message) {
+    async fn handle_message(&self, message: SimulatedMessage) {
         // TODO filter
         let inbox = self.inboxes[&message.destination].clone();
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));

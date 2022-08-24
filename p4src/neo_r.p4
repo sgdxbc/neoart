@@ -43,21 +43,28 @@ control SwitchIngress(
     }
 
     apply {
-        hdr.neo.variant = NEO_VARIANT_R;
-        
-        if (!hdr.neo.isValid() || hdr.neo.ty == NEO_TYPE_UCAST) {
-            if (dmac.apply().miss) {
+        if (!hdr.neo.isValid()) {
+            if (hdr.ethernet.ether_type == ETHERTYPE_ARP) {
                 send_to_endpoints.apply();
+            } else {
+                drop();
             }
-        } else if (hdr.neo.ty == NEO_TYPE_MCAST_RELAY) {
-            hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
-            send_to_replicas.apply();
-        } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
-            hdr.neo.ty = NEO_TYPE_MCAST_RELAY;
-            send_to_accel.apply();
         } else {
-            // unreachable
-            drop();
+            hdr.neo.variant = NEO_VARIANT_R;
+            hdr.udp.checksum = 0;
+            
+            if (hdr.neo.ty == NEO_TYPE_UCAST) {
+                dmac.apply();
+            } else if (hdr.neo.ty == NEO_TYPE_MCAST_RELAY) {
+                hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
+                send_to_replicas.apply();
+            } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
+                hdr.neo.ty = NEO_TYPE_MCAST_RELAY;
+                send_to_accel.apply();
+            } else {
+                // unreachable
+                drop();
+            }
         }
 
         // No need for egress processing, skip it and use empty controls for egress.
