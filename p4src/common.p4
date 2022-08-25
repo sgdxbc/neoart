@@ -131,44 +131,6 @@ header gre_h {
     bit<16> proto;
 }
 
-typedef bit<3> neo_variant_t;
-const neo_variant_t NEO_VARIANT_NULL = 0; // have not gone through switch yet
-const neo_variant_t NEO_VARIANT_R = 1;
-typedef bit<4> neo_type_t;
-const neo_type_t NEO_TYPE_UCAST = 0;
-const neo_type_t NEO_TYPE_MCAST_INGRESS = 1; // only send, never receive on endpoints
-const neo_type_t NEO_TYPE_MCAST_OUTGRESS = 2; // receive on endpoints
-const neo_type_t NEO_TYPE_MCAST_RELAY = 3; // receive and send by accelerator
-// common header for all udp packets, including unicast, multicast, etc.
-header neo_h {
-    neo_variant_t variant;
-    bit<1> is_extended;
-    neo_type_t ty;
-}
-
-header neo_extended_h {
-    // add fields when needed
-}
-
-header neo_ordering_h {
-    bit<32> sequence;
-    bit<256> hash;
-    bit<32> signature;
-}
-
-struct header_t {
-    ethernet_h ethernet;
-    vlan_tag_h vlan_tag;
-    ipv4_h ipv4;
-    ipv6_h ipv6;
-    tcp_h tcp;
-    udp_h udp;
-
-    neo_h neo;
-    neo_ordering_h neo_ordering;
-    neo_extended_h neo_extended;
-}
-
 struct empty_header_t {}
 
 struct empty_metadata_t {}
@@ -252,9 +214,66 @@ control EmptyEgress(
     apply {}
 }
 
-struct metadata_t {
-    bit<1> is_extended;
+/* NeoBFT common definition */
+
+typedef bit<3> neo_variant_t;
+const neo_variant_t NEO_VARIANT_NULL = 0; // have not gone through switch yet
+const neo_variant_t NEO_VARIANT_R = 1;
+const neo_variant_t NEO_VARIANT_S = 2;
+
+// the packet layout is determined by type (and variant)
+// every packet's udp payload starts with `neo_h`, followed by
+typedef bit<4> neo_type_t;
+// unicast packet: user data
+const neo_type_t NEO_TYPE_UCAST = 0;
+// multicast ingress packet: send by endpoints with `Destination::ToMulticast`
+// 32 bytes precomputed message hash + user data (i.e. message)
+const neo_type_t NEO_TYPE_MCAST_INGRESS = 1; 
+// multicast outgress packet: send by switch
+//   neo_r variant: neo_relay_ordering_h + user data
+const neo_type_t NEO_TYPE_MCAST_OUTGRESS = 2;
+// packet relayed from switch to accelerator (neo_r): neo_relay_ordering_h + user data
+const neo_type_t NEO_TYPE_RELAY = 3; 
+// packet replied from accelerator to switch: same as relay
+const neo_type_t NEO_TYPE_RELAY_REPLY = 4;
+
+// common header for all udp packets, including unicast, multicast, etc.
+header neo_h {
+    neo_variant_t variant;
+    bit<1> _unused;
+    neo_type_t ty;
 }
+
+header neo_ingress_h {
+    bit<256> digest;
+}
+
+header neo_relay_h {
+    bit<32> sequence;
+    bit<256> hash;
+    bit<512> signature;
+}
+
+header neo_ordering_h {
+    bit<32> sequence;
+    bit<32> signature;
+}
+
+struct header_t {
+    ethernet_h ethernet;
+    vlan_tag_h vlan_tag;
+    ipv4_h ipv4;
+    ipv6_h ipv6;
+    tcp_h tcp;
+    udp_h udp;
+
+    neo_h neo;
+    neo_ingress_h neo_ingress;
+    neo_relay_h neo_relay;
+    neo_ordering_h neo_ordering;
+}
+
+struct metadata_t {}
 
 parser SwitchIngressParser(
         packet_in pkt,
@@ -290,22 +309,14 @@ parser SwitchIngressParser(
         // maybe better to filter out normal udp traffic with destination port
         // (which still has false negative)
         pkt.extract(hdr.neo);
-        ig_md.is_extended = hdr.neo.is_extended;
         transition select (hdr.neo.ty) {
-            NEO_TYPE_MCAST_INGRESS : parse_neo_ordering;
-            default: parse_neo_extended;
+            NEO_TYPE_MCAST_INGRESS: parse_neo_ingress;
+            default: accept;
         }
     }
 
-    state parse_neo_ordering {
-        pkt.extract(hdr.neo_ordering);
-        transition parse_neo_extended;
-    }
-
-    state parse_neo_extended {
-        // if (ig_md.is_extended == 1) {
-        //     pkt.extract(hdr.neo_extended);
-        // }
+    state parse_neo_ingress {
+        pkt.extract(hdr.neo_ingress);
         transition accept;
     }
 }

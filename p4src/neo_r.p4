@@ -45,7 +45,7 @@ control SwitchIngress(
     apply {
         if (!hdr.neo.isValid()) {
             if (hdr.ethernet.ether_type == ETHERTYPE_ARP) {
-                send_to_endpoints.apply();
+                send_to_endpoints.apply(); // a little bit wild here
             } else {
                 drop();
             }
@@ -55,11 +55,17 @@ control SwitchIngress(
             
             if (hdr.neo.ty == NEO_TYPE_UCAST) {
                 dmac.apply();
-            } else if (hdr.neo.ty == NEO_TYPE_MCAST_RELAY) {
+            } else if (hdr.neo.ty == NEO_TYPE_RELAY_REPLY) {
                 hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
                 send_to_replicas.apply();
             } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
-                hdr.neo.ty = NEO_TYPE_MCAST_RELAY;
+                hdr.neo.ty = NEO_TYPE_RELAY;
+                hdr.neo_relay = { 
+                    sequence = 0, 
+                    hash = hdr.neo_ingress.digest, 
+                    signature = 0
+                };
+                hdr.neo_ingress.setInvalid();
                 send_to_accel.apply();
             } else {
                 // unreachable

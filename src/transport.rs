@@ -112,10 +112,19 @@ use crate::{
 
 pub trait Receiver: Sized {
     type Message: Send + 'static + DeserializeOwned;
-    fn inbound_action(&self, buf: &[u8]) -> InboundAction<Self::Message> {
+    fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
+        assert!(matches!(meta, InboundMeta::Unicast));
         InboundAction::Allow(deserialize(buf))
     }
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
+}
+
+pub enum InboundMeta<'a> {
+    Unicast,
+    OrderedMulticast {
+        sequence_number: u32,
+        signature: &'a [u8],
+    },
 }
 
 pub enum InboundAction<M> {
@@ -134,6 +143,7 @@ pub struct Transport<T: Receiver> {
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
     send_signed: Vec<Destination>,
+    variant: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -165,6 +175,10 @@ pub enum Socket {
 }
 
 impl<T: Receiver> Transport<T> {
+    pub const VARIANT_N: u8 = 0; // no variant
+    pub const VARIANT_R: u8 = 1;
+    pub const VARIANT_S: u8 = 2;
+
     pub fn new(config: Config, socket: Socket, setting: ExecutorSetting) -> Self {
         let mut timer_table = HashMap::new();
         // insert a sentinel entry to make sure we get always get a `sleep` to
@@ -186,7 +200,12 @@ impl<T: Receiver> Transport<T> {
             timer_table,
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
+            variant: Self::VARIANT_N,
         }
+    }
+
+    pub fn set_variant(&mut self, variant: u8) {
+        self.variant = variant;
     }
 
     pub fn create_id(&self) -> ClientId {
@@ -215,11 +234,6 @@ impl<T: Receiver> Transport<T> {
         }
     }
 
-    const UNICAST_MESSAGE_OFFSET: usize = 1;
-    // 1 byte metadata, 4 bytes sequence number, 4 bytes signature
-    const MULTICAST_HASH_OFFSET: usize = 1 + 4 + 4;
-    const MULTICAST_MESSAGE_OFFSET: usize = Self::MULTICAST_HASH_OFFSET + 32;
-
     pub fn send_message(&self, destination: Destination, message: impl Borrow<T::Message>)
     where
         T::Message: Serialize,
@@ -228,16 +242,15 @@ impl<T: Receiver> Transport<T> {
         let message_offset;
         if destination == Destination::ToMulticast {
             buf[0] = 0x01; // null variant, not extended, multicast ingress
-            message_offset = Self::MULTICAST_MESSAGE_OFFSET;
+            message_offset = 1 + 32; // 32 bytes message digest
         } else {
             // otherwise keep 0x00: null variant, not extended, unicast
-            message_offset = Self::UNICAST_MESSAGE_OFFSET;
+            message_offset = 1;
         }
         let len = serialize(&mut buf[message_offset..], message.borrow()) + message_offset;
         if destination == Destination::ToMulticast {
             let d = digest(&buf[message_offset..message_offset + len]);
-            buf[Self::MULTICAST_HASH_OFFSET..Self::MULTICAST_MESSAGE_OFFSET]
-                .copy_from_slice(&d[..]);
+            buf[1..1 + 32].copy_from_slice(&d[..]);
         }
 
         match destination {
@@ -391,12 +404,27 @@ where
         {
             let metadata = buf[0];
             let variant = metadata >> 5;
-            assert_ne!(variant, 0);
-            let action = if metadata & 0x1f == 0x00 {
-                receiver.inbound_action(&buf[Transport::<T>::UNICAST_MESSAGE_OFFSET..])
-            } else {
-                todo!()
-            };
+            assert!(variant != 0 || metadata & 0x10 != 0);
+            if metadata & 0x0f != 0 {
+                assert_eq!(receiver.as_mut().variant, variant);
+            }
+
+            let action;
+            match metadata & 0x0f {
+                0x00 => {
+                    action = receiver.inbound_action(InboundMeta::Unicast, &buf[1..]);
+                }
+                0x02 => {
+                    action = receiver.inbound_action(
+                        InboundMeta::OrderedMulticast {
+                            sequence_number: u32::from_be_bytes(buf[1..5].try_into().unwrap()),
+                            signature: &buf[5..37],
+                        },
+                        &buf[37..],
+                    );
+                }
+                _ => unreachable!(),
+            }
 
             match action {
                 InboundAction::Allow(message) => {
@@ -492,7 +520,9 @@ impl Run for SimulatedNetwork {
 }
 
 impl SimulatedNetwork {
-    async fn handle_message(&self, message: SimulatedMessage) {
+    async fn handle_message(&self, mut message: SimulatedMessage) {
+        message.buf[0] |= 0x10; // set simulate bit
+
         // TODO filter
         let inbox = self.inboxes[&message.destination].clone();
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));

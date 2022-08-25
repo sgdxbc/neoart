@@ -19,7 +19,7 @@ use crate::{
     },
     transport::{
         Destination::{To, ToAll, ToReplica},
-        InboundAction, Receiver, Transport,
+        InboundAction, InboundMeta, Receiver, Transport,
     },
     App,
 };
@@ -383,7 +383,11 @@ impl AsMut<Transport<Self>> for Replica {
 impl Receiver for Replica {
     type Message = Message;
 
-    fn inbound_action(&self, buf: &[u8]) -> InboundAction<Self::Message> {
+    fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
+        if !matches!(meta, InboundMeta::Unicast) {
+            return InboundAction::Block;
+        }
+
         let message = deserialize(buf);
         match message {
             Message::Request(_) => InboundAction::Allow(message),
