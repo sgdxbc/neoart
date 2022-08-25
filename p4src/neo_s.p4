@@ -1,4 +1,4 @@
-// NeoBFT switch program, relay mode
+// NeoBFT switch program, signing mode
 #include "common.p4"
 
 control SwitchIngress(
@@ -30,10 +30,6 @@ control SwitchIngress(
     // keyless tables that always perform default action, need to be configured
     // by control plane
 
-    table send_to_accel {
-        actions = { send; }
-    }
-
     table send_to_replicas {
         actions = { send_to_group; }
     }
@@ -41,6 +37,14 @@ control SwitchIngress(
     table send_to_endpoints {
         actions = { send_to_group; }
     }
+
+    Register<bit<32>, _>(1) sequence;
+    RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
+        void apply(inout bit<32> reg, out bit<32> result) {
+            reg = reg + 1;
+            result = reg;
+        }
+    };
 
     apply {
         // No need for egress processing, skip it and use empty controls for egress.
@@ -55,23 +59,21 @@ control SwitchIngress(
             exit;
         }
         
-        hdr.neo.variant = NEO_VARIANT_R;
+        hdr.neo.variant = NEO_VARIANT_S;
         hdr.udp.checksum = 0;
         
         if (hdr.neo.ty == NEO_TYPE_UCAST) {
             dmac.apply();
-        } else if (hdr.neo.ty == NEO_TYPE_RELAY_REPLY) {
-            hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
-            send_to_replicas.apply();
         } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
-            hdr.neo.ty = NEO_TYPE_RELAY;
-            hdr.neo_relay = { 
-                sequence = 0, 
-                hash = hdr.neo_ingress.digest, 
-                signature = 0
+            hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
+            bit<32> sequence = assign_sequence.execute(0);
+            hdr.neo_ordering = {
+                sequence = sequence,
+                // TODO a better signature
+                signature = 1
             };
             hdr.neo_ingress.setInvalid();
-            send_to_accel.apply();
+            send_to_replicas.apply();
         } else {
             // unreachable
             drop();
