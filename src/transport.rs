@@ -133,6 +133,7 @@ pub enum InboundMeta<'a> {
     OrderedMulticast {
         sequence_number: u32,
         signature: &'a [u8],
+        link_hash: &'a [u8; 32],
     },
 }
 
@@ -421,6 +422,7 @@ where
             InboundMeta::OrderedMulticast {
                 sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
                 signature: &buf[5..9],
+                link_hash: buf[68..100].try_into().unwrap(),
             }
         }
 

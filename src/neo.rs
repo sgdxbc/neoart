@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     crypto::{CryptoMessage, Signature},
-    meta::{ClientId, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER},
+    meta::{deserialize, ClientId, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER},
     transport::{Destination::ToMulticast, InboundAction, InboundMeta, Node, Transport},
     App,
 };
@@ -37,8 +37,8 @@ pub struct OrderedRequest {
     request_number: RequestNumber,
     op: Vec<u8>,
     sequence_number: u32,
-    // network_signature: Vec<u8>,
-    // chaining if needed
+    network_signature: Vec<u8>,
+    link_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,8 +213,32 @@ impl Node for Replica {
     type Message = Message;
 
     fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
-        println!("{meta:?}");
-        InboundAction::Block
+        match (meta, deserialize(buf)) {
+            (
+                InboundMeta::OrderedMulticast {
+                    sequence_number,
+                    signature,
+                    link_hash,
+                },
+                Message::Request(message),
+            ) => {
+                let request = OrderedRequest {
+                    client_id: message.client_id,
+                    request_number: message.request_number,
+                    op: message.op,
+                    sequence_number,
+                    network_signature: signature.to_vec(),
+                    link_hash: *link_hash,
+                };
+                // TODO verify multicast signature
+                InboundAction::Allow(Message::OrderedRequest(request))
+            }
+            (InboundMeta::Unicast, Message::PrepareRequest(message)) => {
+                let replica_id = message.replica_id;
+                InboundAction::VerifyReplica(Message::PrepareRequest(message), replica_id)
+            }
+            _ => InboundAction::Block,
+        }
     }
 
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {}

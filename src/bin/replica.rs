@@ -58,7 +58,7 @@ where
     let socket = UdpSocket::bind(config.replicas[args.index as usize])
         .await
         .unwrap();
-    socket.set_broadcast(true).unwrap(); // maybe needed later
+    socket.set_broadcast(true).unwrap();
     socket.writable().await.unwrap();
 
     let latency = Arc::new(Mutex::new(Latency::default()));

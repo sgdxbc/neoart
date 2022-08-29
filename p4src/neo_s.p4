@@ -35,9 +35,9 @@ control SwitchIngress(
         hdr.udp.dst_port = port;
         hdr.neo.sequence = assign_sequence.execute(0);
         // TODO signature
-        bit<8> padding = (bit<8>)hdr.neo.sequence;
-        hdr.neo.signature[7:0] = padding;
-        hdr.neo.signature[23:16] = padding;
+        // bit<8> padding = (bit<8>)hdr.neo.sequence;
+        // hdr.neo.signature[7:0] = padding;
+        // hdr.neo.signature[23:16] = padding;
         hdr.neo.hash = 0;
     }
 
@@ -60,7 +60,6 @@ control SwitchIngress(
     table do_set_meta {
         actions = { set_meta; }
     }
-
    
     apply {
         // No need for egress processing, skip it and use empty controls for egress.
@@ -77,6 +76,12 @@ control SwitchIngress(
             exit;
         }
         
+        /* if (hdr.neo.sequence == 0xffffffff) {
+            sequence.write(0, 0);
+            drop();
+            exit;
+        } */
+
         do_set_meta.apply();
         send_to_replicas.apply();
     }
