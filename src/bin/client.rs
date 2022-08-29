@@ -17,7 +17,7 @@ use neoart::{
     },
     meta::Config,
     neo,
-    transport::{Receiver, Run, Socket, Transport},
+    transport::{Node, Run, Socket, Transport},
     unreplicated, zyzzyva, Client,
 };
 use tokio::{
@@ -48,7 +48,7 @@ async fn main_internal<T>(
     args: Args,
     new_client: impl FnOnce(Transport<T>) -> T + Clone + Send + 'static,
 ) where
-    T: Receiver + Client + AsMut<Transport<T>> + Send,
+    T: Node + Client + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage,
 {
     let config: Config = read_to_string(args.config).await.unwrap().parse().unwrap();

@@ -8,7 +8,7 @@ use crate::{
     meta::{ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
         Destination::{To, ToReplica},
-        Receiver, Transport,
+        Node, Transport,
     },
     App,
 };
@@ -94,7 +94,7 @@ impl crate::Client for Client {
     }
 }
 
-impl Receiver for Client {
+impl Node for Client {
     type Message = Message;
 
     fn receive_message(&mut self, _remote: SocketAddr, message: Self::Message) {
@@ -169,7 +169,7 @@ impl AsMut<Transport<Self>> for Replica {
     }
 }
 
-impl Receiver for Replica {
+impl Node for Replica {
     type Message = Message;
 
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {

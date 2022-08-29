@@ -6,7 +6,7 @@ use neoart::{
     latency::{merge_latency_into, Latency},
     meta::{Config, OpNumber, ReplicaId},
     neo,
-    transport::{Receiver, Run, Socket, Transport},
+    transport::{Node, Run, Socket, Transport},
     unreplicated, zyzzyva, App,
 };
 use nix::{
@@ -45,7 +45,7 @@ impl App for Null {
 
 async fn main_internal<T>(args: Args, new_replica: impl FnOnce(Transport<T>) -> T)
 where
-    T: Receiver + AsMut<Transport<T>> + Send,
+    T: Node + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage,
 {
     let mut config: Config = read_to_string(args.config).await.unwrap().parse().unwrap();

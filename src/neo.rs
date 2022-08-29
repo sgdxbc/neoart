@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use crate::{
     crypto::{CryptoMessage, Signature},
     meta::{ClientId, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER},
-    transport::{Destination::ToMulticast, InboundAction, InboundMeta, Receiver, Transport},
+    transport::{Destination::ToMulticast, InboundAction, InboundMeta, Node, Transport},
     App,
 };
 
@@ -118,7 +118,7 @@ impl crate::Client for Client {
     }
 }
 
-impl Receiver for Client {
+impl Node for Client {
     type Message = Message;
 
     fn receive_message(&mut self, _remote: SocketAddr, message: Self::Message) {
@@ -209,7 +209,7 @@ impl AsMut<Transport<Self>> for Replica {
     }
 }
 
-impl Receiver for Replica {
+impl Node for Replica {
     type Message = Message;
 
     fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {

@@ -3,8 +3,8 @@
 //! signing and verifying messages with cryptographic.
 //!
 //! The abstraction is basically following specpaxos codebase. The struct
-//! `Transport` interacts with types that implement `Receiver` in the same way,
-//! as `Transport` and `TransportReceiver` in spexpaxos. The following describes
+//! `Transport` interacts with types that implement `Node` in the same way as
+//! `Transport` and `TransportReceiver` in spexpaxos. The following describes
 //! significant modifications.
 //!
 //! The original model requires circular mutable references between every
@@ -22,9 +22,9 @@
 //! `Concurrent` wrapper is provided to simplify spawning and joining.
 //!
 //! A client-side receiver should implement both `Run` and `Client`. Notice that
-//! `Client::invoke` method is not an async method, but instead return a
-//! `Future`, so it will not "contest" with `Run::run` for `&mut self`. A simple
-//! demostration to run a client until invocation is done:
+//! `Client::invoke` method is not an async method, but instead a sync method
+//! that returns a `dyn Future`, so it will not "contest" with `Run::run` for
+//! `&mut self`. A simple demostration to run a client until invocation is done:
 //! ```
 //! # use neoart::{common::*, transport::*, unreplicated::*, Client as _};
 //! # #[tokio::main]
@@ -70,7 +70,7 @@
 //! sending order on the other side of network.
 //!
 //! The outbound interface is `Transport::send_signed_message`, which sign the
-//! message in background work thread and send it after signing. The sending
+//! message in background worker thread and send it after signing. The sending
 //! semantic is different from plain `Transport::send_message`. The plain
 //! interface filters out loopback traffic, while
 //! `Transport::send_signed_message` keeps it to allow "recirculated" processing
@@ -112,7 +112,7 @@ pub trait Run {
     async fn run(&mut self, close: impl Future<Output = ()> + Send);
 }
 
-pub trait Receiver: Sized {
+pub trait Node: Sized {
     type Message: Send + 'static + DeserializeOwned;
     fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
         assert!(matches!(meta, InboundMeta::Unicast));
@@ -139,7 +139,7 @@ pub enum InboundAction<M> {
     // verify multicast
 }
 
-pub struct Transport<T: Receiver> {
+pub struct Transport<T: Node> {
     pub config: Config,
     crypto: Crypto<T::Message>,
     crypto_channel: mpsc::Receiver<CryptoEvent<T::Message>>,
@@ -178,7 +178,7 @@ pub enum Socket {
     Simulated(SimulatedSocket),
 }
 
-impl<T: Receiver> Transport<T> {
+impl<T: Node> Transport<T> {
     pub const VARIANT_N: u8 = 0; // no variant
     pub const VARIANT_R: u8 = 1;
     pub const VARIANT_S: u8 = 2;
@@ -250,7 +250,7 @@ impl<T: Receiver> Transport<T> {
         };
         let len = serialize(&mut buf[message_offset..], message.borrow()) + message_offset;
         if destination == Destination::ToMulticast {
-            let d = digest(&buf[message_offset..message_offset + len]);
+            let d = digest(&buf[message_offset..len]);
             buf[68..100].copy_from_slice(&d[..]);
         }
 
@@ -340,7 +340,7 @@ impl Socket {
 #[async_trait]
 impl<T> Run for T
 where
-    T: Receiver + AsMut<Transport<T>> + Send,
+    T: Node + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage,
 {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
@@ -370,7 +370,7 @@ where
 
         fn handle_crypto_event<T>(receiver: &mut T, event: CryptoEvent<T::Message>)
         where
-            T: Receiver + AsMut<Transport<T>>,
+            T: Node + AsMut<Transport<T>>,
             T::Message: Serialize,
         {
             match event {
@@ -397,37 +397,15 @@ where
 
         fn handle_raw_message<T>(receiver: &mut T, remote: SocketAddr, buf: &[u8])
         where
-            T: Receiver + AsMut<Transport<T>>,
+            T: Node + AsMut<Transport<T>>,
             T::Message: CryptoMessage + Send + 'static,
         {
-            let metadata = buf[0];
-            let variant = metadata >> 5;
-            println!("{metadata:x}");
-            assert!(variant != 0 || metadata & 0x10 != 0);
-            if metadata & 0x0f != 0 {
-                assert_eq!(receiver.as_mut().variant, variant);
-            }
-
-            let action;
-            match (metadata & 0x0f, variant) {
-                (0x00, _) => {
-                    action = receiver.inbound_action(InboundMeta::Unicast, &buf[1..]);
-                }
-                (0x02, Transport::<T>::VARIANT_R) => todo!(),
-                (0x02, Transport::<T>::VARIANT_S) => {
-                    // TODO verify HMAC signature
-                    action = receiver.inbound_action(
-                        InboundMeta::OrderedMulticast {
-                            sequence_number: u32::from_be_bytes(buf[1..5].try_into().unwrap()),
-                            signature: &buf[5..9],
-                        },
-                        &buf[9..],
-                    );
-                }
-                _ => unreachable!(),
-            }
-
-            match action {
+            let meta = InboundMeta::Unicast;
+            // meta = InboundMeta::OrderedMulticast {
+            //     sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            //     signature: &buf[5..9],
+            // };
+            match receiver.inbound_action(meta, buf) {
                 InboundAction::Allow(message) => {
                     receiver.receive_message(remote, message);
                 }
@@ -522,8 +500,6 @@ impl Run for SimulatedNetwork {
 
 impl SimulatedNetwork {
     async fn handle_message(&self, mut message: SimulatedMessage) {
-        message.buf[0] |= 0x10; // set simulate bit
-
         // TODO filter
         let inbox = self.inboxes[&message.destination].clone();
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));
