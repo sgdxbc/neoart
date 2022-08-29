@@ -104,11 +104,13 @@ use tokio::{
 
 use crate::{
     crypto::{Crypto, CryptoMessage, ExecutorSetting},
-    meta::{
-        deserialize, digest, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER,
-        MULTICAST,
-    },
+    meta::{deserialize, digest, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER},
 };
+
+#[async_trait]
+pub trait Run {
+    async fn run(&mut self, close: impl Future<Output = ()> + Send);
+}
 
 pub trait Receiver: Sized {
     type Message: Send + 'static + DeserializeOwned;
@@ -119,6 +121,7 @@ pub trait Receiver: Sized {
     fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundMeta<'a> {
     Unicast,
     OrderedMulticast {
@@ -127,6 +130,7 @@ pub enum InboundMeta<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
 pub enum InboundAction<M> {
     Allow(M),
     Block,
@@ -216,7 +220,7 @@ impl<T: Receiver> Transport<T> {
         random_id(addr)
     }
 
-    fn send_message_interal(socket: &Socket, destination: SocketAddr, buf: &[u8]) {
+    fn send_message_internal(socket: &Socket, destination: SocketAddr, buf: &[u8]) {
         match socket {
             Socket::Os(socket) => {
                 socket.try_send_to(buf, destination).unwrap();
@@ -239,26 +243,23 @@ impl<T: Receiver> Transport<T> {
         T::Message: Serialize,
     {
         let mut buf = [0; 1400];
-        let message_offset;
-        if destination == Destination::ToMulticast {
-            buf[0] = 0x01; // null variant, not extended, multicast ingress
-            message_offset = 1 + 32; // 32 bytes message digest
+        let message_offset = if destination == Destination::ToMulticast {
+            100 // 4 bytes sequence, up to 64 bytes signature, 32 bytes hash
         } else {
-            // otherwise keep 0x00: null variant, not extended, unicast
-            message_offset = 1;
-        }
+            0
+        };
         let len = serialize(&mut buf[message_offset..], message.borrow()) + message_offset;
         if destination == Destination::ToMulticast {
             let d = digest(&buf[message_offset..message_offset + len]);
-            buf[1..1 + 32].copy_from_slice(&d[..]);
+            buf[68..100].copy_from_slice(&d[..]);
         }
 
         match destination {
             Destination::ToNull => {
                 unreachable!() // really?
             }
-            Destination::To(addr) => Self::send_message_interal(&self.socket, addr, &buf[..len]),
-            Destination::ToReplica(id) => Self::send_message_interal(
+            Destination::To(addr) => Self::send_message_internal(&self.socket, addr, &buf[..len]),
+            Destination::ToReplica(id) => Self::send_message_internal(
                 &self.socket,
                 self.config.replicas[id as usize],
                 &buf[..len],
@@ -271,13 +272,15 @@ impl<T: Receiver> Transport<T> {
 
                 for &address in &self.config.replicas {
                     if address != local {
-                        Self::send_message_interal(&self.socket, address, &buf[..len]);
+                        Self::send_message_internal(&self.socket, address, &buf[..len]);
                     }
                 }
             }
-            Destination::ToMulticast => {
-                Self::send_message_interal(&self.socket, SocketAddr::from(MULTICAST), &buf[..len])
-            }
+            Destination::ToMulticast => Self::send_message_internal(
+                &self.socket,
+                (self.config.multicast.unwrap(), 14159).into(),
+                &buf[..len],
+            ),
         }
     }
 
@@ -332,11 +335,6 @@ impl Socket {
             }
         }
     }
-}
-
-#[async_trait]
-pub trait Run {
-    async fn run(&mut self, close: impl Future<Output = ()> + Send);
 }
 
 #[async_trait]
@@ -404,23 +402,26 @@ where
         {
             let metadata = buf[0];
             let variant = metadata >> 5;
+            println!("{metadata:x}");
             assert!(variant != 0 || metadata & 0x10 != 0);
             if metadata & 0x0f != 0 {
                 assert_eq!(receiver.as_mut().variant, variant);
             }
 
             let action;
-            match metadata & 0x0f {
-                0x00 => {
+            match (metadata & 0x0f, variant) {
+                (0x00, _) => {
                     action = receiver.inbound_action(InboundMeta::Unicast, &buf[1..]);
                 }
-                0x02 => {
+                (0x02, Transport::<T>::VARIANT_R) => todo!(),
+                (0x02, Transport::<T>::VARIANT_S) => {
+                    // TODO verify HMAC signature
                     action = receiver.inbound_action(
                         InboundMeta::OrderedMulticast {
                             sequence_number: u32::from_be_bytes(buf[1..5].try_into().unwrap()),
-                            signature: &buf[5..37],
+                            signature: &buf[5..9],
                         },
-                        &buf[37..],
+                        &buf[9..],
                     );
                 }
                 _ => unreachable!(),

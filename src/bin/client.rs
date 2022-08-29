@@ -16,6 +16,7 @@ use neoart::{
         Point::{RequestBegin, RequestEnd},
     },
     meta::Config,
+    neo,
     transport::{Receiver, Run, Socket, Transport},
     unreplicated, zyzzyva, Client,
 };
@@ -28,6 +29,7 @@ enum Mode {
     Ur, // unreplicated
     Zyzzyva,
     ZyzzyvaByz,
+    Neo,
 }
 
 #[derive(Parser)]
@@ -62,6 +64,7 @@ async fn main_internal<T>(
             let new_client = new_client.clone();
             spawn(async move {
                 let socket = UdpSocket::bind(address).await.unwrap();
+                socket.set_broadcast(true).unwrap();
                 socket.writable().await.unwrap();
                 let transport = Transport::new(config, Socket::Os(socket), ExecutorSetting::Inline);
                 let mut client = new_client(transport);
@@ -124,6 +127,7 @@ fn main() {
                 Mode::ZyzzyvaByz => {
                     main_internal(args, |transport| zyzzyva::Client::new(transport, true)).await
                 }
+                Mode::Neo => main_internal(args, neo::Client::new).await,
             }
         });
 

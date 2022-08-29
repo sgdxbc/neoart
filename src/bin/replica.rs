@@ -5,6 +5,7 @@ use neoart::{
     crypto::{CryptoMessage, ExecutorSetting},
     latency::{merge_latency_into, Latency},
     meta::{Config, OpNumber, ReplicaId},
+    neo,
     transport::{Receiver, Run, Socket, Transport},
     unreplicated, zyzzyva, App,
 };
@@ -18,6 +19,7 @@ use tokio::{fs::read_to_string, net::UdpSocket, signal::ctrl_c};
 enum Mode {
     Ur, // unreplicated
     Zyzzyva,
+    Neo,
 }
 
 #[derive(Parser)]
@@ -56,6 +58,8 @@ where
     let socket = UdpSocket::bind(config.replicas[args.index as usize])
         .await
         .unwrap();
+    socket.set_broadcast(true).unwrap();
+    socket.writable().await.unwrap();
     let latency = Arc::new(Mutex::new(Latency::default()));
     let setting = match args.num_worker {
         0 => ExecutorSetting::Inline,
@@ -87,6 +91,12 @@ async fn main() {
         Mode::Zyzzyva => {
             main_internal(args, move |transport| {
                 zyzzyva::Replica::new(transport, index, Null, enable_batching)
+            })
+            .await
+        }
+        Mode::Neo => {
+            main_internal(args, move |transport| {
+                neo::Replica::new(transport, index, Null)
             })
             .await
         }

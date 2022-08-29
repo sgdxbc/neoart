@@ -216,47 +216,11 @@ control EmptyEgress(
 
 /* NeoBFT common definition */
 
-typedef bit<3> neo_variant_t;
-const neo_variant_t NEO_VARIANT_NULL = 0; // have not gone through switch yet
-const neo_variant_t NEO_VARIANT_R = 1;
-const neo_variant_t NEO_VARIANT_S = 2;
-
-// the packet layout is determined by type (and variant)
-// every packet's udp payload starts with `neo_h`, followed by
-typedef bit<4> neo_type_t;
-// unicast packet: user data
-const neo_type_t NEO_TYPE_UCAST = 0;
-// multicast ingress packet: send by endpoints with `Destination::ToMulticast`
-// 32 bytes precomputed message hash + user data (i.e. message)
-const neo_type_t NEO_TYPE_MCAST_INGRESS = 1; 
-// multicast outgress packet: send by switch
-//   neo_r variant: neo_relay_ordering_h + user data
-const neo_type_t NEO_TYPE_MCAST_OUTGRESS = 2;
-// packet relayed from switch to accelerator (neo_r): neo_relay_ordering_h + user data
-const neo_type_t NEO_TYPE_RELAY = 3; 
-// packet replied from accelerator to switch: same as relay
-const neo_type_t NEO_TYPE_RELAY_REPLY = 4;
-
-// common header for all udp packets, including unicast, multicast, etc.
 header neo_h {
-    neo_variant_t variant;
-    bit<1> _unused;
-    neo_type_t ty;
-}
-
-header neo_ingress_h {
-    bit<256> digest;
-}
-
-header neo_relay_h {
-    bit<32> sequence;
-    bit<256> hash;
-    bit<512> signature;
-}
-
-header neo_ordering_h {
     bit<32> sequence;
     bit<32> signature;
+    bit<(60 * 8)> signature_ex;
+    bit<(32 * 8)> hash;
 }
 
 struct header_t {
@@ -268,9 +232,6 @@ struct header_t {
     udp_h udp;
 
     neo_h neo;
-    neo_ingress_h neo_ingress;
-    neo_relay_h neo_relay;
-    neo_ordering_h neo_ordering;
 }
 
 struct metadata_t {}
@@ -282,6 +243,7 @@ parser SwitchIngressParser(
         out ingress_intrinsic_metadata_t ig_intr_md) {
 
     TofinoIngressParser() tofino_parser;
+    value_set<bit<16>>(1) neo_port;
 
     state start {
         tofino_parser.apply(pkt, ig_intr_md);
@@ -306,17 +268,14 @@ parser SwitchIngressParser(
 
     state parse_udp {
         pkt.extract(hdr.udp);
-        // maybe better to filter out normal udp traffic with destination port
-        // (which still has false negative)
-        pkt.extract(hdr.neo);
-        transition select (hdr.neo.ty) {
-            NEO_TYPE_MCAST_INGRESS: parse_neo_ingress;
+        transition select (hdr.udp.dst_port) {
+            neo_port: parse_neo;
             default: accept;
         }
     }
 
-    state parse_neo_ingress {
-        pkt.extract(hdr.neo_ingress);
+    state parse_neo {
+        pkt.extract(hdr.neo);
         transition accept;
     }
 }

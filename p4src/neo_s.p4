@@ -22,6 +22,22 @@ control SwitchIngress(
         ig_tm_md.rid = 0xffff;
     }
 
+    Register<bit<32>, _>(1) sequence;
+    RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
+        void apply(inout bit<32> reg, out bit<32> result) {
+            reg = reg + 1;
+            result = reg;
+        }
+    };
+ 
+    action set_meta(bit<16> port) {
+        hdr.udp.checksum = 0;
+        hdr.udp.dst_port = port;
+        hdr.neo.sequence = assign_sequence.execute(0);
+        // TODO signature
+        hdr.neo.hash = 0;
+    }
+
     table dmac {
         key = { hdr.ethernet.dst_addr : exact; }
         actions = { send; }
@@ -38,14 +54,11 @@ control SwitchIngress(
         actions = { send_to_group; }
     }
 
-    Register<bit<32>, _>(1) sequence;
-    RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
-        void apply(inout bit<32> reg, out bit<32> result) {
-            reg = reg + 1;
-            result = reg;
-        }
-    };
+    table do_set_meta {
+        actions = { set_meta; }
+    }
 
+   
     apply {
         // No need for egress processing, skip it and use empty controls for egress.
         ig_tm_md.bypass_egress = 1w1;
@@ -53,31 +66,16 @@ control SwitchIngress(
         if (!hdr.neo.isValid()) {
             if (hdr.ethernet.ether_type == ETHERTYPE_ARP) {
                 send_to_endpoints.apply(); // a little bit wild here
+            } else if (hdr.ipv4.protocol == IP_PROTOCOLS_UDP) {
+                dmac.apply();
             } else {
                 drop();
             }
             exit;
         }
         
-        hdr.neo.variant = NEO_VARIANT_S;
-        hdr.udp.checksum = 0;
-        
-        if (hdr.neo.ty == NEO_TYPE_UCAST) {
-            dmac.apply();
-        } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
-            hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
-            bit<32> sequence = assign_sequence.execute(0);
-            hdr.neo_ordering = {
-                sequence = sequence,
-                // TODO a better signature
-                signature = 1
-            };
-            hdr.neo_ingress.setInvalid();
-            send_to_replicas.apply();
-        } else {
-            // unreachable
-            drop();
-        }
+        do_set_meta.apply();
+        send_to_replicas.apply();
     }
 }
 

@@ -6,6 +6,7 @@ pub mod common;
 pub mod crypto;
 pub mod latency;
 pub mod meta;
+pub mod neo;
 pub mod transport;
 pub mod unreplicated;
 pub mod ycsb;

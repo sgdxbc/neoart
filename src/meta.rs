@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     fmt::Display,
     io::{Cursor, Read, Write},
-    net::{SocketAddr, Ipv4Addr},
+    net::{Ipv4Addr, SocketAddr},
     str::FromStr,
 };
 
@@ -13,7 +13,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 // preallocate 8M entries, the expected usage is at most ~300K * 20s
 pub const ENTRY_NUMBER: usize = 8 << 20;
-pub const MULTICAST: (Ipv4Addr, u16) = (Ipv4Addr::BROADCAST, 0x1fff);
 
 pub type ReplicaId = u8;
 pub type RequestNumber = u32;
@@ -75,6 +74,7 @@ pub struct Config {
     pub f: usize,
     pub replicas: Vec<SocketAddr>,
     pub keys: Vec<KeyPair>,
+    pub multicast: Option<Ipv4Addr>,
 }
 
 impl FromStr for Config {
@@ -82,12 +82,15 @@ impl FromStr for Config {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut f = None;
         let mut replicas = Vec::new();
+        let mut multicast = None;
         for line in s.lines() {
             let line = line.trim_start();
             if let Some(line) = line.strip_prefix('f') {
                 f = Some(line.trim_start().parse().unwrap());
             } else if let Some(line) = line.strip_prefix("replica") {
                 replicas.push(line.trim_start().parse().unwrap());
+            } else if let Some(line) = line.strip_prefix("multicast") {
+                multicast = Some(line.trim_start().parse().unwrap());
             }
         }
         Ok(Self {
@@ -95,6 +98,7 @@ impl FromStr for Config {
             f: f.unwrap(),
             replicas,
             keys: Vec::new(),
+            multicast,
         })
     }
 }
