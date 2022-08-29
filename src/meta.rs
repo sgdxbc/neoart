@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     fmt::Display,
     io::{Cursor, Read, Write},
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     str::FromStr,
 };
 
@@ -74,7 +74,7 @@ pub struct Config {
     pub f: usize,
     pub replicas: Vec<SocketAddr>,
     pub keys: Vec<KeyPair>,
-    pub multicast: Option<Ipv4Addr>,
+    pub multicast: Option<SocketAddr>,
 }
 
 impl FromStr for Config {

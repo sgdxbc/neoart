@@ -6,7 +6,7 @@ use neoart::{
     latency::{merge_latency_into, Latency},
     meta::{Config, OpNumber, ReplicaId},
     neo,
-    transport::{Node, Run, Socket, Transport},
+    transport::{MulticastVariant, Node, Run, Socket, Transport},
     unreplicated, zyzzyva, App,
 };
 use nix::{
@@ -58,15 +58,22 @@ where
     let socket = UdpSocket::bind(config.replicas[args.index as usize])
         .await
         .unwrap();
-    socket.set_broadcast(true).unwrap();
+    socket.set_broadcast(true).unwrap(); // maybe needed later
     socket.writable().await.unwrap();
+
     let latency = Arc::new(Mutex::new(Latency::default()));
     let setting = match args.num_worker {
         0 => ExecutorSetting::Inline,
         n => ExecutorSetting::Rayon(n, latency.clone()),
     };
 
-    let transport = Transport::new(config, Socket::Os(socket), setting);
+    let multicast = config.multicast;
+    let mut transport = Transport::new(config, Socket::Os(socket), setting);
+    if let Some(multicast) = multicast {
+        let socket = UdpSocket::bind(multicast).await.unwrap();
+        transport.listen_multicast(Socket::Os(socket), MulticastVariant::Sign);
+    }
+
     let mut replica = new_replica(transport);
     replica.run(async { ctrl_c().await.unwrap() }).await;
 
@@ -74,6 +81,7 @@ where
     let aggregated = &mut latency.lock().unwrap();
     merge_latency_into(aggregated);
     aggregated.sort();
+    // maybe print it out
 }
 
 #[tokio::main(flavor = "current_thread")]

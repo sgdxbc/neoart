@@ -35,6 +35,9 @@ control SwitchIngress(
         hdr.udp.dst_port = port;
         hdr.neo.sequence = assign_sequence.execute(0);
         // TODO signature
+        bit<8> padding = (bit<8>)hdr.neo.sequence;
+        hdr.neo.signature[7:0] = padding;
+        hdr.neo.signature[23:16] = padding;
         hdr.neo.hash = 0;
     }
 

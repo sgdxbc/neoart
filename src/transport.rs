@@ -87,8 +87,14 @@
 //! pool and is suitable for benchmarking.
 
 use std::{
-    borrow::Borrow, collections::HashMap, fmt::Write, future::Future, net::SocketAddr, pin::Pin,
-    sync::Arc, time::Duration,
+    borrow::Borrow,
+    collections::HashMap,
+    fmt::Write,
+    future::{pending, Future},
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -144,10 +150,10 @@ pub struct Transport<T: Node> {
     crypto: Crypto<T::Message>,
     crypto_channel: mpsc::Receiver<CryptoEvent<T::Message>>,
     socket: Socket,
+    multicast_socket: Socket,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
     send_signed: Vec<Destination>,
-    variant: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,15 +180,27 @@ type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
 
 #[derive(Debug)]
 pub enum Socket {
+    Null,
     Os(UdpSocket),
     Simulated(SimulatedSocket),
 }
 
-impl<T: Node> Transport<T> {
-    pub const VARIANT_N: u8 = 0; // no variant
-    pub const VARIANT_R: u8 = 1;
-    pub const VARIANT_S: u8 = 2;
+impl From<&'_ Socket> for SocketAddr {
+    fn from(socket: &Socket) -> Self {
+        match socket {
+            Socket::Null => unreachable!(),
+            Socket::Os(socket) => socket.local_addr().unwrap(),
+            Socket::Simulated(SimulatedSocket { addr, .. }) => *addr,
+        }
+    }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MulticastVariant {
+    Sign,
+}
+
+impl<T: Node> Transport<T> {
     pub fn new(config: Config, socket: Socket, setting: ExecutorSetting) -> Self {
         let mut timer_table = HashMap::new();
         // insert a sentinel entry to make sure we get always get a `sleep` to
@@ -201,27 +219,25 @@ impl<T: Node> Transport<T> {
             config,
             crypto_channel,
             socket,
+            multicast_socket: Socket::Null,
             timer_table,
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
-            variant: Self::VARIANT_N,
         }
     }
 
-    pub fn set_variant(&mut self, variant: u8) {
-        self.variant = variant;
+    pub fn listen_multicast(&mut self, socket: Socket, variant: MulticastVariant) {
+        assert_eq!(variant, MulticastVariant::Sign);
+        self.multicast_socket = socket;
     }
 
     pub fn create_id(&self) -> ClientId {
-        let addr = match &self.socket {
-            Socket::Os(socket) => socket.local_addr().unwrap(),
-            &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,
-        };
-        random_id(addr)
+        random_id((&self.socket).into())
     }
 
     fn send_message_internal(socket: &Socket, destination: SocketAddr, buf: &[u8]) {
         match socket {
+            Socket::Null => unreachable!(),
             Socket::Os(socket) => {
                 socket.try_send_to(buf, destination).unwrap();
             }
@@ -265,11 +281,7 @@ impl<T: Node> Transport<T> {
                 &buf[..len],
             ),
             Destination::ToAll => {
-                let local = match &self.socket {
-                    Socket::Os(socket) => socket.local_addr().unwrap(),
-                    &Socket::Simulated(SimulatedSocket { addr, .. }) => addr,
-                };
-
+                let local = (&self.socket).into();
                 for &address in &self.config.replicas {
                     if address != local {
                         Self::send_message_internal(&self.socket, address, &buf[..len]);
@@ -278,7 +290,7 @@ impl<T: Node> Transport<T> {
             }
             Destination::ToMulticast => Self::send_message_internal(
                 &self.socket,
-                (self.config.multicast.unwrap(), 14159).into(),
+                self.config.multicast.unwrap(),
                 &buf[..len],
             ),
         }
@@ -327,6 +339,7 @@ impl<T: Node> Transport<T> {
 impl Socket {
     async fn receive_from(&mut self, buf: &mut [u8]) -> (usize, SocketAddr) {
         match self {
+            Self::Null => pending().await,
             Self::Os(socket) => socket.recv_from(buf).await.unwrap(),
             Self::Simulated(SimulatedSocket { inbox, .. }) => {
                 let (remote, message) = inbox.recv().await.unwrap();
@@ -346,6 +359,7 @@ where
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
         let mut buf = [0; 1400];
+        let mut multicast_buf = [0; 1400];
         loop {
             let transport = self.as_mut();
             let (&id, timer) = transport
@@ -363,7 +377,15 @@ where
                     handle_crypto_event(self, event.unwrap());
                 },
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
-                    handle_raw_message(self, remote, &buf[..len]);
+                    handle_raw_message(self, remote, InboundMeta::Unicast, &buf[..len]);
+                }
+                (len, remote) = transport.multicast_socket.receive_from(&mut multicast_buf) => {
+                    handle_raw_message(
+                        self,
+                        remote,
+                        multicast_meta(&multicast_buf[..100]),
+                        &multicast_buf[100..len],
+                    );
                 }
             }
         }
@@ -395,16 +417,22 @@ where
             }
         }
 
-        fn handle_raw_message<T>(receiver: &mut T, remote: SocketAddr, buf: &[u8])
-        where
+        fn multicast_meta(buf: &[u8]) -> InboundMeta {
+            InboundMeta::OrderedMulticast {
+                sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                signature: &buf[5..9],
+            }
+        }
+
+        fn handle_raw_message<T>(
+            receiver: &mut T,
+            remote: SocketAddr,
+            meta: InboundMeta,
+            buf: &[u8],
+        ) where
             T: Node + AsMut<Transport<T>>,
             T::Message: CryptoMessage + Send + 'static,
         {
-            let meta = InboundMeta::Unicast;
-            // meta = InboundMeta::OrderedMulticast {
-            //     sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-            //     signature: &buf[5..9],
-            // };
             match receiver.inbound_action(meta, buf) {
                 InboundAction::Allow(message) => {
                     receiver.receive_message(remote, message);
@@ -499,7 +527,7 @@ impl Run for SimulatedNetwork {
 }
 
 impl SimulatedNetwork {
-    async fn handle_message(&self, mut message: SimulatedMessage) {
+    async fn handle_message(&self, message: SimulatedMessage) {
         // TODO filter
         let inbox = self.inboxes[&message.destination].clone();
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));
