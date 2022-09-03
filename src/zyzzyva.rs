@@ -31,6 +31,7 @@ pub enum Message {
     SpecResponse(SpecResponse, ReplicaId, Vec<u8>, OrderReq),
     Commit(Commit),
     LocalCommit(LocalCommit),
+    Checkpoint(Checkpoint),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,12 +84,22 @@ pub struct LocalCommit {
     signature: Signature,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    op_number: OpNumber,
+    history_digest: Digest,
+    // app_snapshot: (),
+    replica_id: ReplicaId,
+    signature: Signature,
+}
+
 impl CryptoMessage for Message {
     fn signature_mut(&mut self) -> &mut Signature {
         match self {
             Self::OrderReq(OrderReq { signature, .. }, _)
             | Self::SpecResponse(SpecResponse { signature, .. }, ..)
-            | Self::LocalCommit(LocalCommit { signature, .. }) => signature,
+            | Self::LocalCommit(LocalCommit { signature, .. })
+            | Self::Checkpoint(Checkpoint { signature, .. }) => signature,
             _ => unreachable!(),
         }
     }
@@ -337,6 +348,8 @@ pub struct Replica {
     reorder_order_req: Reorder<(OrderReq, Vec<Request>)>,
     batch_size: usize,
     batch: Vec<Request>,
+    checkpoint_quorums: HashMap<(OpNumber, Digest), HashSet<ReplicaId>>,
+    checkpoint_number: OpNumber,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +383,8 @@ impl Replica {
             commit_certificate: CommitCertificate::default(),
             batch_size: if enable_batching { Self::BATCH_SIZE } else { 1 },
             batch: Vec::new(),
+            checkpoint_quorums: HashMap::new(),
+            checkpoint_number: 0,
         }
     }
 }
@@ -408,6 +423,7 @@ impl Node for Replica {
             Message::Request(message) => self.handle_request(remote, message),
             Message::OrderReq(message, request) => self.handle_order_req(remote, message, request),
             Message::Commit(message) => self.handle_commit(remote, message),
+            Message::Checkpoint(message) => self.handle_checkpoint(remote, message),
             _ => unreachable!(),
         }
     }
@@ -443,22 +459,19 @@ impl Replica {
         let batch = take(&mut self.batch);
         let message_digest = digest(&batch);
         self.history_digest = digest([self.history_digest, message_digest]);
+        let order_req = OrderReq {
+            view_number: self.view_number,
+            op_number: self.op_number,
+            message_digest,
+            history_digest: self.history_digest,
+            signature: Signature::default(),
+        };
         self.transport.send_signed_message(
             ToAll,
-            Message::OrderReq(
-                OrderReq {
-                    view_number: self.view_number,
-                    op_number: self.op_number,
-                    message_digest,
-                    history_digest: self.history_digest,
-                    signature: Signature::default(),
-                },
-                batch,
-            ),
+            Message::OrderReq(order_req.clone(), batch.clone()),
             self.id,
         );
-
-        // locally speculative commit in `Receiver::on_signed`
+        self.insert_order_req(order_req, batch);
     }
 
     fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Vec<Request>) {
@@ -477,11 +490,15 @@ impl Replica {
             return;
         }
 
+        self.insert_order_req(message, request);
+    }
+
+    fn insert_order_req(&mut self, message: OrderReq, request: Vec<Request>) {
         let mut ordered = self
             .reorder_order_req
             .insert_reorder(message.op_number, (message, request));
         while let Some((message, request)) = ordered {
-            if !is_primary {
+            if self.id != self.transport.config.primary(self.view_number) {
                 let previous_digest = if self.op_number == 0 {
                     Digest::default()
                 } else {
@@ -502,12 +519,12 @@ impl Replica {
                 self.history_digest = message.history_digest;
             }
 
-            self.spec_commit(message, request);
+            self.speculative_commit(message, request);
             ordered = self.reorder_order_req.expect_next();
         }
     }
 
-    fn spec_commit(&mut self, message: OrderReq, batch: Vec<Request>) {
+    fn speculative_commit(&mut self, message: OrderReq, batch: Vec<Request>) {
         assert_eq!(message.view_number, self.view_number);
 
         for request in &batch {
@@ -575,6 +592,27 @@ impl Replica {
         });
         self.transport
             .send_signed_message(To(remote), local_commit, self.id);
+    }
+
+    fn handle_checkpoint(&mut self, _remote: SocketAddr, message: Checkpoint) {
+        if message.op_number <= self.checkpoint_number {
+            return;
+        }
+        if let Some(entry) = self.log.get((message.op_number - 1) as usize) {
+            if entry.history_digest != message.history_digest {
+                return;
+            }
+        }
+
+        let quorum = self
+            .checkpoint_quorums
+            .entry((message.op_number, message.history_digest))
+            .or_default();
+        quorum.insert(message.replica_id);
+        if quorum.len() == self.transport.config.f + 1 {
+            self.checkpoint_number = message.op_number;
+            self.app.commit_upcall(self.checkpoint_number);
+        }
     }
 }
 

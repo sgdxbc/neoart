@@ -22,28 +22,10 @@ control SwitchIngress(
         ig_tm_md.rid = 0xffff;
     }
 
-    Register<bit<32>, _>(1) sequence;
-    RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
-        void apply(inout bit<32> reg, out bit<32> result) {
-            reg = reg + 1;
-            result = reg;
-        }
-    };
- 
-    action set_meta(bit<16> port) {
-        hdr.udp.checksum = 0;
-        hdr.udp.dst_port = port;
-        hdr.neo.sequence = assign_sequence.execute(0);
-        // TODO signature
-        // bit<8> padding = (bit<8>)hdr.neo.sequence;
-        // hdr.neo.signature[7:0] = padding;
-        // hdr.neo.signature[23:16] = padding;
-        hdr.neo.hash = 0;
-    }
-
     table dmac {
         key = { hdr.ethernet.dst_addr : exact; }
         actions = { send; }
+        size = 8;
     }
 
     // keyless tables that always perform default action, need to be configured
@@ -51,16 +33,45 @@ control SwitchIngress(
 
     table send_to_replicas {
         actions = { send_to_group; }
+        size = 1;
     }
 
     table send_to_endpoints {
         actions = { send_to_group; }
+        size = 1;
     }
 
-    table do_set_meta {
-        actions = { set_meta; }
+    bit<32> code;
+    bit<32> sequence_number;
+
+    Register<bit<32>, _>(1, 0) sequence;
+    RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
+        void apply(inout bit<32> reg, out bit<32> result) {
+            if (code == 0) {
+                reg = reg + 1;
+            } else {
+                reg = 0;
+            }
+            result = reg;
+        }
+    };
+
+    action neo_multicast(bit<16> port) {
+        hdr.udp.checksum = 0;
+        hdr.udp.dst_port = port;
+        hdr.neo.sequence = sequence_number;
+        // TODO signature
+        bit<8> padding = (bit<8>)hdr.neo.sequence;
+        hdr.neo.signature[7:0] = padding;
+        hdr.neo.signature[23:16] = padding;
+        hdr.neo.hash = 0;
     }
-   
+
+    table neo {
+        actions = { neo_multicast; }
+        size = 1;
+    }
+
     apply {
         // No need for egress processing, skip it and use empty controls for egress.
         ig_tm_md.bypass_egress = 1w1;
@@ -76,13 +87,13 @@ control SwitchIngress(
             exit;
         }
         
-        /* if (hdr.neo.sequence == 0xffffffff) {
-            sequence.write(0, 0);
+        code = hdr.neo.sequence;
+        sequence_number = assign_sequence.execute(0);
+        if (code != 0) {
             drop();
             exit;
-        } */
-
-        do_set_meta.apply();
+        }
+        neo.apply();
         send_to_replicas.apply();
     }
 }

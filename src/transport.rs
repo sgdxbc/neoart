@@ -60,14 +60,14 @@
 //!
 //! The `Crypto` is intergrated into `Transport` through two sets of interfaces
 //! for inbound and outbound messages. Every inbound message must go through
-//! verification, where exact policy is returned by `Receiver::inbound_action`.
-//! A replica message basically can be verified by `VerifyReplica` while
-//! `Verify` can be used for customized verification. The message will be
-//! verified in background worker thread, and be fed into
-//! `Receiver::receive_message` if it is verified. The order of messages passing
-//! into `Receiver::receive_message` could be different to the order observed by
-//! `Receiver::inbound_action`, and both ordering could be different to the
-//! sending order on the other side of network.
+//! verification, where exact policy is returned by `Node::inbound_action`. A
+//! replica message basically can be verified by `VerifyReplica` while `Verify`
+//! can be used for customized verification. The message will be verified in
+//! background worker thread, and be fed into `Node::receive_message` if it is
+//! verified. The order of messages passing into `Node::receive_message` could
+//! be different to the order observed by `Node::inbound_action`, and both
+//! ordering could be different to the sending order on the other side of
+//! network.
 //!
 //! The outbound interface is `Transport::send_signed_message`, which sign the
 //! message in background worker thread and send it after signing. The sending
@@ -77,7 +77,8 @@
 //! on signed messages. This is basically a design tradeoff, because it is hard
 //! to recirculate in the synchronized `Transport::send_message`, while it is
 //! also hard to "inline" the receiving logic of the loopback copy with the
-//! asynchronized `Transport::send_signed_message`.
+//! asynchronized `Transport::send_signed_message`. Notice that the recirculated
+//! messages do not go through `Node::inbound_action`, they are always allowed.
 //!
 //! `Crypto`'s executor has `Inline` and `Rayon` variants. The `Inline` executor
 //! finishes cryptographic task on current thread before returning from calling,
@@ -409,11 +410,11 @@ where
                     // we don't have access to self.id here, and extract replica
                     // address from config then compare is too expensive (and
                     // not elegant)
-                    if matches!(dest, Destination::ToAll) {
-                        // assuming receiver does not care about remote address
-                        // of recirculation messages
-                        receiver.receive_message(SocketAddr::from(([0, 0, 0, 0], 0)), message);
-                    }
+                    // if matches!(dest, Destination::ToAll) {
+                    //     // assuming receiver does not care about remote address
+                    //     // of recirculation messages
+                    //     receiver.receive_message(SocketAddr::from(([0, 0, 0, 0], 0)), message);
+                    // }
                 }
             }
         }
