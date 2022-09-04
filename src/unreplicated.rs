@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -8,7 +8,7 @@ use crate::{
     meta::{ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
         Destination::{To, ToReplica},
-        Node, Transport,
+        Node, Transport, TransportMessage,
     },
     App,
 };
@@ -97,8 +97,8 @@ impl crate::Client for Client {
 impl Node for Client {
     type Message = Message;
 
-    fn receive_message(&mut self, _remote: SocketAddr, message: Self::Message) {
-        let message = if let Message::Reply(message) = message {
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
+        let message = if let TransportMessage::Allowed(Message::Reply(message)) = message {
             message
         } else {
             unreachable!()
@@ -172,8 +172,8 @@ impl AsMut<Transport<Self>> for Replica {
 impl Node for Replica {
     type Message = Message;
 
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
-        let message = if let Message::Request(message) = message {
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
+        let message = if let TransportMessage::Allowed(Message::Request(message)) = message {
             message
         } else {
             unreachable!()
@@ -185,7 +185,7 @@ impl Node for Replica {
             if reply.request_number == message.request_number {
                 println!("! resend");
                 self.transport.send_signed_message(
-                    To(remote),
+                    To(message.client_id.0),
                     Message::Reply(reply.clone()),
                     self.id,
                 );
@@ -205,7 +205,7 @@ impl Node for Replica {
         });
         assert_eq!(self.log.len() as OpNumber, self.op_number);
         self.transport
-            .send_signed_message(To(remote), reply, self.id);
+            .send_signed_message(To(message.client_id.0), reply, self.id);
     }
 }
 

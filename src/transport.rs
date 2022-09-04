@@ -125,7 +125,7 @@ pub trait Node: Sized {
         assert!(matches!(meta, InboundMeta::Unicast));
         InboundAction::Allow(deserialize(buf))
     }
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message);
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +147,13 @@ pub enum InboundAction<M> {
     // verify multicast
 }
 
+#[derive(Clone, Copy)]
+pub enum TransportMessage<M> {
+    Allowed(M),
+    Verified(M),
+    Signed(M),
+}
+
 pub struct Transport<T: Node> {
     pub config: Config,
     crypto: Crypto<T::Message>,
@@ -161,6 +168,7 @@ pub struct Transport<T: Node> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Destination {
     ToNull, // reserved
+    ToSelf,
     To(SocketAddr),
     ToReplica(ReplicaId),
     ToAll,
@@ -168,7 +176,7 @@ pub enum Destination {
 }
 
 pub enum CryptoEvent<M> {
-    Verified(SocketAddr, M),
+    Verified(M),
     Signed(usize, M),
 }
 
@@ -199,7 +207,8 @@ impl From<&'_ Socket> for SocketAddr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MulticastVariant {
-    Sign,
+    HalfSipHash,
+    // Secp256k1
 }
 
 impl<T: Node> Transport<T> {
@@ -229,7 +238,7 @@ impl<T: Node> Transport<T> {
     }
 
     pub fn listen_multicast(&mut self, socket: Socket, variant: MulticastVariant) {
-        assert_eq!(variant, MulticastVariant::Sign);
+        assert_eq!(variant, MulticastVariant::HalfSipHash);
         self.multicast_socket = socket;
     }
 
@@ -273,7 +282,7 @@ impl<T: Node> Transport<T> {
         }
 
         match destination {
-            Destination::ToNull => {
+            Destination::ToNull | Destination::ToSelf => {
                 unreachable!() // really?
             }
             Destination::To(addr) => Self::send_message_internal(&self.socket, addr, &buf[..len]),
@@ -398,28 +407,21 @@ where
             T::Message: Serialize,
         {
             match event {
-                CryptoEvent::Verified(remote, message) => {
-                    receiver.receive_message(remote, message);
+                CryptoEvent::Verified(message) => {
+                    receiver.receive_message(TransportMessage::Verified(message));
                 }
-                CryptoEvent::Signed(id, message) => {
-                    let dest = receiver.as_mut().send_signed[id];
-                    if !matches!(dest, Destination::ToNull) {
-                        receiver.as_mut().send_message(dest, &message);
+                CryptoEvent::Signed(id, message) => match receiver.as_mut().send_signed[id] {
+                    Destination::ToNull => {}
+                    Destination::ToSelf => {
+                        receiver.receive_message(TransportMessage::Signed(message))
                     }
-                    // TODO Destination::ToReplica(self.id)
-                    // we don't have access to self.id here, and extract replica
-                    // address from config then compare is too expensive (and
-                    // not elegant)
-                    // if matches!(dest, Destination::ToAll) {
-                    //     // assuming receiver does not care about remote address
-                    //     // of recirculation messages
-                    //     receiver.receive_message(SocketAddr::from(([0, 0, 0, 0], 0)), message);
-                    // }
-                }
+                    destination @ _ => receiver.as_mut().send_message(destination, &message),
+                },
             }
         }
 
         fn multicast_meta(buf: &[u8]) -> InboundMeta {
+            // TODO match variant
             InboundMeta::OrderedMulticast {
                 sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
                 signature: &buf[5..9],
@@ -429,7 +431,7 @@ where
 
         fn handle_raw_message<T>(
             receiver: &mut T,
-            remote: SocketAddr,
+            _remote: SocketAddr,
             meta: InboundMeta,
             buf: &[u8],
         ) where
@@ -438,17 +440,14 @@ where
         {
             match receiver.inbound_action(meta, buf) {
                 InboundAction::Allow(message) => {
-                    receiver.receive_message(remote, message);
+                    receiver.receive_message(TransportMessage::Allowed(message));
                 }
                 InboundAction::Block => {}
                 InboundAction::VerifyReplica(message, replica_id) => {
-                    receiver
-                        .as_mut()
-                        .crypto
-                        .verify_replica(remote, message, replica_id);
+                    receiver.as_mut().crypto.verify_replica(message, replica_id);
                 }
                 InboundAction::Verify(message, verify) => {
-                    receiver.as_mut().crypto.verify(remote, message, verify);
+                    receiver.as_mut().crypto.verify(message, verify);
                 }
             }
         }

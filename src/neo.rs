@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    net::SocketAddr,
     pin::Pin,
     time::Duration,
 };
@@ -18,7 +17,7 @@ use crate::{
     },
     transport::{
         Destination::{To, ToAll, ToMulticast, ToReplica},
-        InboundAction, InboundMeta, Node, Transport,
+        InboundAction, InboundMeta, Node, Transport, TransportMessage,
     },
     App,
 };
@@ -144,8 +143,8 @@ impl crate::Client for Client {
 impl Node for Client {
     type Message = Message;
 
-    fn receive_message(&mut self, _remote: SocketAddr, message: Self::Message) {
-        let message = if let Message::Reply(message) = message {
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
+        let message = if let TransportMessage::Allowed(Message::Reply(message)) = message {
             message
         } else {
             unreachable!()
@@ -308,18 +307,24 @@ impl Node for Replica {
         }
     }
 
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
         match message {
-            Message::OrderedRequest(message) => self.handle_ordered_request(remote, message),
-            Message::MulticastVote(message) => self.handle_multicast_vote(remote, message),
-            Message::MulticastGeneric(message) => self.handle_multicast_generic(remote, message),
+            TransportMessage::Verified(Message::OrderedRequest(message)) => {
+                self.handle_ordered_request(message)
+            }
+            TransportMessage::Verified(Message::MulticastVote(message)) => {
+                self.handle_multicast_vote(message)
+            }
+            TransportMessage::Verified(Message::MulticastGeneric(message)) => {
+                self.handle_multicast_generic(message)
+            }
             _ => unreachable!(),
         }
     }
 }
 
 impl Replica {
-    fn handle_ordered_request(&mut self, _remote: SocketAddr, message: OrderedRequest) {
+    fn handle_ordered_request(&mut self, message: OrderedRequest) {
         // we don't look up client table at this point, because every ordered
         // request will be assigned to different sequence number even if they
         // contains identical client request. so certain states e.g. reordering
@@ -394,7 +399,7 @@ impl Replica {
         }
     }
 
-    fn handle_multicast_vote(&mut self, _remote: SocketAddr, message: MulticastVote) {
+    fn handle_multicast_vote(&mut self, message: MulticastVote) {
         // TODO assert is primary
 
         if message.sequence_number != self.vote_number {
@@ -476,7 +481,7 @@ impl Replica {
         }
     }
 
-    fn handle_multicast_generic(&mut self, _remote: SocketAddr, message: MulticastGeneric) {
+    fn handle_multicast_generic(&mut self, message: MulticastGeneric) {
         if message.sequence_number > self.speculative_number {
             // TODO check local digest match certificate
             self.speculative_number = message.sequence_number;

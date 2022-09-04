@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     mem::take,
-    net::SocketAddr,
     pin::Pin,
     time::Duration,
 };
@@ -18,8 +17,8 @@ use crate::{
         ViewNumber, ENTRY_NUMBER,
     },
     transport::{
-        Destination::{To, ToAll, ToReplica},
-        InboundAction, InboundMeta, Node, Transport,
+        Destination::{To, ToAll, ToReplica, ToSelf},
+        InboundAction, InboundMeta, Node, Transport, TransportMessage,
     },
     App,
 };
@@ -209,12 +208,14 @@ impl crate::Client for Client {
 impl Node for Client {
     type Message = Message;
 
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
         match message {
-            Message::SpecResponse(message, replica_id, result, _) => {
-                self.handle_spec_response(remote, message, replica_id, result)
+            TransportMessage::Allowed(Message::SpecResponse(message, replica_id, result, _)) => {
+                self.handle_spec_response(message, replica_id, result)
             }
-            Message::LocalCommit(message) => self.handle_local_commit(remote, message),
+            TransportMessage::Allowed(Message::LocalCommit(message)) => {
+                self.handle_local_commit(message)
+            }
             _ => unreachable!(),
         }
     }
@@ -223,7 +224,6 @@ impl Node for Client {
 impl Client {
     fn handle_spec_response(
         &mut self,
-        _remote: SocketAddr,
         mut message: SpecResponse,
         replica_id: ReplicaId,
         result: Vec<u8>,
@@ -269,7 +269,7 @@ impl Client {
         }
     }
 
-    fn handle_local_commit(&mut self, _remote: SocketAddr, message: LocalCommit) {
+    fn handle_local_commit(&mut self, message: LocalCommit) {
         if message.client_id != self.id {
             return;
         }
@@ -418,27 +418,40 @@ impl Node for Replica {
         }
     }
 
-    fn receive_message(&mut self, remote: SocketAddr, message: Self::Message) {
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
         match message {
-            Message::Request(message) => self.handle_request(remote, message),
-            Message::OrderReq(message, request) => self.handle_order_req(remote, message, request),
-            Message::Commit(message) => self.handle_commit(remote, message),
-            Message::Checkpoint(message) => self.handle_checkpoint(remote, message),
+            TransportMessage::Allowed(Message::Request(message)) => self.handle_request(message),
+            TransportMessage::Verified(Message::OrderReq(message, request)) => {
+                self.handle_order_req(message, request)
+            }
+            TransportMessage::Signed(Message::OrderReq(message, request)) => {
+                // check view number?
+                self.transport
+                    .send_message(ToAll, Message::OrderReq(message.clone(), request.clone()));
+                self.insert_order_req(message, request);
+            }
+            TransportMessage::Verified(Message::Commit(message)) => self.handle_commit(message),
+            TransportMessage::Verified(Message::Checkpoint(message)) => {
+                self.handle_checkpoint(message)
+            }
             _ => unreachable!(),
         }
     }
 }
 
 impl Replica {
-    fn handle_request(&mut self, remote: SocketAddr, message: Request) {
+    fn handle_request(&mut self, message: Request) {
         if let Some((request_number, spec_response)) = self.client_table.get(&message.client_id) {
             if message.request_number < *request_number {
                 return;
             }
             if message.request_number == *request_number {
                 if let Some(spec_response) = spec_response {
-                    self.transport
-                        .send_signed_message(To(remote), spec_response.clone(), self.id);
+                    self.transport.send_signed_message(
+                        To(message.client_id.0),
+                        spec_response.clone(),
+                        self.id,
+                    );
                 }
                 return;
             }
@@ -467,14 +480,13 @@ impl Replica {
             signature: Signature::default(),
         };
         self.transport.send_signed_message(
-            ToAll,
+            ToSelf,
             Message::OrderReq(order_req.clone(), batch.clone()),
             self.id,
         );
-        self.insert_order_req(order_req, batch);
     }
 
-    fn handle_order_req(&mut self, _remote: SocketAddr, message: OrderReq, request: Vec<Request>) {
+    fn handle_order_req(&mut self, message: OrderReq, request: Vec<Request>) {
         if message.view_number < self.view_number {
             return;
         }
@@ -561,7 +573,7 @@ impl Replica {
         });
     }
 
-    fn handle_commit(&mut self, remote: SocketAddr, message: Commit) {
+    fn handle_commit(&mut self, message: Commit) {
         let spec_response = &message.certificate.spec_response;
         if self.view_number > spec_response.view_number {
             return;
@@ -591,10 +603,10 @@ impl Replica {
             signature: Signature::default(),
         });
         self.transport
-            .send_signed_message(To(remote), local_commit, self.id);
+            .send_signed_message(To(message.client_id.0), local_commit, self.id);
     }
 
-    fn handle_checkpoint(&mut self, _remote: SocketAddr, message: Checkpoint) {
+    fn handle_checkpoint(&mut self, message: Checkpoint) {
         if message.op_number <= self.checkpoint_number {
             return;
         }

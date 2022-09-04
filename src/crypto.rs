@@ -1,6 +1,5 @@
 use std::{
     mem::take,
-    net::SocketAddr,
     sync::{Arc, Mutex},
     thread::spawn,
 };
@@ -110,7 +109,6 @@ impl<M> Crypto<M> {
 impl<M> Crypto<M> {
     fn verify_internal(
         &mut self,
-        remote: SocketAddr,
         message: M,
         verify_message: impl FnOnce(&mut M, &Config) -> bool + Send + 'static,
     ) where
@@ -118,40 +116,34 @@ impl<M> Crypto<M> {
     {
         match &self.executor {
             Executor::Inline => {
-                Self::verify_task(remote, message, verify_message, &self.config, &self.sender)
+                Self::verify_task(message, verify_message, &self.config, &self.sender)
             }
             Executor::Rayon(executor) => {
                 let config = self.config.clone();
                 let sender = self.sender.clone();
-                executor.spawn(move || {
-                    Self::verify_task(remote, message, verify_message, &config, &sender)
-                });
+                executor
+                    .spawn(move || Self::verify_task(message, verify_message, &config, &sender));
             }
         }
     }
 
-    pub fn verify_replica(&mut self, remote: SocketAddr, message: M, replica_id: ReplicaId)
+    pub fn verify_replica(&mut self, message: M, replica_id: ReplicaId)
     where
         M: CryptoMessage + Send + 'static,
     {
-        self.verify_internal(remote, message, move |message, config: &Config| {
+        self.verify_internal(message, move |message, config: &Config| {
             verify_message(message, &config.keys[replica_id as usize].public_key())
         });
     }
 
-    pub fn verify(
-        &mut self,
-        remote: SocketAddr,
-        message: M,
-        verify_message: fn(&mut M, &Config) -> bool,
-    ) where
+    pub fn verify(&mut self, message: M, verify_message: fn(&mut M, &Config) -> bool)
+    where
         M: Send + 'static,
     {
-        self.verify_internal(remote, message, verify_message);
+        self.verify_internal(message, verify_message);
     }
 
     fn verify_task(
-        remote: SocketAddr,
         mut message: M,
         verify_message: impl FnOnce(&mut M, &Config) -> bool,
         config: &Config,
@@ -159,7 +151,7 @@ impl<M> Crypto<M> {
     ) {
         if verify_message(&mut message, config) {
             sender
-                .try_send(CryptoEvent::Verified(remote, message))
+                .try_send(CryptoEvent::Verified(message))
                 .map_err(|_| panic!())
                 .unwrap();
         } else {
