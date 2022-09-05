@@ -68,7 +68,7 @@ pub fn digest(message: impl Serialize) -> Digest {
         .as_ref()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub n: usize,
     pub f: usize,

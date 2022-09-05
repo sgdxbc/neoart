@@ -757,7 +757,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn single_op_byzantine() {
         let mut system = System::new(1, true, false);
-        system.replicas.remove(3).join().await;
+        let _byz_replica = system.replicas.remove(3).join().await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
             Duration::from_millis(50),
@@ -778,7 +778,7 @@ mod tests {
     async fn concurrent_closed_loop_byzantine() {
         let num_client = 10;
         let mut system = System::new(num_client, true, false);
-        system.replicas.remove(3).join().await;
+        let _byz_replica = system.replicas.remove(3).join().await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
         }

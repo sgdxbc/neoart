@@ -90,11 +90,13 @@
 use std::{
     borrow::Borrow,
     collections::HashMap,
-    fmt::Write,
     future::{pending, Future},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering::SeqCst},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -497,6 +499,7 @@ pub struct SimulatedNetwork {
     ),
     inboxes: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>,
     epoch: Instant,
+    is_running: Arc<AtomicBool>,
 }
 
 struct SimulatedMessage {
@@ -511,6 +514,7 @@ impl Default for SimulatedNetwork {
             send_channel: mpsc::channel(64),
             inboxes: HashMap::new(),
             epoch: Instant::now(),
+            is_running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -534,18 +538,20 @@ impl SimulatedNetwork {
     }
 
     pub fn config(n: usize, f: usize) -> Config {
-        let mut config = String::new();
-        writeln!(config, "f {f}").unwrap();
-        for i in 0..n {
-            writeln!(config, "replica 5.9.0.{i}:2023").unwrap();
-        }
-        let mut config: Config = config.parse().unwrap();
+        let mut config = Config {
+            n,
+            f,
+            replicas: (0..n)
+                .map(|i| SocketAddr::from(([5, 9, 0, i as u8], 2023)))
+                .collect(),
+            ..Config::default()
+        };
         config.gen_keys();
         config
     }
 
     pub fn client(i: usize) -> SocketAddr {
-        format!("20.23.7.10:{}", i + 1).parse().unwrap()
+        SocketAddr::from(([20, 23, 7, 10], i as u16 + 1))
     }
 }
 
@@ -553,14 +559,16 @@ impl SimulatedNetwork {
 impl Run for SimulatedNetwork {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
-        loop {
+        self.is_running.store(true, SeqCst);
+        while self.is_running.load(SeqCst) {
             select! {
-                _ = &mut close => return,
+                _ = &mut close => break,
                 message = self.send_channel.1.recv() => {
                     self.handle_message(message.unwrap()).await
                 }
             }
         }
+        self.is_running.store(false, SeqCst);
     }
 }
 
@@ -570,20 +578,29 @@ impl SimulatedNetwork {
         let inbox = self.inboxes[&message.destination].clone();
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));
         let epoch = self.epoch;
+        let is_running = self.is_running.clone();
         spawn(async move {
             sleep(delay).await;
+            if !is_running.load(SeqCst) {
+                return;
+            }
             println!(
-                "* [{:6?}] [{} -> {}] message length {} {}",
+                "* [{:6?}] [{} -> {}] message length {}",
                 Instant::now() - epoch,
                 message.source,
                 message.destination,
                 message.buf.len(),
-                if inbox.send((message.source, message.buf)).await.is_err() {
-                    "(failed)"
-                } else {
-                    ""
-                }
             );
+            if inbox.send((message.source, message.buf)).await.is_err() {
+                println!("! send failed and abort simulation");
+                // the simulation will end as soon as the first attempt of
+                // sending message into a crashed receiver i.e. the coroutine
+                // thread running it
+                // this may not be as good as end the simulation as soon as any
+                // receiver crashes, by monitor the liveness of threads, but it
+                // should be mostly the same
+                is_running.store(false, SeqCst);
+            }
         });
     }
 }

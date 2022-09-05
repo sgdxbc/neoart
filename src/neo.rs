@@ -116,17 +116,17 @@ impl Message {
         }
     }
 
-    fn verify_multicast_generic(message: &mut Message, config: &Config) -> bool {
-        if let Message::MulticastGeneric(generic) = message {
+    fn verify_multicast_generic(&mut self, config: &Config) -> bool {
+        if let Message::MulticastGeneric(generic) = self {
             let primary_id = config.primary(generic.view_number);
-            if !verify_message(message, &config.keys[primary_id as usize].public_key()) {
+            if !verify_message(self, &config.keys[primary_id as usize].public_key()) {
                 return false;
             }
         } else {
             unreachable!();
         }
         // this so silly = =
-        let message = if let Message::MulticastGeneric(generic) = message {
+        let message = if let Message::MulticastGeneric(generic) = self {
             generic
         } else {
             unreachable!()
