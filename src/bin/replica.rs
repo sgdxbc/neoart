@@ -71,7 +71,9 @@ where
     let multicast = config.multicast;
     let mut transport = Transport::new(config, Socket::Os(socket), setting);
     if let Some(multicast) = multicast {
-        let socket = UdpSocket::bind(multicast).await.unwrap();
+        let socket = UdpSocket::bind((multicast.ip(), multicast.port() + 1))
+            .await
+            .unwrap();
         transport.listen_multicast(Socket::Os(socket), MulticastVariant::HalfSipHash);
     }
 

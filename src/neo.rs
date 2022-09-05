@@ -315,8 +315,16 @@ struct LogEntry {
 }
 
 impl Replica {
-    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
-        // TODO send control packet to reset sequence
+    pub fn new(
+        mut transport: Transport<Self>,
+        id: ReplicaId,
+        app: impl App + Send + 'static,
+    ) -> Self {
+        transport.create_timer(Duration::ZERO, |node| {
+            let buf = [&[0xff; 4][..], &[0; 96][..]].concat();
+            node.transport
+                .send_buffer(node.transport.config.multicast.unwrap(), &buf);
+        });
         Self {
             transport,
             id,
@@ -515,8 +523,8 @@ impl Replica {
             // if there is no voting reply expected do not resend actively
             if nontrivial_batch {
                 // TODO set timer
+                self.send_vote();
             }
-            self.send_vote();
         }
     }
 
@@ -601,5 +609,16 @@ impl Replica {
         };
         self.transport
             .send_signed_message(destination, Message::MulticastVote(vote), self.id);
+    }
+}
+
+impl Drop for Replica {
+    fn drop(&mut self) {
+        if self.id == self.transport.config.primary(self.view_number) {
+            println!(
+                "estimated voting batch size {}",
+                self.log.len() / self.vote_quorums.len()
+            );
+        }
     }
 }

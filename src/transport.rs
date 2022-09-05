@@ -259,7 +259,7 @@ impl<T: Node> Transport<T> {
                 event: Box::new(|_| unreachable!("you forget to shutdown benchmark for an hour")),
             },
         );
-        let (crypto_sender, crypto_channel) = mpsc::channel(64);
+        let (crypto_sender, crypto_channel) = mpsc::channel(1024);
         Self {
             crypto: Crypto::new(config.clone(), setting, crypto_sender),
             config,
@@ -345,6 +345,10 @@ impl<T: Node> Transport<T> {
                 &buf[..len],
             ),
         }
+    }
+
+    pub fn send_buffer(&self, address: impl Into<SocketAddr>, buf: &[u8]) {
+        Self::send_message_internal(&self.socket, address.into(), buf);
     }
 
     pub fn send_signed_message(
@@ -434,7 +438,10 @@ where
                     handle_raw_message(
                         self,
                         remote,
-                        InboundPacket::new_multicast(&buf[..len], MulticastVariant::HalfSipHash),
+                        InboundPacket::new_multicast(
+                            &multicast_buf[..len],
+                            MulticastVariant::HalfSipHash,
+                        ),
                     );
                 }
             }
