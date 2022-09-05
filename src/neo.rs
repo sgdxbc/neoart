@@ -343,9 +343,9 @@ impl Replica {
             // however is it a good idea to couple protocol implementation with
             // link hash method?
             // is it ok if we limit all verifiable network ordering to use same
-            // link hash method i.e. some kind of sha256? if not, currently this
-            // is no information exposed to protocol implementation to indicate
-            // what underlying multicast variant is
+            // link hash method i.e. some kind of sha256? if otherwise hash
+            // method varies then currently protocol is not aware of what method
+            // is using
             let digest = digest(Request {
                 client_id: request.client_id,
                 request_number: request.request_number,
@@ -362,15 +362,24 @@ impl Replica {
             } else {
                 // assert every buffered message in `fast_verify` has lower
                 // sequence number
-                self.vote_buffer.extend(self.fast_verify.drain(..));
+                self.vote_buffer.append(&mut self.fast_verify);
                 self.vote_buffer.push(request);
+                assert_eq!(
+                    self.vote_buffer[0].sequence_number,
+                    self.speculative_number + 1
+                );
+                // a new voting round should be triggered by newly verified
+                // batch
                 if self.id == self.transport.config.primary(self.view_number)
                     && self.vote_number == self.speculative_number
                 {
-                    self.close_vote_batch();
-                    assert!(self.vote_number > self.speculative_number);
+                    let nontrivial_batch = self.close_vote_batch();
+                    assert!(nontrivial_batch);
                     let generic = MulticastGeneric {
                         vote_number: self.vote_number,
+                        // there is no higher certificate collected, only an
+                        // intention of new voting, so a null certificate is
+                        // accetable and reducing replica's verifying workload
                         ..MulticastGeneric::default()
                     };
                     self.transport.send_signed_message(
@@ -382,12 +391,11 @@ impl Replica {
                 }
             }
             self.link_hash = digest;
-
             ordered = self.reorder_ordered_request.expect_next();
         }
     }
 
-    fn close_vote_batch(&mut self) {
+    fn close_vote_batch(&mut self) -> bool {
         assert_eq!(self.id, self.transport.config.primary(self.view_number));
         assert!(
             self.vote_number == self.speculative_number,
@@ -401,6 +409,7 @@ impl Replica {
             );
             self.vote_number = message.sequence_number;
         }
+        self.vote_number != self.speculative_number
     }
 
     fn handle_multicast_vote(&mut self, message: MulticastVote) {
@@ -423,9 +432,9 @@ impl Replica {
 
             self.speculative_number = message.sequence_number;
             self.speculative_commit();
+            let nontrivial_batch = self.close_vote_batch();
             // send certificate as soon as possible, even when vote batch is
             // empty
-            self.close_vote_batch();
             let generic = MulticastGeneric {
                 sequence_number: message.sequence_number,
                 digest: message.digest,
@@ -435,35 +444,34 @@ impl Replica {
             };
             self.transport
                 .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
-            if self.vote_number > self.speculative_number {
+            // if there is no voting reply expected do not resend actively
+            if nontrivial_batch {
                 // TODO set timer
             }
         }
     }
 
     fn speculative_commit(&mut self) {
-        let i = self
-            .vote_buffer
-            // any better way?
-            .binary_search_by_key(&self.speculative_number, |message| message.sequence_number)
-            .unwrap();
-        for request in self.vote_buffer.drain(..=i) {
-            // TODO this is too weird
-            (|| {
-                if let Some(reply) = self.client_table.get(&request.client_id) {
-                    if reply.request_number > request.request_number {
-                        return;
-                    }
-                    if reply.request_number == request.request_number {
-                        self.transport.send_signed_message(
-                            To(request.client_id.0),
-                            Message::Reply(reply.clone()),
-                            self.id,
-                        );
-                        return;
-                    }
+        let end_index = (self.speculative_number - self.vote_buffer[0].sequence_number) as usize;
+        if end_index >= self.vote_buffer.len() {
+            todo!() // query missing ordered requests
+        }
+        for request in self.vote_buffer.drain(..=end_index) {
+            let mut execute = true;
+            if let Some(reply) = self.client_table.get(&request.client_id) {
+                if reply.request_number > request.request_number {
+                    execute = false;
                 }
-
+                if reply.request_number == request.request_number {
+                    self.transport.send_signed_message(
+                        To(request.client_id.0),
+                        Message::Reply(reply.clone()),
+                        self.id,
+                    );
+                    execute = false;
+                }
+            }
+            if execute {
                 let op_number = request.sequence_number as OpNumber;
                 let result = self.app.replica_upcall(op_number, &request.op);
                 let reply = Reply {
@@ -479,8 +487,7 @@ impl Replica {
                     Message::Reply(reply),
                     self.id,
                 );
-            })();
-
+            }
             self.log.push(LogEntry { request });
         }
     }
@@ -491,6 +498,8 @@ impl Replica {
             self.speculative_number = message.sequence_number;
             self.speculative_commit();
         }
+        // TODO detect and handle the case where replica misses at least one
+        // whole batch
         if message.vote_number > self.speculative_number {
             let batch_size = (message.vote_number - self.speculative_number) as usize;
             if self.vote_buffer.len() < batch_size {

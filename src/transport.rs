@@ -449,7 +449,7 @@ where
                     Destination::ToSelf => {
                         receiver.receive_message(TransportMessage::Signed(message))
                     }
-                    destination @ _ => receiver.as_mut().send_message(destination, &message),
+                    destination => receiver.as_mut().send_message(destination, &message),
                 },
             }
         }

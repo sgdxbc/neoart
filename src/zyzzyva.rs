@@ -485,11 +485,8 @@ impl Replica {
             history_digest: self.history_digest,
             signature: Signature::default(),
         };
-        self.transport.send_signed_message(
-            ToSelf,
-            Message::OrderReq(order_req.clone(), batch.clone()),
-            self.id,
-        );
+        self.transport
+            .send_signed_message(ToSelf, Message::OrderReq(order_req, batch), self.id);
     }
 
     fn handle_order_req(&mut self, message: OrderReq, request: Vec<Request>) {
