@@ -13,6 +13,7 @@ use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::Pid,
 };
+use serde::de::DeserializeOwned;
 use tokio::{fs::read_to_string, net::UdpSocket, signal::ctrl_c};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
@@ -46,7 +47,7 @@ impl App for Null {
 async fn main_internal<T>(args: Args, new_replica: impl FnOnce(Transport<T>) -> T)
 where
     T: Node + AsMut<Transport<T>> + Send,
-    T::Message: CryptoMessage,
+    T::Message: CryptoMessage + DeserializeOwned,
 {
     let mut config: Config = read_to_string(args.config).await.unwrap().parse().unwrap();
     config.gen_keys();

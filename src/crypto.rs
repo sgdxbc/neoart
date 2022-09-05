@@ -152,7 +152,7 @@ impl<M> Crypto<M> {
         if verify_message(&mut message, config) {
             sender
                 .try_send(CryptoEvent::Verified(message))
-                .map_err(|_| panic!())
+                .map_err(|_| ())
                 .unwrap();
         } else {
             println!("! verify signature error");
@@ -191,7 +191,7 @@ impl<M> Crypto<M> {
         *message.signature_mut() = Signature(signature);
         sender
             .try_send(CryptoEvent::Signed(id, message))
-            .map_err(|_| panic!())
+            .map_err(|_| ())
             .unwrap();
     }
 }

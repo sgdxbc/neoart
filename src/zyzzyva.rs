@@ -13,12 +13,12 @@ use crate::{
     common::Reorder,
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
-        deserialize, digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber,
-        ViewNumber, ENTRY_NUMBER,
+        digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
+        ENTRY_NUMBER,
     },
     transport::{
         Destination::{To, ToAll, ToReplica, ToSelf},
-        InboundAction, InboundMeta, Node, Transport, TransportMessage,
+        InboundAction, InboundPacket, Node, Transport, TransportMessage,
     },
     App,
 };
@@ -105,17 +105,13 @@ impl CryptoMessage for Message {
 
     fn digest(&self) -> Digest {
         match self {
-            Self::OrderReq(message, _) => digest(message),
+            // according to paper's specification the digest of messages below
+            // does not cover the rest part of the messages
+            // not a big deal just follow the specification as good as we can
+            Self::OrderReq(message, ..) => digest(message),
             Self::SpecResponse(message, ..) => digest(message),
             _ => digest(self),
         }
-    }
-}
-
-// for calling `verify_message` below
-impl CryptoMessage for SpecResponse {
-    fn signature_mut(&mut self) -> &mut Signature {
-        &mut self.signature
     }
 }
 
@@ -130,10 +126,17 @@ impl Message {
             return false;
         }
         for &(replica_id, signature) in &certificate.signatures {
-            let mut spec_response = SpecResponse {
-                signature,
-                ..certificate.spec_response
-            };
+            let mut spec_response = Message::SpecResponse(
+                SpecResponse {
+                    signature,
+                    ..certificate.spec_response
+                },
+                // the rest parts' content does not really matter since
+                // `signature` is not covering them
+                replica_id,
+                Vec::default(),
+                OrderReq::default(),
+            );
             if !verify_message(
                 &mut spec_response,
                 &config.keys[replica_id as usize].public_key(),
@@ -398,12 +401,15 @@ impl AsMut<Transport<Self>> for Replica {
 impl Node for Replica {
     type Message = Message;
 
-    fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
-        if !matches!(meta, InboundMeta::Unicast) {
+    fn inbound_action(
+        &self,
+        buffer: InboundPacket<'_, Self::Message>,
+    ) -> InboundAction<Self::Message> {
+        let message = if let InboundPacket::Unicast { message, .. } = buffer {
+            message
+        } else {
             return InboundAction::Block;
-        }
-
-        let message = deserialize(buf);
+        };
         match message {
             Message::Request(_) => InboundAction::Allow(message),
             Message::OrderReq(OrderReq { view_number, .. }, _) => {

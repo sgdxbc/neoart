@@ -20,6 +20,7 @@ use neoart::{
     transport::{Node, Run, Socket, Transport},
     unreplicated, zyzzyva, Client,
 };
+use serde::de::DeserializeOwned;
 use tokio::{
     fs::read_to_string, net::UdpSocket, pin, runtime, select, spawn, sync::Notify, time::sleep,
 };
@@ -49,7 +50,7 @@ async fn main_internal<T>(
     new_client: impl FnOnce(Transport<T>) -> T + Clone + Send + 'static,
 ) where
     T: Node + Client + AsMut<Transport<T>> + Send,
-    T::Message: CryptoMessage,
+    T::Message: CryptoMessage + DeserializeOwned,
 {
     let config: Config = read_to_string(args.config).await.unwrap().parse().unwrap();
 

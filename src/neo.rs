@@ -12,12 +12,11 @@ use crate::{
     common::Reorder,
     crypto::{CryptoMessage, Signature},
     meta::{
-        deserialize, digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
-        ENTRY_NUMBER,
+        digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER,
     },
     transport::{
         Destination::{To, ToAll, ToMulticast, ToReplica},
-        InboundAction, InboundMeta, Node, Transport, TransportMessage,
+        InboundAction, InboundPacket, Node, Transport, TransportMessage,
     },
     App,
 };
@@ -278,16 +277,18 @@ impl AsMut<Transport<Self>> for Replica {
 impl Node for Replica {
     type Message = Message;
 
-    fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
-        match (meta, deserialize(buf)) {
-            (
-                InboundMeta::OrderedMulticast {
-                    sequence_number,
-                    signature,
-                    link_hash,
-                },
-                Message::Request(message),
-            ) => {
+    fn inbound_action(
+        &self,
+        packet: InboundPacket<'_, Self::Message>,
+    ) -> InboundAction<Self::Message> {
+        match packet {
+            InboundPacket::OrderedMulticast {
+                sequence_number,
+                signature,
+                link_hash,
+                message: Message::Request(message),
+                ..
+            } => {
                 let request = OrderedRequest {
                     client_id: message.client_id,
                     request_number: message.request_number,
@@ -299,7 +300,10 @@ impl Node for Replica {
                 // TODO verify multicast signature
                 InboundAction::Allow(Message::OrderedRequest(request))
             }
-            (InboundMeta::Unicast, Message::MulticastVote(message)) => {
+            InboundPacket::Unicast {
+                message: Message::MulticastVote(message),
+                ..
+            } => {
                 let replica_id = message.replica_id;
                 InboundAction::VerifyReplica(Message::MulticastVote(message), replica_id)
             }

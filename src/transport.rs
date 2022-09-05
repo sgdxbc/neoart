@@ -120,22 +120,57 @@ pub trait Run {
 }
 
 pub trait Node: Sized {
-    type Message: Send + 'static + DeserializeOwned;
-    fn inbound_action(&self, meta: InboundMeta<'_>, buf: &[u8]) -> InboundAction<Self::Message> {
-        assert!(matches!(meta, InboundMeta::Unicast));
-        InboundAction::Allow(deserialize(buf))
+    type Message: Send + 'static;
+    fn inbound_action(
+        &self,
+        packet: InboundPacket<'_, Self::Message>,
+    ) -> InboundAction<Self::Message> {
+        if let InboundPacket::Unicast { message, .. } = packet {
+            InboundAction::Allow(message)
+        } else {
+            unreachable!()
+        }
     }
     fn receive_message(&mut self, message: TransportMessage<Self::Message>);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboundMeta<'a> {
-    Unicast,
+pub enum InboundPacket<'a, M> {
+    Unicast {
+        // remote address if needed
+        message: M,
+    },
     OrderedMulticast {
+        // remote address
         sequence_number: u32,
         signature: &'a [u8],
         link_hash: &'a [u8; 32],
+        message: M,
     },
+}
+
+impl<'a, M> InboundPacket<'a, M> {
+    fn new_unicast(buf: &[u8]) -> Self
+    where
+        M: DeserializeOwned,
+    {
+        Self::Unicast {
+            message: deserialize(buf),
+        }
+    }
+
+    fn new_multicast(buf: &'a [u8], variant: MulticastVariant) -> Self
+    where
+        M: DeserializeOwned,
+    {
+        assert_eq!(variant, MulticastVariant::HalfSipHash);
+        Self::OrderedMulticast {
+            sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            signature: &buf[4..8],
+            link_hash: &[0; 32],
+            message: deserialize(&buf[100..]),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -365,7 +400,7 @@ impl Socket {
 impl<T> Run for T
 where
     T: Node + AsMut<Transport<T>> + Send,
-    T::Message: CryptoMessage,
+    T::Message: CryptoMessage + DeserializeOwned,
 {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
@@ -388,14 +423,13 @@ where
                     handle_crypto_event(self, event.unwrap());
                 },
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
-                    handle_raw_message(self, remote, InboundMeta::Unicast, &buf[..len]);
+                    handle_raw_message(self, remote, InboundPacket::new_unicast(&buf[..len]));
                 }
                 (len, remote) = transport.multicast_socket.receive_from(&mut multicast_buf) => {
                     handle_raw_message(
                         self,
                         remote,
-                        multicast_meta(&multicast_buf[..100]),
-                        &multicast_buf[100..len],
+                        InboundPacket::new_multicast(&buf[..len], MulticastVariant::HalfSipHash),
                     );
                 }
             }
@@ -420,25 +454,15 @@ where
             }
         }
 
-        fn multicast_meta(buf: &[u8]) -> InboundMeta {
-            // TODO match variant
-            InboundMeta::OrderedMulticast {
-                sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-                signature: &buf[5..9],
-                link_hash: buf[68..100].try_into().unwrap(),
-            }
-        }
-
         fn handle_raw_message<T>(
             receiver: &mut T,
             _remote: SocketAddr,
-            meta: InboundMeta,
-            buf: &[u8],
+            buffer: InboundPacket<'_, T::Message>,
         ) where
             T: Node + AsMut<Transport<T>>,
             T::Message: CryptoMessage + Send + 'static,
         {
-            match receiver.inbound_action(meta, buf) {
+            match receiver.inbound_action(buffer) {
                 InboundAction::Allow(message) => {
                     receiver.receive_message(TransportMessage::Allowed(message));
                 }
