@@ -300,6 +300,7 @@ impl<T: Node> Transport<T> {
                         source: *addr,
                         destination,
                         buf: buf.to_vec(),
+                        multicast_outgress: false,
                     })
                     .map_err(|_| ())
                     .unwrap();
@@ -492,30 +493,32 @@ where
     }
 }
 
-pub struct SimulatedNetwork {
+pub struct SimulatedNetwork<T = ()> {
     send_channel: (
         mpsc::Sender<SimulatedMessage>,
         mpsc::Receiver<SimulatedMessage>,
     ),
-    inboxes: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>,
-    epoch: Instant,
+    inboxes: HashMap<SocketAddr, Inbox>,
+    multicast_listeners: HashMap<SocketAddr, mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+    pub epoch: Instant,
     is_running: Arc<AtomicBool>,
+    pub switch: T,
+}
+struct Inbox {
+    unicast: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    multicast: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
-struct SimulatedMessage {
-    source: SocketAddr,
-    destination: SocketAddr,
-    buf: Vec<u8>,
+pub struct SimulatedMessage {
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub buf: Vec<u8>,
+    pub multicast_outgress: bool,
 }
 
-impl Default for SimulatedNetwork {
+impl<T: Default> Default for SimulatedNetwork<T> {
     fn default() -> Self {
-        Self {
-            send_channel: mpsc::channel(64),
-            inboxes: HashMap::new(),
-            epoch: Instant::now(),
-            is_running: Arc::new(AtomicBool::new(false)),
-        }
+        Self::new(T::default())
     }
 }
 
@@ -526,17 +529,46 @@ pub struct SimulatedSocket {
     inbox: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
 }
 
-impl SimulatedNetwork {
+impl<T> SimulatedNetwork<T> {
+    pub fn new(switch: T) -> Self {
+        Self {
+            send_channel: mpsc::channel(64),
+            inboxes: HashMap::new(),
+            multicast_listeners: HashMap::new(),
+            epoch: Instant::now(),
+            is_running: Arc::new(AtomicBool::new(false)),
+            switch,
+        }
+    }
+
     pub fn insert_socket(&mut self, addr: SocketAddr) -> Socket {
-        let (inbox_sender, inbox) = mpsc::channel(64);
-        self.inboxes.insert(addr, inbox_sender);
+        let (unicast_sender, unicast) = mpsc::channel(1024);
+        let (multicast_sender, multicast) = mpsc::channel(1024);
+        self.inboxes.insert(
+            addr,
+            Inbox {
+                unicast: unicast_sender,
+                multicast: multicast_sender,
+            },
+        );
+        self.multicast_listeners.insert(addr, multicast);
         Socket::Simulated(SimulatedSocket {
             addr,
             network: self.send_channel.0.clone(),
-            inbox,
+            inbox: unicast,
         })
     }
 
+    pub fn multicast_socket(&mut self, addr: SocketAddr) -> Socket {
+        Socket::Simulated(SimulatedSocket {
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            network: self.send_channel.0.clone(), // TODO not allow to send
+            inbox: self.multicast_listeners.remove(&addr).unwrap(),
+        })
+    }
+}
+
+impl SimulatedNetwork {
     pub fn config(n: usize, f: usize) -> Config {
         let mut config = Config {
             n,
@@ -544,6 +576,7 @@ impl SimulatedNetwork {
             replicas: (0..n)
                 .map(|i| SocketAddr::from(([5, 9, 0, i as u8], 2023)))
                 .collect(),
+            multicast: Some(SocketAddr::from(([5, 9, 0, 255], 14159))),
             ..Config::default()
         };
         config.gen_keys();
@@ -555,8 +588,16 @@ impl SimulatedNetwork {
     }
 }
 
+pub trait SimulatedSwitch {
+    fn handle_message(&mut self, message: SimulatedMessage);
+}
+
 #[async_trait]
-impl Run for SimulatedNetwork {
+impl<T> Run for SimulatedNetwork<T>
+where
+    Self: SimulatedSwitch,
+    T: Send,
+{
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
         self.is_running.store(true, SeqCst);
@@ -564,7 +605,7 @@ impl Run for SimulatedNetwork {
             select! {
                 _ = &mut close => break,
                 message = self.send_channel.1.recv() => {
-                    self.handle_message(message.unwrap()).await
+                    self.handle_message(message.unwrap())
                 }
             }
         }
@@ -572,11 +613,14 @@ impl Run for SimulatedNetwork {
     }
 }
 
-impl SimulatedNetwork {
-    async fn handle_message(&self, message: SimulatedMessage) {
-        // TODO filter
-        let inbox = self.inboxes[&message.destination].clone();
-        let delay = Duration::from_millis(thread_rng().gen_range(1..10));
+impl<T> SimulatedNetwork<T> {
+    pub fn send_message(&mut self, message: SimulatedMessage, min_delay: u64, max_delay: u64) {
+        let inbox = if message.multicast_outgress {
+            self.inboxes[&message.destination].multicast.clone()
+        } else {
+            self.inboxes[&message.destination].unicast.clone()
+        };
+        let delay = Duration::from_millis(thread_rng().gen_range(min_delay..max_delay));
         let epoch = self.epoch;
         let is_running = self.is_running.clone();
         spawn(async move {
@@ -585,11 +629,16 @@ impl SimulatedNetwork {
                 return;
             }
             println!(
-                "* [{:6?}] [{} -> {}] message length {}",
+                "* [{:6?}] [{} -> {}] message length {} {}",
                 Instant::now() - epoch,
                 message.source,
                 message.destination,
                 message.buf.len(),
+                if message.multicast_outgress {
+                    "(multicast)"
+                } else {
+                    ""
+                }
             );
             if inbox.send((message.source, message.buf)).await.is_err() {
                 println!("! send failed and abort simulation");
@@ -602,6 +651,12 @@ impl SimulatedNetwork {
                 is_running.store(false, SeqCst);
             }
         });
+    }
+}
+
+impl SimulatedSwitch for SimulatedNetwork {
+    fn handle_message(&mut self, message: SimulatedMessage) {
+        self.send_message(message, 1, 10);
     }
 }
 

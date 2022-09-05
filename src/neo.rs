@@ -6,8 +6,9 @@ use std::{
     time::Duration,
 };
 
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 
 use crate::{
     common::Reorder,
@@ -18,7 +19,8 @@ use crate::{
     },
     transport::{
         Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        InboundAction, InboundPacket, MulticastVariant, Node, Transport,
+        InboundAction, InboundPacket, MulticastVariant, Node, SimulatedMessage, SimulatedNetwork,
+        SimulatedSwitch, Transport,
         TransportMessage::{self, Allowed, Signed, Verified},
     },
     App,
@@ -614,11 +616,143 @@ impl Replica {
 
 impl Drop for Replica {
     fn drop(&mut self) {
-        if self.id == self.transport.config.primary(self.view_number) {
+        if self.id == self.transport.config.primary(self.view_number)
+            && !self.vote_quorums.is_empty()
+        {
             println!(
                 "estimated voting batch size {}",
                 self.log.len() / self.vote_quorums.len()
             );
         }
+    }
+}
+
+struct Switch {
+    sequence_number: u32,
+    config: Config,
+}
+
+impl SimulatedSwitch for SimulatedNetwork<Switch> {
+    fn handle_message(&mut self, mut message: SimulatedMessage) {
+        if message.destination != self.switch.config.multicast.unwrap() {
+            return self.send_message(message, 1, 10);
+        }
+        if message.buf[0..4] == [0xff; 4] {
+            self.switch.sequence_number = 0;
+            return;
+        }
+        self.switch.sequence_number += 1;
+        let sequence_number = self.switch.sequence_number;
+        println!(
+            "* [{:6?}] [{} -> <multicast>] sequence {sequence_number} message length {}",
+            Instant::now() - self.epoch,
+            message.source,
+            message.buf[100..].len()
+        );
+        message.buf[0..4].copy_from_slice(&sequence_number.to_be_bytes()[..]);
+        // this is synchronized with switch program
+        message.buf[7] = (sequence_number & 0xff) as u8;
+        message.buf[8] = (sequence_number + 1 & 0xff) as u8;
+
+        let delay = thread_rng().gen_range(1..10);
+        // TODO more elegant than clone addresses
+        for destination in self.switch.config.replicas.clone() {
+            self.send_message(
+                SimulatedMessage {
+                    source: message.source,
+                    destination,
+                    buf: message.buf.clone(),
+                    multicast_outgress: true,
+                },
+                delay,
+                delay + 1,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use crate::{
+        common::TestApp,
+        crypto::ExecutorSetting,
+        meta::ReplicaId,
+        transport::{Concurrent, MulticastVariant::HalfSipHash, Run, SimulatedNetwork, Transport},
+        Client as _,
+    };
+
+    use super::{Client, Replica, Switch};
+
+    struct System {
+        net: Concurrent<SimulatedNetwork<Switch>>,
+        replicas: Vec<Concurrent<Replica>>,
+        clients: Vec<Client>,
+    }
+
+    impl System {
+        fn new(num_client: usize) -> Self {
+            let config = SimulatedNetwork::config(4, 1);
+            let mut net = SimulatedNetwork::new(Switch {
+                sequence_number: 0,
+                config: config.clone(),
+            });
+            let clients = (0..num_client)
+                .map(|i| {
+                    Client::new(Transport::new(
+                        config.clone(),
+                        net.insert_socket(SimulatedNetwork::client(i)),
+                        ExecutorSetting::Inline,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let replicas = (0..4)
+                .map(|i| {
+                    let mut transport = Transport::new(
+                        config.clone(),
+                        net.insert_socket(config.replicas[i]),
+                        ExecutorSetting::Inline,
+                    );
+                    transport
+                        .listen_multicast(net.multicast_socket(config.replicas[i]), HalfSipHash);
+                    let replica = Replica::new(transport, i as ReplicaId, TestApp::default());
+                    Concurrent::run(replica)
+                })
+                .collect::<Vec<_>>();
+
+            Self {
+                net: Concurrent::run(net),
+                replicas,
+                clients,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_op() {
+        let mut system = System::new(1);
+        let result = system.clients[0].invoke("hello".as_bytes());
+        timeout(
+            Duration::from_millis(40),
+            system.clients[0].run(async {
+                assert_eq!(&result.await, "[1] hello".as_bytes());
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut commit_count = 1;
+        for (i, replica) in system.replicas.into_iter().enumerate() {
+            if i == 0 {
+                assert_eq!(replica.join().await.log.len(), 1);
+            } else {
+                commit_count += replica.join().await.log.len();
+            }
+        }
+        assert!(commit_count >= 3);
+        system.net.join().await;
     }
 }

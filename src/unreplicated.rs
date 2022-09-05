@@ -227,7 +227,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn single_op() {
         let config = SimulatedNetwork::config(1, 0);
-        let mut net = SimulatedNetwork::default();
+        let mut net = SimulatedNetwork::<()>::default();
         let replica = Replica::new(
             Transport::new(
                 config.clone(),
