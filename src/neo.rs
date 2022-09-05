@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    mem::replace,
     pin::Pin,
     time::Duration,
 };
@@ -10,13 +11,15 @@ use tokio::sync::oneshot;
 
 use crate::{
     common::Reorder,
-    crypto::{CryptoMessage, Signature},
+    crypto::{verify_message, CryptoMessage, Signature},
     meta::{
-        digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER,
+        digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
+        ENTRY_NUMBER,
     },
     transport::{
-        Destination::{To, ToAll, ToMulticast, ToReplica},
-        InboundAction, InboundPacket, Node, Transport, TransportMessage,
+        Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
+        InboundAction, InboundPacket, MulticastVariant, Node, Transport,
+        TransportMessage::{self, Allowed, Signed, Verified},
     },
     App,
 };
@@ -49,6 +52,7 @@ pub struct OrderedRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MulticastGeneric {
+    view_number: ViewNumber,
     sequence_number: u32,
     digest: Digest,
     quorum_signatures: Vec<(ReplicaId, Signature)>,
@@ -58,6 +62,7 @@ pub struct MulticastGeneric {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MulticastVote {
+    view_number: ViewNumber,
     sequence_number: u32,
     digest: Digest, // digest over batched requests
     replica_id: ReplicaId,
@@ -74,12 +79,74 @@ pub struct Reply {
 }
 
 impl CryptoMessage for Message {
-    //
+    fn signature_mut(&mut self) -> &mut Signature {
+        match self {
+            Self::MulticastGeneric(MulticastGeneric { signature, .. })
+            | Self::MulticastVote(MulticastVote { signature, .. })
+            | Self::Reply(Reply { signature, .. }) => signature,
+            _ => unreachable!(),
+        }
+    }
+
+    fn digest(&self) -> Digest {
+        if let Self::OrderedRequest(message) = self {
+            digest(Self::Request(Request {
+                client_id: message.client_id,
+                request_number: message.request_number,
+                op: message.op.clone(),
+            }))
+        } else {
+            digest(self)
+        }
+    }
 }
 
 impl Message {
     fn has_network_signature(message: &OrderedRequest) -> bool {
         !message.network_signature.iter().all(|&b| b == 0)
+    }
+
+    fn multicast_action(variant: MulticastVariant, message: OrderedRequest) -> InboundAction<Self> {
+        assert_eq!(variant, MulticastVariant::HalfSipHash);
+        // TODO perform real verification
+        if Self::has_network_signature(&message) {
+            InboundAction::Allow(Message::OrderedRequest(message))
+        } else {
+            InboundAction::Block
+        }
+    }
+
+    fn verify_multicast_generic(message: &mut Message, config: &Config) -> bool {
+        if let Message::MulticastGeneric(generic) = message {
+            let primary_id = config.primary(generic.view_number);
+            if !verify_message(message, &config.keys[primary_id as usize].public_key()) {
+                return false;
+            }
+        } else {
+            unreachable!();
+        }
+        // this so silly = =
+        let message = if let Message::MulticastGeneric(generic) = message {
+            generic
+        } else {
+            unreachable!()
+        };
+        for &(replica_id, signature) in &message.quorum_signatures {
+            let vote = MulticastVote {
+                view_number: message.view_number,
+                sequence_number: message.sequence_number,
+                digest: message.digest,
+                replica_id,
+                signature,
+            };
+            if !verify_message(
+                &mut Message::MulticastVote(vote),
+                &config.keys[replica_id as usize].public_key(),
+            ) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -143,7 +210,7 @@ impl Node for Client {
     type Message = Message;
 
     fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
-        let message = if let TransportMessage::Allowed(Message::Reply(message)) = message {
+        let message = if let Allowed(Message::Reply(message)) = message {
             message
         } else {
             unreachable!()
@@ -297,31 +364,37 @@ impl Node for Replica {
                     network_signature: signature.to_vec(),
                     link_hash: *link_hash,
                 };
-                // TODO verify multicast signature
-                InboundAction::Allow(Message::OrderedRequest(request))
+                Message::multicast_action(self.transport.multicast_variant(), request)
             }
             InboundPacket::Unicast {
                 message: Message::MulticastVote(message),
                 ..
             } => {
+                // if message.sequence_number != self.vote_number {
+                //     return InboundAction::Block;
+                // }
                 let replica_id = message.replica_id;
                 InboundAction::VerifyReplica(Message::MulticastVote(message), replica_id)
             }
+            InboundPacket::Unicast {
+                message: Message::MulticastGeneric(message),
+                ..
+            } => InboundAction::Verify(
+                Message::MulticastGeneric(message),
+                Message::verify_multicast_generic,
+            ),
             _ => InboundAction::Block,
         }
     }
 
     fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
         match message {
-            TransportMessage::Verified(Message::OrderedRequest(message)) => {
-                self.handle_ordered_request(message)
-            }
-            TransportMessage::Verified(Message::MulticastVote(message)) => {
-                self.handle_multicast_vote(message)
-            }
-            TransportMessage::Verified(Message::MulticastGeneric(message)) => {
-                self.handle_multicast_generic(message)
-            }
+            Verified(Message::OrderedRequest(message))
+            | Allowed(Message::OrderedRequest(message)) => self.handle_ordered_request(message),
+            Verified(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
+            // need to be caution to reuse...
+            Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
+            Verified(Message::MulticastGeneric(message)) => self.handle_multicast_generic(message),
             _ => unreachable!(),
         }
     }
@@ -339,59 +412,53 @@ impl Replica {
             .reorder_ordered_request
             .insert_reorder(message.sequence_number, message);
         while let Some(request) = ordered {
-            // TODO change this to the real digest generated by network
-            // however is it a good idea to couple protocol implementation with
-            // link hash method?
-            // is it ok if we limit all verifiable network ordering to use same
-            // link hash method i.e. some kind of sha256? if otherwise hash
-            // method varies then currently protocol is not aware of what method
-            // is using
-            let digest = digest(Request {
-                client_id: request.client_id,
-                request_number: request.request_number,
-                op: request.op.clone(),
-            });
-
-            if !Message::has_network_signature(&request) {
-                if request.link_hash != self.link_hash {
-                    todo!()
-                    // break
-                }
-
-                self.fast_verify.push(request);
-            } else {
-                // assert every buffered message in `fast_verify` has lower
-                // sequence number
-                self.vote_buffer.append(&mut self.fast_verify);
-                self.vote_buffer.push(request);
-                assert_eq!(
-                    self.vote_buffer[0].sequence_number,
-                    self.speculative_number + 1
-                );
-                // a new voting round should be triggered by newly verified
-                // batch
-                if self.id == self.transport.config.primary(self.view_number)
-                    && self.vote_number == self.speculative_number
-                {
-                    let nontrivial_batch = self.close_vote_batch();
-                    assert!(nontrivial_batch);
-                    let generic = MulticastGeneric {
-                        vote_number: self.vote_number,
-                        // there is no higher certificate collected, only an
-                        // intention of new voting, so a null certificate is
-                        // accetable and reducing replica's verifying workload
-                        ..MulticastGeneric::default()
-                    };
-                    self.transport.send_signed_message(
-                        ToAll,
-                        Message::MulticastGeneric(generic),
-                        self.id,
-                    );
-                    // TODO set timer
-                }
-            }
-            self.link_hash = digest;
+            self.verify_ordered_request(request);
             ordered = self.reorder_ordered_request.expect_next();
+        }
+    }
+
+    fn verify_ordered_request(&mut self, request: OrderedRequest) {
+        let digest = match self.transport.multicast_variant() {
+            MulticastVariant::Disabled => unreachable!(),
+            // should we instead assert that this digest never be used?
+            MulticastVariant::HalfSipHash => Digest::default(),
+            // Secp256k1
+        };
+        let link_hash = replace(&mut self.link_hash, digest);
+        if !Message::has_network_signature(&request) {
+            if request.link_hash == link_hash {
+                self.fast_verify.push(request);
+                return;
+            }
+            todo!() // fallback to slow path
+        }
+
+        // assert every buffered message in `fast_verify` has lower sequence
+        // number
+        self.vote_buffer.append(&mut self.fast_verify);
+        self.vote_buffer.push(request);
+        assert_eq!(
+            self.vote_buffer[0].sequence_number,
+            self.speculative_number + 1
+        );
+
+        // only trigger a new voting round if there is no outstanding voting
+        if self.id == self.transport.config.primary(self.view_number)
+            && self.vote_number == self.speculative_number
+        {
+            let nontrivial_batch = self.close_vote_batch();
+            assert!(nontrivial_batch);
+            let generic = MulticastGeneric {
+                vote_number: self.vote_number,
+                // there is no higher certificate collected, only an intention
+                // of new voting, so a null certificate is acceptable and
+                // reducing replica's verifying workload
+                ..MulticastGeneric::default()
+            };
+            self.transport
+                .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
+            // TODO set timer
+            self.send_vote();
         }
     }
 
@@ -436,6 +503,7 @@ impl Replica {
             // send certificate as soon as possible, even when vote batch is
             // empty
             let generic = MulticastGeneric {
+                view_number: self.view_number,
                 sequence_number: message.sequence_number,
                 digest: message.digest,
                 quorum_signatures,
@@ -448,6 +516,7 @@ impl Replica {
             if nontrivial_batch {
                 // TODO set timer
             }
+            self.send_vote();
         }
     }
 
@@ -500,26 +569,37 @@ impl Replica {
         }
         // TODO detect and handle the case where replica misses at least one
         // whole batch
-        if message.vote_number > self.speculative_number {
-            let batch_size = (message.vote_number - self.speculative_number) as usize;
-            if self.vote_buffer.len() < batch_size {
-                todo!(); // state transfer or silently ignore?
-            }
-            assert_eq!(
-                self.vote_buffer[batch_size - 1].sequence_number,
-                message.vote_number
-            );
-            let vote = MulticastVote {
-                sequence_number: message.vote_number,
-                digest: digest(&self.vote_buffer[..batch_size as usize]),
-                replica_id: self.id,
-                signature: Signature::default(),
-            };
-            self.transport.send_signed_message(
-                ToReplica(self.transport.config.primary(self.view_number)),
-                Message::MulticastVote(vote),
-                self.id,
-            );
+        if message.vote_number > self.vote_number {
+            self.vote_number = message.vote_number;
+            self.send_vote();
         }
+    }
+
+    fn send_vote(&mut self) {
+        assert_ne!(self.vote_number, self.speculative_number);
+        let batch_size = (self.vote_number - self.speculative_number) as usize;
+        if self.vote_buffer.len() < batch_size {
+            assert_ne!(self.id, self.transport.config.primary(self.view_number));
+            todo!() // query missing sequence number?
+        }
+        assert_eq!(
+            self.vote_buffer[batch_size - 1].sequence_number,
+            self.vote_number
+        );
+        let vote = MulticastVote {
+            view_number: self.view_number,
+            sequence_number: self.vote_number,
+            digest: digest(&self.vote_buffer[..batch_size as usize]),
+            replica_id: self.id,
+            signature: Signature::default(),
+        };
+        let primary_id = self.transport.config.primary(self.view_number);
+        let destination = if self.id == primary_id {
+            ToSelf
+        } else {
+            ToReplica(primary_id)
+        };
+        self.transport
+            .send_signed_message(destination, Message::MulticastVote(vote), self.id);
     }
 }

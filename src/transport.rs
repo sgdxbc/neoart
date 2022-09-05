@@ -179,7 +179,6 @@ pub enum InboundAction<M> {
     Block,
     VerifyReplica(M, ReplicaId),
     Verify(M, fn(&mut M, &Config) -> bool),
-    // verify multicast
 }
 
 #[derive(Clone, Copy)]
@@ -242,6 +241,7 @@ impl From<&'_ Socket> for SocketAddr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MulticastVariant {
+    Disabled,
     HalfSipHash,
     // Secp256k1
 }
@@ -275,6 +275,11 @@ impl<T: Node> Transport<T> {
     pub fn listen_multicast(&mut self, socket: Socket, variant: MulticastVariant) {
         assert_eq!(variant, MulticastVariant::HalfSipHash);
         self.multicast_socket = socket;
+    }
+
+    pub fn multicast_variant(&self) -> MulticastVariant {
+        // TODO
+        MulticastVariant::HalfSipHash
     }
 
     pub fn create_id(&self) -> ClientId {
