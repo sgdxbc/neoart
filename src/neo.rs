@@ -323,9 +323,9 @@ impl Replica {
         app: impl App + Send + 'static,
     ) -> Self {
         transport.create_timer(Duration::ZERO, |node| {
-            let buf = [&[0xff; 4][..], &[0; 96][..]].concat();
+            let multicast = node.transport.config.multicast;
             node.transport
-                .send_raw(node.transport.config.multicast.unwrap(), &buf);
+                .send_raw((multicast.ip(), multicast.port() + 1), &[]);
         });
         Self {
             transport,
@@ -644,13 +644,15 @@ where
     T: simulated::Switch + AsRef<simulated::BasicSwitch>,
 {
     fn handle_packet(&mut self, mut packet: simulated::Packet) {
-        if packet.destination != self.config.multicast.unwrap() {
-            return self.underlying.handle_packet(packet);
-        }
-        if packet.buffer[0..4] == [0xff; 4] {
+        let multicast = self.config.multicast;
+        if packet.destination == (multicast.ip(), multicast.port() + 1).into() {
             self.sequence_number = 0;
             return;
         }
+        if packet.destination != multicast {
+            return self.underlying.handle_packet(packet);
+        }
+
         self.sequence_number += 1;
         let n = self.sequence_number;
         println!(
@@ -688,7 +690,7 @@ mod tests {
 
     use crate::{
         common::TestApp,
-        crypto::ExecutorSetting,
+        crypto::Executor,
         meta::ReplicaId,
         transport::{
             simulated::{BasicSwitch, Network},
@@ -720,7 +722,7 @@ mod tests {
                     Client::new(Transport::new(
                         config.clone(),
                         net.insert_socket(Network::client(i)),
-                        ExecutorSetting::Inline,
+                        Executor::Inline,
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -729,7 +731,7 @@ mod tests {
                     let mut transport = Transport::new(
                         config.clone(),
                         net.insert_socket(config.replicas[i]),
-                        ExecutorSetting::Inline,
+                        Executor::Inline,
                     );
                     transport
                         .listen_multicast(net.multicast_socket(config.replicas[i]), HalfSipHash);

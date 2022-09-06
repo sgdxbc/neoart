@@ -68,38 +68,45 @@ pub fn digest(message: impl Serialize) -> Digest {
         .as_ref()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub n: usize,
     pub f: usize,
     pub replicas: Vec<SocketAddr>,
     pub keys: Vec<KeyPair>,
-    pub multicast: Option<SocketAddr>,
+    pub multicast: SocketAddr,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            n: 0,
+            f: 0,
+            replicas: Vec::new(),
+            keys: Vec::new(),
+            multicast: SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
+    }
 }
 
 impl FromStr for Config {
     type Err = Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut f = None;
-        let mut replicas = Vec::new();
-        let mut multicast = None;
+        let mut config = Self::default();
         for line in s.lines() {
             let line = line.trim_start();
             if let Some(line) = line.strip_prefix('f') {
-                f = Some(line.trim_start().parse().unwrap());
+                config.f = line.trim_start().parse().unwrap();
             } else if let Some(line) = line.strip_prefix("replica") {
-                replicas.push(line.trim_start().parse().unwrap());
+                config.replicas.push(line.trim_start().parse().unwrap());
             } else if let Some(line) = line.strip_prefix("multicast") {
-                multicast = Some(line.trim_start().parse().unwrap());
+                config.multicast = line.trim_start().parse().unwrap();
             }
         }
-        Ok(Self {
-            n: replicas.len(),
-            f: f.unwrap(),
-            replicas,
-            keys: Vec::new(),
-            multicast,
-        })
+        assert!(!config.replicas.is_empty());
+        config.n = config.replicas.len();
+        assert_ne!(config.f, 0);
+        Ok(config)
     }
 }
 

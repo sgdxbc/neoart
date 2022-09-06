@@ -4,22 +4,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::meta::ENTRY_NUMBER;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Point {
     RequestBegin(u32),
     RequestEnd(u32),
-    // TransportBegin,
-    // TransportEnd,
-    // ReceiverBegin,
-    // ReceiverEnd,
-    // CryptoSubmitBegin,
-    // CryptoSubmitEnd,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Latency(Vec<(Instant, Point)>);
 thread_local! {
-    static LATENCY: RefCell<Latency> = RefCell::new(Latency(vec![]));
+    // assume at most 16 measurement point per entry
+    static LATENCY: RefCell<Latency> = RefCell::new(Latency(Vec::with_capacity(ENTRY_NUMBER * 16)));
 }
 
 pub fn push_latency(point: Point) {

@@ -95,7 +95,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     net::UdpSocket,
     pin, select, spawn,
@@ -105,7 +105,7 @@ use tokio::{
 };
 
 use crate::{
-    crypto::{Crypto, CryptoMessage, ExecutorSetting},
+    crypto::{Crypto, CryptoMessage, Executor},
     meta::{deserialize, digest, random_id, serialize, ClientId, Config, ReplicaId, ENTRY_NUMBER},
 };
 
@@ -229,7 +229,7 @@ pub enum Socket {
     SimulatedMulticast(mpsc::Receiver<simulated::Message>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MulticastVariant {
     Disabled,
     HalfSipHash,
@@ -237,7 +237,7 @@ pub enum MulticastVariant {
 }
 
 impl<T: Node> Transport<T> {
-    pub fn new(config: Config, socket: Socket, setting: ExecutorSetting) -> Self {
+    pub fn new(config: Config, socket: Socket, executor: Executor) -> Self {
         assert!(matches!(socket, Socket::Os(_)) || matches!(socket, Socket::Simulated(_)));
 
         let mut timer_table = HashMap::new();
@@ -253,7 +253,7 @@ impl<T: Node> Transport<T> {
         );
         let (crypto_sender, crypto_channel) = mpsc::channel(64);
         Self {
-            crypto: Crypto::new(config.clone(), setting, crypto_sender),
+            crypto: Crypto::new(config.clone(), crypto_sender, executor),
             config,
             crypto_channel,
             socket,
@@ -330,11 +330,9 @@ impl<T: Node> Transport<T> {
                     }
                 }
             }
-            Destination::ToMulticast => Self::send_message_internal(
-                &self.socket,
-                self.config.multicast.unwrap(),
-                &buf[..len],
-            ),
+            Destination::ToMulticast => {
+                Self::send_message_internal(&self.socket, self.config.multicast, &buf[..len])
+            }
         }
     }
 
@@ -604,7 +602,7 @@ pub mod simulated {
                 replicas: (0..n)
                     .map(|i| SocketAddr::from(([5, 9, 0, i as u8], 2023)))
                     .collect(),
-                multicast: Some(SocketAddr::from(([5, 9, 0, 255], 14159))),
+                multicast: SocketAddr::from(([5, 9, 0, 255], 14159)),
                 ..Config::default()
             };
             config.gen_keys();

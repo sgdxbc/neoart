@@ -65,48 +65,44 @@ pub struct Crypto<M> {
 }
 
 #[derive(Debug)]
-enum Executor {
+pub enum Executor {
     Inline,
     Rayon(ThreadPool),
 }
 
-#[derive(Debug, Clone)]
-pub enum ExecutorSetting {
-    Inline,
-    Rayon(usize, Arc<Mutex<Latency>>),
-}
-
-impl<M> Crypto<M> {
+impl Executor {
     thread_local! {
         static BLOCKING_SEND: RefCell<bool> = RefCell::new(false);
     }
 
-    pub fn new(config: Config, setting: ExecutorSetting, sender: Sender<CryptoEvent<M>>) -> Self {
-        let executor = match setting {
-            ExecutorSetting::Inline => Executor::Inline,
-            ExecutorSetting::Rayon(num_threads, latency) => Executor::Rayon(
-                ThreadPoolBuilder::new()
-                    .num_threads(num_threads)
-                    .spawn_handler(|thread| {
-                        let latency = latency.clone();
-                        spawn(move || {
-                            let mut cpu_set = CpuSet::new();
-                            // save cpu#0 for transport + receiver
-                            cpu_set.set(thread.index() + 1).unwrap();
-                            sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+    pub fn new_rayon(num_threads: usize, latency: Arc<Mutex<Latency>>) -> Self {
+        Self::Rayon(
+            ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .spawn_handler(|thread| {
+                    let latency = latency.clone();
+                    spawn(move || {
+                        let mut cpu_set = CpuSet::new();
+                        // save cpu#0 for transport + receiver
+                        cpu_set.set(thread.index() + 1).unwrap();
+                        sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
 
-                            Self::BLOCKING_SEND
-                                .with(|blocking_send| *blocking_send.borrow_mut() = true);
-                            thread.run();
+                        Self::BLOCKING_SEND
+                            .with(|blocking_send| *blocking_send.borrow_mut() = true);
+                        thread.run();
 
-                            merge_latency_into(&mut latency.lock().unwrap());
-                        });
-                        Ok(())
-                    })
-                    .build()
-                    .unwrap(),
-            ),
-        };
+                        merge_latency_into(&mut latency.lock().unwrap());
+                    });
+                    Ok(())
+                })
+                .build()
+                .unwrap(),
+        )
+    }
+}
+
+impl<M> Crypto<M> {
+    pub fn new(config: Config, sender: Sender<CryptoEvent<M>>, executor: Executor) -> Self {
         Self {
             sender,
             config: Arc::new(config),
@@ -159,7 +155,7 @@ impl<M> Crypto<M> {
         sender: &Sender<CryptoEvent<M>>,
     ) {
         if verify_message(&mut message, config) {
-            if Self::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
+            if Executor::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
                 sender
                     .blocking_send(CryptoEvent::Verified(message))
                     .map_err(|_| ())
@@ -205,7 +201,7 @@ impl<M> Crypto<M> {
         });
         *message.signature_mut() = Signature(signature);
 
-        if Self::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
+        if Executor::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
             sender
                 .blocking_send(CryptoEvent::Signed(id, message))
                 .map_err(|_| ())

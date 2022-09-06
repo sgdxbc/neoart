@@ -217,7 +217,7 @@ mod tests {
 
     use crate::{
         common::TestApp,
-        crypto::ExecutorSetting,
+        crypto::Executor,
         transport::{
             simulated::{BasicSwitch, Network},
             Concurrent, Run, Transport,
@@ -235,7 +235,7 @@ mod tests {
             Transport::new(
                 config.clone(),
                 net.insert_socket(config.replicas[0]),
-                ExecutorSetting::Inline,
+                Executor::Inline,
             ),
             0,
             TestApp::default(),
@@ -243,7 +243,7 @@ mod tests {
         let mut client = Client::new(Transport::new(
             config.clone(),
             net.insert_socket(Network::client(0)),
-            ExecutorSetting::Inline,
+            Executor::Inline,
         ));
 
         let net = Concurrent::run(net);

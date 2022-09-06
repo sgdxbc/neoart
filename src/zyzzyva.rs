@@ -643,7 +643,7 @@ mod tests {
 
     use crate::{
         common::TestApp,
-        crypto::ExecutorSetting,
+        crypto::Executor,
         meta::ReplicaId,
         transport::{simulated::Network, Concurrent, Run, Transport},
         zyzzyva::{Client, Replica},
@@ -666,7 +666,7 @@ mod tests {
                         Transport::new(
                             config.clone(),
                             net.insert_socket(Network::client(i)),
-                            ExecutorSetting::Inline,
+                            Executor::Inline,
                         ),
                         assume_byz,
                     )
@@ -678,7 +678,7 @@ mod tests {
                         Transport::new(
                             config.clone(),
                             net.insert_socket(config.replicas[i]),
-                            ExecutorSetting::Inline,
+                            Executor::Inline,
                         ),
                         i as ReplicaId,
                         TestApp::default(),
