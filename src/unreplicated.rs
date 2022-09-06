@@ -218,7 +218,7 @@ mod tests {
     use crate::{
         common::TestApp,
         crypto::ExecutorSetting,
-        transport::{Concurrent, Run, SimulatedNetwork, Transport},
+        transport::{Concurrent, Run, SimulatedBasicSwitch, SimulatedNetwork, Transport},
         Client as _,
     };
 
@@ -227,7 +227,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn single_op() {
         let config = SimulatedNetwork::config(1, 0);
-        let mut net = SimulatedNetwork::<()>::default();
+        let mut net = SimulatedNetwork(SimulatedBasicSwitch::default());
         let replica = Replica::new(
             Transport::new(
                 config.clone(),

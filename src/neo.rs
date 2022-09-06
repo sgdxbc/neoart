@@ -19,8 +19,8 @@ use crate::{
     },
     transport::{
         Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        InboundAction, InboundPacket, MulticastVariant, Node, SimulatedNetwork, SimulatedPacket,
-        SimulatedSwitch, Transport,
+        InboundAction, InboundPacket, MulticastVariant, Node, SimulatedBasicSwitch,
+        SimulatedPacket, SimulatedSwitch, Transport,
         TransportMessage::{self, Allowed, Signed, Verified},
     },
     App,
@@ -627,48 +627,55 @@ impl Drop for Replica {
     }
 }
 
-struct Switch {
+struct Switch<T = SimulatedBasicSwitch> {
     sequence_number: u32,
     config: Config,
+    underlying: T,
 }
 
-impl SimulatedSwitch for SimulatedNetwork<Switch> {
-    fn handle_message(&mut self, mut packet: SimulatedPacket) {
-        if packet.destination != self.switch.config.multicast.unwrap() {
-            return self
-                .forward_packet(packet, Duration::from_millis(thread_rng().gen_range(1..10)));
+impl<T: AsMut<SimulatedBasicSwitch>> AsMut<SimulatedBasicSwitch> for Switch<T> {
+    fn as_mut(&mut self) -> &mut SimulatedBasicSwitch {
+        self.underlying.as_mut()
+    }
+}
+
+impl<T> SimulatedSwitch for Switch<T>
+where
+    T: SimulatedSwitch + AsRef<SimulatedBasicSwitch>,
+{
+    fn handle_packet(&mut self, mut packet: SimulatedPacket) {
+        if packet.destination != self.config.multicast.unwrap() {
+            return self.underlying.handle_packet(packet);
         }
-        if packet.buf[0..4] == [0xff; 4] {
-            self.switch.sequence_number = 0;
+        if packet.buffer[0..4] == [0xff; 4] {
+            self.sequence_number = 0;
             return;
         }
-        self.switch.sequence_number += 1;
-        let sequence_number = self.switch.sequence_number;
+        self.sequence_number += 1;
+        let n = self.sequence_number;
         println!(
-            "* [{:6?}] [{} -> <multicast>] sequence {sequence_number} message length {}",
-            Instant::now() - self.epoch,
+            "* [{:6?}] [{} -> <multicast>] sequence {n} message length {}",
+            Instant::now() - self.underlying.as_ref().epoch,
             packet.source,
-            packet.buf[100..].len()
+            packet.buffer[100..].len()
         );
-        packet.buf[0..4].copy_from_slice(&sequence_number.to_be_bytes()[..]);
+        packet.buffer[0..4].copy_from_slice(&n.to_be_bytes()[..]);
         // this is synchronized with switch program
-        packet.buf[7] = (sequence_number & 0xff) as u8;
-        packet.buf[8] = (sequence_number + 1 & 0xff) as u8;
+        packet.buffer[7] = (n & 0xff) as u8;
+        packet.buffer[8] = ((n + 1) & 0xff) as u8;
 
         // currently implementation is not good at handle multicast that varies
         // to much on arriving time, so simply unify it here
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));
         // TODO more elegant than clone addresses
-        for destination in self.switch.config.replicas.clone() {
-            self.forward_packet(
-                SimulatedPacket {
-                    source: packet.source,
-                    destination,
-                    buf: packet.buf.clone(),
-                    multicast_outgress: true,
-                },
+        for &destination in &self.config.replicas {
+            self.underlying.handle_packet(SimulatedPacket {
+                source: packet.source,
+                destination,
+                buffer: packet.buffer.clone(),
                 delay,
-            );
+                multicast_outgress: true,
+            });
         }
     }
 }
@@ -683,7 +690,10 @@ mod tests {
         common::TestApp,
         crypto::ExecutorSetting,
         meta::ReplicaId,
-        transport::{Concurrent, MulticastVariant::HalfSipHash, Run, SimulatedNetwork, Transport},
+        transport::{
+            Concurrent, MulticastVariant::HalfSipHash, Run, SimulatedBasicSwitch, SimulatedNetwork,
+            Transport,
+        },
         Client as _,
     };
 
@@ -698,9 +708,10 @@ mod tests {
     impl System {
         fn new(num_client: usize) -> Self {
             let config = SimulatedNetwork::config(4, 1);
-            let mut net = SimulatedNetwork::new(Switch {
+            let mut net = SimulatedNetwork(Switch {
                 sequence_number: 0,
                 config: config.clone(),
+                underlying: SimulatedBasicSwitch::default(),
             });
             let clients = (0..num_client)
                 .map(|i| {

@@ -52,16 +52,15 @@ impl Latency {
         intervals
     }
 
-    pub fn trim(&self, start: u64, duration: u64) -> Self {
+    pub fn trim(&self, offset: Duration, length: Duration) -> Self {
         if self.0.is_empty() {
             return Self(Vec::new());
         }
-        let start = self.0[0].0 + Duration::from_millis(start);
-        let duration = Duration::from_millis(duration);
+        let start = self.0[0].0 + offset;
         Self(
             self.0
                 .iter()
-                .filter(|&&(instant, _)| instant >= start && instant < start + duration)
+                .filter(|&&(instant, _)| instant >= start && instant < start + length)
                 .copied()
                 .collect(),
         )

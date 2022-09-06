@@ -305,7 +305,8 @@ impl<T: Node> Transport<T> {
                 let result = network.try_send(SimulatedPacket {
                     source: *addr,
                     destination,
-                    buf: buf.to_vec(),
+                    buffer: buf.to_vec(),
+                    delay: Duration::from_millis(thread_rng().gen_range(1..10)),
                     multicast_outgress: false,
                 });
                 if result.is_err() {
@@ -509,7 +510,7 @@ where
     }
 }
 
-pub struct SimulatedNetwork<T = ()> {
+pub struct SimulatedBasicSwitch {
     send_channel: (
         mpsc::Sender<SimulatedPacket>,
         mpsc::Receiver<SimulatedPacket>,
@@ -518,7 +519,6 @@ pub struct SimulatedNetwork<T = ()> {
     multicast_listeners: HashMap<SocketAddr, mpsc::Receiver<SimulatedMessage>>,
     pub epoch: Instant,
     is_running: Arc<AtomicBool>,
-    pub switch: T,
 }
 struct Inbox {
     unicast: mpsc::Sender<SimulatedMessage>,
@@ -529,14 +529,9 @@ type SimulatedMessage = (SocketAddr, Vec<u8>);
 pub struct SimulatedPacket {
     pub source: SocketAddr,
     pub destination: SocketAddr,
-    pub buf: Vec<u8>,
+    pub buffer: Vec<u8>,
+    pub delay: Duration,
     pub multicast_outgress: bool,
-}
-
-impl<T: Default> Default for SimulatedNetwork<T> {
-    fn default() -> Self {
-        Self::new(T::default())
-    }
 }
 
 #[derive(Debug)]
@@ -547,19 +542,20 @@ pub struct SimulatedSocket {
     is_running: Arc<AtomicBool>,
 }
 
-impl<T> SimulatedNetwork<T> {
-    pub fn new(switch: T) -> Self {
+impl Default for SimulatedBasicSwitch {
+    fn default() -> Self {
         Self {
             send_channel: mpsc::channel(64),
             inboxes: HashMap::new(),
             multicast_listeners: HashMap::new(),
             epoch: Instant::now(),
             is_running: Arc::new(AtomicBool::new(false)),
-            switch,
         }
     }
+}
 
-    pub fn insert_socket(&mut self, addr: SocketAddr) -> Socket {
+impl SimulatedBasicSwitch {
+    fn insert_socket(&mut self, addr: SocketAddr) -> Socket {
         let (unicast_sender, unicast) = mpsc::channel(64);
         let (multicast_sender, multicast) = mpsc::channel(64);
         self.inboxes.insert(
@@ -578,11 +574,13 @@ impl<T> SimulatedNetwork<T> {
         })
     }
 
-    pub fn multicast_socket(&mut self, addr: SocketAddr) -> Socket {
+    fn multicast_socket(&mut self, addr: SocketAddr) -> Socket {
         Socket::SimulatedMulticast(self.multicast_listeners.remove(&addr).unwrap())
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimulatedNetwork<T = SimulatedBasicSwitch>(pub T);
 impl SimulatedNetwork {
     pub fn config(n: usize, f: usize) -> Config {
         let mut config = Config {
@@ -603,33 +601,49 @@ impl SimulatedNetwork {
     }
 }
 
+impl<T> SimulatedNetwork<T> {
+    pub fn insert_socket(&mut self, addr: SocketAddr) -> Socket
+    where
+        T: AsMut<SimulatedBasicSwitch>,
+    {
+        self.0.as_mut().insert_socket(addr)
+    }
+
+    pub fn multicast_socket(&mut self, addr: SocketAddr) -> Socket
+    where
+        T: AsMut<SimulatedBasicSwitch>,
+    {
+        self.0.as_mut().multicast_socket(addr)
+    }
+}
+
 pub trait SimulatedSwitch {
-    fn handle_message(&mut self, message: SimulatedPacket);
+    fn handle_packet(&mut self, packet: SimulatedPacket);
 }
 
 #[async_trait]
 impl<T> Run for SimulatedNetwork<T>
 where
-    Self: SimulatedSwitch,
-    T: Send,
+    T: SimulatedSwitch + AsMut<SimulatedBasicSwitch> + Send,
 {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
+        let Self(switch) = self;
         pin!(close);
-        self.is_running.store(true, SeqCst);
-        while self.is_running.load(SeqCst) {
+        switch.as_mut().is_running.store(true, SeqCst);
+        while switch.as_mut().is_running.load(SeqCst) {
             select! {
                 _ = &mut close => break,
-                message = self.send_channel.1.recv() => {
-                    self.handle_message(message.unwrap())
+                message = switch.as_mut().send_channel.1.recv() => {
+                    switch.handle_packet(message.unwrap())
                 }
             }
         }
-        self.is_running.store(false, SeqCst);
+        switch.as_mut().is_running.store(false, SeqCst);
     }
 }
 
-impl<T> SimulatedNetwork<T> {
-    pub fn forward_packet(&mut self, message: SimulatedPacket, delay: Duration) {
+impl SimulatedBasicSwitch {
+    pub fn forward_packet(&mut self, message: SimulatedPacket) {
         let inbox = if message.multicast_outgress {
             self.inboxes[&message.destination].multicast.clone()
         } else {
@@ -638,7 +652,7 @@ impl<T> SimulatedNetwork<T> {
         let epoch = self.epoch;
         let is_running = self.is_running.clone();
         spawn(async move {
-            sleep(delay).await;
+            sleep(message.delay).await;
             if !is_running.load(SeqCst) {
                 return;
             }
@@ -647,14 +661,14 @@ impl<T> SimulatedNetwork<T> {
                 Instant::now() - epoch,
                 message.source,
                 message.destination,
-                message.buf.len(),
+                message.buffer.len(),
                 if message.multicast_outgress {
                     "(multicast)"
                 } else {
                     ""
                 }
             );
-            if inbox.send((message.source, message.buf)).await.is_err() {
+            if inbox.send((message.source, message.buffer)).await.is_err() {
                 println!("! send failed and abort simulation");
                 // the simulation will end as soon as the first attempt of
                 // sending message into a crashed receiver i.e. the coroutine
@@ -671,9 +685,19 @@ impl<T> SimulatedNetwork<T> {
     }
 }
 
-impl SimulatedSwitch for SimulatedNetwork {
-    fn handle_message(&mut self, packet: SimulatedPacket) {
-        self.forward_packet(packet, Duration::from_millis(thread_rng().gen_range(1..10)));
+impl AsRef<SimulatedBasicSwitch> for SimulatedBasicSwitch {
+    fn as_ref(&self) -> &SimulatedBasicSwitch {
+        self
+    }
+}
+impl AsMut<SimulatedBasicSwitch> for SimulatedBasicSwitch {
+    fn as_mut(&mut self) -> &mut SimulatedBasicSwitch {
+        self
+    }
+}
+impl SimulatedSwitch for SimulatedBasicSwitch {
+    fn handle_packet(&mut self, packet: SimulatedPacket) {
+        self.forward_packet(packet);
     }
 }
 
