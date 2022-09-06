@@ -4,15 +4,16 @@
 //!
 //! The abstraction is basically following specpaxos codebase. The struct
 //! `Transport` interacts with types that implement `Node` in the same way as
-//! `Transport` and `TransportReceiver` in spexpaxos. The following describes
-//! significant modifications.
+//! `Transport` and `TransportReceiver` in spexpaxos. (Rename to `Node` because
+//! "receiver" is an overly-used term in Rust libraries.) The following
+//! describes significant modifications.
 //!
 //! The original model requires circular mutable references between every
 //! receiver and its transport, which is quite awkward in Rust semantic. Instead
 //! of one shared transport, in NeoArt every `Receiver` should own a
-//! `Transport`. The OS transport is fine to be separated, while the simulated
-//! transports need to be connected with each other for packet passing. This is
-//! solved by `SimulatedNetwork`.
+//! `Transport`. While the OS transport is fine to be separately-owned, the
+//! simulated transports need to be connected with each other for packet
+//! passing. And `SimulatedNetwork` is the connector.
 //!
 //! This codebase follows asynchronized programming model. There is no single
 //! `transport.run()` as main event loop (there is no single transport already),
@@ -58,7 +59,7 @@
 //! # }
 //! ```
 //!
-//! The `Crypto` is intergrated into `Transport` through two sets of interfaces
+//! The `Crypto` is integrated into `Transport` through two sets of interfaces
 //! for inbound and outbound messages. Every inbound message must go through
 //! verification, where exact policy is returned by `Node::inbound_action`. A
 //! replica message basically can be verified by `VerifyReplica` while `Verify`
@@ -70,15 +71,12 @@
 //! network.
 //!
 //! The outbound interface is `Transport::send_signed_message`, which sign the
-//! message in background worker thread and send it after signing. The sending
-//! semantic is different from plain `Transport::send_message`. The plain
-//! interface filters out loopback traffic, while
-//! `Transport::send_signed_message` keeps it to allow "recirculated" processing
-//! on signed messages. This is basically a design tradeoff, because it is hard
-//! to recirculate in the synchronized `Transport::send_message`, while it is
-//! also hard to "inline" the receiving logic of the loopback copy with the
-//! asynchronized `Transport::send_signed_message`. Notice that the recirculated
-//! messages do not go through `Node::inbound_action`, they are always allowed.
+//! message in background worker thread and send it after signing. If a protocol
+//! wants to postprocess a locally-signed message, e.g. insert it into a quorum
+//! certificate, the message could be sent to `Destination::ToSelf`, and after
+//! signing the message will be "recirculated" to `Node::receive_message` and be
+//! wrapped with `TransportMessage::Signed`. `ToSelf` is not allowed for plain
+//! `Transport::send_message`.
 //!
 //! `Crypto`'s executor has `Inline` and `Rayon` variants. The `Inline` executor
 //! finishes cryptographic task on current thread before returning from calling,
@@ -86,7 +84,6 @@
 //! completion. It is suitable for testing and client side usage which doesn't
 //! actually do any signing or verifying. `Rayon` executor uses a Rayon thread
 //! pool and is suitable for benchmarking.
-
 use std::{
     borrow::Borrow,
     collections::HashMap,
@@ -121,7 +118,7 @@ pub trait Run {
     async fn run(&mut self, close: impl Future<Output = ()> + Send);
 }
 
-pub trait Node: Sized {
+pub trait Node {
     type Message: Send + 'static;
     fn inbound_action(
         &self,
@@ -157,6 +154,10 @@ impl<'a, M> InboundPacket<'a, M> {
         M: DeserializeOwned,
     {
         Self::Unicast {
+            // currently messages are unconditionally deserialized upon
+            // receiving and panic if the message is malformed. this is not
+            // suitable for byzantine system. a better design is to wrap the
+            // deserialization result in `Result` to allow error handling
             message: deserialize(buf),
         }
     }
