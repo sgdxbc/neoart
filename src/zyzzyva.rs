@@ -645,27 +645,27 @@ mod tests {
         common::TestApp,
         crypto::ExecutorSetting,
         meta::ReplicaId,
-        transport::{Concurrent, Run, SimulatedNetwork, Transport},
+        transport::{simulated::Network, Concurrent, Run, Transport},
         zyzzyva::{Client, Replica},
         Client as _,
     };
 
     struct System {
-        net: Concurrent<SimulatedNetwork>,
+        net: Concurrent<Network>,
         replicas: Vec<Concurrent<Replica>>,
         clients: Vec<Client>,
     }
 
     impl System {
         fn new(num_client: usize, assume_byz: bool, enable_batching: bool) -> Self {
-            let config = SimulatedNetwork::config(4, 1);
-            let mut net = SimulatedNetwork::default();
+            let config = Network::config(4, 1);
+            let mut net = Network::default();
             let clients = (0..num_client)
                 .map(|i| {
                     Client::new(
                         Transport::new(
                             config.clone(),
-                            net.insert_socket(SimulatedNetwork::client(i)),
+                            net.insert_socket(Network::client(i)),
                             ExecutorSetting::Inline,
                         ),
                         assume_byz,

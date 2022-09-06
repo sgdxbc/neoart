@@ -18,9 +18,9 @@ use crate::{
         ENTRY_NUMBER,
     },
     transport::{
+        simulated,
         Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        InboundAction, InboundPacket, MulticastVariant, Node, SimulatedBasicSwitch,
-        SimulatedPacket, SimulatedSwitch, Transport,
+        InboundAction, InboundPacket, MulticastVariant, Node, Transport,
         TransportMessage::{self, Allowed, Signed, Verified},
     },
     App,
@@ -627,23 +627,23 @@ impl Drop for Replica {
     }
 }
 
-struct Switch<T = SimulatedBasicSwitch> {
+struct Switch<T = simulated::BasicSwitch> {
     sequence_number: u32,
     config: Config,
     underlying: T,
 }
 
-impl<T: AsMut<SimulatedBasicSwitch>> AsMut<SimulatedBasicSwitch> for Switch<T> {
-    fn as_mut(&mut self) -> &mut SimulatedBasicSwitch {
+impl<T: AsMut<simulated::BasicSwitch>> AsMut<simulated::BasicSwitch> for Switch<T> {
+    fn as_mut(&mut self) -> &mut simulated::BasicSwitch {
         self.underlying.as_mut()
     }
 }
 
-impl<T> SimulatedSwitch for Switch<T>
+impl<T> simulated::Switch for Switch<T>
 where
-    T: SimulatedSwitch + AsRef<SimulatedBasicSwitch>,
+    T: simulated::Switch + AsRef<simulated::BasicSwitch>,
 {
-    fn handle_packet(&mut self, mut packet: SimulatedPacket) {
+    fn handle_packet(&mut self, mut packet: simulated::Packet) {
         if packet.destination != self.config.multicast.unwrap() {
             return self.underlying.handle_packet(packet);
         }
@@ -669,7 +669,7 @@ where
         let delay = Duration::from_millis(thread_rng().gen_range(1..10));
         // TODO more elegant than clone addresses
         for &destination in &self.config.replicas {
-            self.underlying.handle_packet(SimulatedPacket {
+            self.underlying.handle_packet(simulated::Packet {
                 source: packet.source,
                 destination,
                 buffer: packet.buffer.clone(),
@@ -691,8 +691,10 @@ mod tests {
         crypto::ExecutorSetting,
         meta::ReplicaId,
         transport::{
-            Concurrent, MulticastVariant::HalfSipHash, Run, SimulatedBasicSwitch, SimulatedNetwork,
-            Transport,
+            simulated::{BasicSwitch, Network},
+            Concurrent,
+            MulticastVariant::HalfSipHash,
+            Run, Transport,
         },
         Client as _,
     };
@@ -700,24 +702,24 @@ mod tests {
     use super::{Client, Replica, Switch};
 
     struct System {
-        net: Concurrent<SimulatedNetwork<Switch>>,
+        net: Concurrent<Network<Switch>>,
         replicas: Vec<Concurrent<Replica>>,
         clients: Vec<Client>,
     }
 
     impl System {
         fn new(num_client: usize) -> Self {
-            let config = SimulatedNetwork::config(4, 1);
-            let mut net = SimulatedNetwork(Switch {
+            let config = Network::config(4, 1);
+            let mut net = Network(Switch {
                 sequence_number: 0,
                 config: config.clone(),
-                underlying: SimulatedBasicSwitch::default(),
+                underlying: BasicSwitch::default(),
             });
             let clients = (0..num_client)
                 .map(|i| {
                     Client::new(Transport::new(
                         config.clone(),
-                        net.insert_socket(SimulatedNetwork::client(i)),
+                        net.insert_socket(Network::client(i)),
                         ExecutorSetting::Inline,
                     ))
                 })

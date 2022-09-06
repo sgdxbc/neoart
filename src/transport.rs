@@ -13,12 +13,12 @@
 //! of one shared transport, in NeoArt every `Receiver` should own a
 //! `Transport`. While the OS transport is fine to be separately-owned, the
 //! simulated transports need to be connected with each other for packet
-//! passing. And `SimulatedNetwork` is the connector.
+//! passing. And `simulated::Network` is the connector.
 //!
 //! This codebase follows asynchronized programming model. There is no single
 //! `transport.run()` as main event loop (there is no single transport already),
 //! instead main event loop should be provided by underlying async framework,
-//! i.e. Tokio. All `Transport`, `Receiver` and `SimulatedNetwork` implement
+//! i.e. Tokio. All `Transport`, `Receiver` and `simulated::Network` implement
 //! `Run` trait, which has an async `run` method that enables cooperation. The
 //! `Concurrent` wrapper is provided to simplify spawning and joining.
 //!
@@ -30,8 +30,8 @@
 //! # use neoart::{common::*, transport::*, unreplicated::*, Client as _};
 //! # #[tokio::main]
 //! # async fn main() {
-//! #     let config = SimulatedNetwork::config(1, 0);
-//! #     let mut net = SimulatedNetwork::default();
+//! #     let config = simulated::Network::config(1, 0);
+//! #     let mut net = simulated::Network::default();
 //! #     let replica = Replica::new(
 //! #         Transport::new(
 //! #             config.clone(),
@@ -43,7 +43,7 @@
 //! #     );
 //! #     let mut client = Client::new(Transport::new(
 //! #         config.clone(),
-//! #         net.insert_socket(SimulatedNetwork::client(0)),
+//! #         net.insert_socket(simulated::Network::client(0)),
 //! #         neoart::crypto::ExecutorSetting::Inline,
 //! #     ));
 //! #     let net = Concurrent::run(net);
@@ -90,15 +90,11 @@ use std::{
     future::{pending, Future},
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering::SeqCst},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
-use rand::{thread_rng, Rng};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     net::UdpSocket,
@@ -229,8 +225,8 @@ type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
 pub enum Socket {
     Null,
     Os(UdpSocket), // both unicast and multicast
-    Simulated(SimulatedSocket),
-    SimulatedMulticast(mpsc::Receiver<SimulatedMessage>),
+    Simulated(simulated::Socket),
+    SimulatedMulticast(mpsc::Receiver<simulated::Message>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,24 +292,7 @@ impl<T: Node> Transport<T> {
             Socket::Os(socket) => {
                 socket.try_send_to(buf, destination).unwrap();
             }
-            Socket::Simulated(SimulatedSocket {
-                addr,
-                network,
-                is_running,
-                ..
-            }) => {
-                let result = network.try_send(SimulatedPacket {
-                    source: *addr,
-                    destination,
-                    buffer: buf.to_vec(),
-                    delay: Duration::from_millis(thread_rng().gen_range(1..10)),
-                    multicast_outgress: false,
-                });
-                if result.is_err() {
-                    println!("! network not available and abort simulation");
-                    is_running.store(false, SeqCst);
-                }
-            }
+            Socket::Simulated(socket) => socket.send_to(destination, buf),
         }
     }
 
@@ -408,7 +387,7 @@ impl Socket {
         match self {
             Self::Null => pending().await,
             Self::Os(socket) => socket.recv_from(buf).await.unwrap(),
-            Self::Simulated(SimulatedSocket { inbox, .. }) | Self::SimulatedMulticast(inbox) => {
+            Self::Simulated(simulated::Socket { inbox, .. }) | Self::SimulatedMulticast(inbox) => {
                 let (remote, message) = inbox.recv().await.unwrap();
                 buf[..message.len()].copy_from_slice(&message);
                 (message.len(), remote)
@@ -420,7 +399,7 @@ impl Socket {
         match self {
             Socket::Null | Socket::SimulatedMulticast(_) => unreachable!(),
             Socket::Os(socket) => socket.local_addr().unwrap(),
-            Socket::Simulated(SimulatedSocket { addr, .. }) => *addr,
+            Socket::Simulated(simulated::Socket { addr, .. }) => *addr,
         }
     }
 }
@@ -510,194 +489,231 @@ where
     }
 }
 
-pub struct SimulatedBasicSwitch {
-    send_channel: (
-        mpsc::Sender<SimulatedPacket>,
-        mpsc::Receiver<SimulatedPacket>,
-    ),
-    inboxes: HashMap<SocketAddr, Inbox>,
-    multicast_listeners: HashMap<SocketAddr, mpsc::Receiver<SimulatedMessage>>,
-    pub epoch: Instant,
-    is_running: Arc<AtomicBool>,
-}
-struct Inbox {
-    unicast: mpsc::Sender<SimulatedMessage>,
-    multicast: mpsc::Sender<SimulatedMessage>,
-}
+pub mod simulated {
+    use std::{
+        collections::HashMap,
+        future::Future,
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicBool, Ordering::SeqCst},
+            Arc,
+        },
+        time::Duration,
+    };
 
-type SimulatedMessage = (SocketAddr, Vec<u8>);
-pub struct SimulatedPacket {
-    pub source: SocketAddr,
-    pub destination: SocketAddr,
-    pub buffer: Vec<u8>,
-    pub delay: Duration,
-    pub multicast_outgress: bool,
-}
+    use async_trait::async_trait;
+    use rand::{thread_rng, Rng};
+    use tokio::{
+        pin, select, spawn,
+        sync::mpsc,
+        time::{sleep, Instant},
+    };
 
-#[derive(Debug)]
-pub struct SimulatedSocket {
-    addr: SocketAddr,
-    network: mpsc::Sender<SimulatedPacket>,
-    inbox: mpsc::Receiver<SimulatedMessage>,
-    is_running: Arc<AtomicBool>,
-}
+    use crate::meta::Config;
 
-impl Default for SimulatedBasicSwitch {
-    fn default() -> Self {
-        Self {
-            send_channel: mpsc::channel(64),
-            inboxes: HashMap::new(),
-            multicast_listeners: HashMap::new(),
-            epoch: Instant::now(),
-            is_running: Arc::new(AtomicBool::new(false)),
-        }
+    pub struct BasicSwitch {
+        send_channel: (mpsc::Sender<Packet>, mpsc::Receiver<Packet>),
+        inboxes: HashMap<SocketAddr, Inbox>,
+        multicast_listeners: HashMap<SocketAddr, mpsc::Receiver<Message>>,
+        pub epoch: Instant,
+        is_running: Arc<AtomicBool>,
     }
-}
-
-impl SimulatedBasicSwitch {
-    fn insert_socket(&mut self, addr: SocketAddr) -> Socket {
-        let (unicast_sender, unicast) = mpsc::channel(64);
-        let (multicast_sender, multicast) = mpsc::channel(64);
-        self.inboxes.insert(
-            addr,
-            Inbox {
-                unicast: unicast_sender,
-                multicast: multicast_sender,
-            },
-        );
-        self.multicast_listeners.insert(addr, multicast);
-        Socket::Simulated(SimulatedSocket {
-            addr,
-            network: self.send_channel.0.clone(),
-            inbox: unicast,
-            is_running: self.is_running.clone(),
-        })
+    struct Inbox {
+        unicast: mpsc::Sender<Message>,
+        multicast: mpsc::Sender<Message>,
     }
 
-    fn multicast_socket(&mut self, addr: SocketAddr) -> Socket {
-        Socket::SimulatedMulticast(self.multicast_listeners.remove(&addr).unwrap())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SimulatedNetwork<T = SimulatedBasicSwitch>(pub T);
-impl SimulatedNetwork {
-    pub fn config(n: usize, f: usize) -> Config {
-        let mut config = Config {
-            n,
-            f,
-            replicas: (0..n)
-                .map(|i| SocketAddr::from(([5, 9, 0, i as u8], 2023)))
-                .collect(),
-            multicast: Some(SocketAddr::from(([5, 9, 0, 255], 14159))),
-            ..Config::default()
-        };
-        config.gen_keys();
-        config
+    pub type Message = (SocketAddr, Vec<u8>);
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Packet {
+        pub source: SocketAddr,
+        pub destination: SocketAddr,
+        pub buffer: Vec<u8>,
+        pub delay: Duration,
+        pub multicast_outgress: bool,
     }
 
-    pub fn client(i: usize) -> SocketAddr {
-        SocketAddr::from(([20, 23, 7, 10], i as u16 + 1))
-    }
-}
-
-impl<T> SimulatedNetwork<T> {
-    pub fn insert_socket(&mut self, addr: SocketAddr) -> Socket
-    where
-        T: AsMut<SimulatedBasicSwitch>,
-    {
-        self.0.as_mut().insert_socket(addr)
+    #[derive(Debug)]
+    pub struct Socket {
+        pub addr: SocketAddr,
+        network: mpsc::Sender<Packet>,
+        pub inbox: mpsc::Receiver<Message>,
+        is_running: Arc<AtomicBool>,
     }
 
-    pub fn multicast_socket(&mut self, addr: SocketAddr) -> Socket
-    where
-        T: AsMut<SimulatedBasicSwitch>,
-    {
-        self.0.as_mut().multicast_socket(addr)
-    }
-}
-
-pub trait SimulatedSwitch {
-    fn handle_packet(&mut self, packet: SimulatedPacket);
-}
-
-#[async_trait]
-impl<T> Run for SimulatedNetwork<T>
-where
-    T: SimulatedSwitch + AsMut<SimulatedBasicSwitch> + Send,
-{
-    async fn run(&mut self, close: impl Future<Output = ()> + Send) {
-        let Self(switch) = self;
-        pin!(close);
-        switch.as_mut().is_running.store(true, SeqCst);
-        while switch.as_mut().is_running.load(SeqCst) {
-            select! {
-                _ = &mut close => break,
-                message = switch.as_mut().send_channel.1.recv() => {
-                    switch.handle_packet(message.unwrap())
-                }
+    impl Socket {
+        pub fn send_to(&self, destination: SocketAddr, buf: &[u8]) {
+            let result = self.network.try_send(Packet {
+                source: self.addr,
+                destination,
+                buffer: buf.to_vec(),
+                delay: Duration::from_millis(thread_rng().gen_range(1..10)),
+                multicast_outgress: false,
+            });
+            if result.is_err() {
+                println!("! network not available and abort simulation");
+                self.is_running.store(false, SeqCst);
             }
         }
-        switch.as_mut().is_running.store(false, SeqCst);
     }
-}
 
-impl SimulatedBasicSwitch {
-    pub fn forward_packet(&mut self, message: SimulatedPacket) {
-        let inbox = if message.multicast_outgress {
-            self.inboxes[&message.destination].multicast.clone()
-        } else {
-            self.inboxes[&message.destination].unicast.clone()
-        };
-        let epoch = self.epoch;
-        let is_running = self.is_running.clone();
-        spawn(async move {
-            sleep(message.delay).await;
-            if !is_running.load(SeqCst) {
-                return;
+    impl Default for BasicSwitch {
+        fn default() -> Self {
+            Self {
+                send_channel: mpsc::channel(64),
+                inboxes: HashMap::new(),
+                multicast_listeners: HashMap::new(),
+                epoch: Instant::now(),
+                is_running: Arc::new(AtomicBool::new(false)),
             }
-            println!(
-                "* [{:6?}] [{} -> {}] message length {} {}",
-                Instant::now() - epoch,
-                message.source,
-                message.destination,
-                message.buffer.len(),
-                if message.multicast_outgress {
-                    "(multicast)"
-                } else {
-                    ""
-                }
+        }
+    }
+
+    impl BasicSwitch {
+        fn insert_socket(&mut self, addr: SocketAddr) -> super::Socket {
+            let (unicast_sender, unicast) = mpsc::channel(64);
+            let (multicast_sender, multicast) = mpsc::channel(64);
+            self.inboxes.insert(
+                addr,
+                Inbox {
+                    unicast: unicast_sender,
+                    multicast: multicast_sender,
+                },
             );
-            if inbox.send((message.source, message.buffer)).await.is_err() {
-                println!("! send failed and abort simulation");
-                // the simulation will end as soon as the first attempt of
-                // sending message into a crashed receiver i.e. the coroutine
-                // thread running it
-                // (it will also end if receiver fail to transmit to network,
-                // but that should not be possible as long as network is
-                // correctly implementated)
-                // this may not be as good as end the simulation as soon as any
-                // receiver crashes, by monitor the liveness of threads, but it
-                // should be mostly the same
-                is_running.store(false, SeqCst);
-            }
-        });
-    }
-}
+            self.multicast_listeners.insert(addr, multicast);
+            super::Socket::Simulated(Socket {
+                addr,
+                network: self.send_channel.0.clone(),
+                inbox: unicast,
+                is_running: self.is_running.clone(),
+            })
+        }
 
-impl AsRef<SimulatedBasicSwitch> for SimulatedBasicSwitch {
-    fn as_ref(&self) -> &SimulatedBasicSwitch {
-        self
+        fn multicast_socket(&mut self, addr: SocketAddr) -> super::Socket {
+            super::Socket::SimulatedMulticast(self.multicast_listeners.remove(&addr).unwrap())
+        }
     }
-}
-impl AsMut<SimulatedBasicSwitch> for SimulatedBasicSwitch {
-    fn as_mut(&mut self) -> &mut SimulatedBasicSwitch {
-        self
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct Network<T = BasicSwitch>(pub T);
+    impl Network {
+        pub fn config(n: usize, f: usize) -> Config {
+            let mut config = Config {
+                n,
+                f,
+                replicas: (0..n)
+                    .map(|i| SocketAddr::from(([5, 9, 0, i as u8], 2023)))
+                    .collect(),
+                multicast: Some(SocketAddr::from(([5, 9, 0, 255], 14159))),
+                ..Config::default()
+            };
+            config.gen_keys();
+            config
+        }
+
+        pub fn client(i: usize) -> SocketAddr {
+            SocketAddr::from(([20, 23, 7, 10], i as u16 + 1))
+        }
     }
-}
-impl SimulatedSwitch for SimulatedBasicSwitch {
-    fn handle_packet(&mut self, packet: SimulatedPacket) {
-        self.forward_packet(packet);
+
+    impl<T> Network<T> {
+        pub fn insert_socket(&mut self, addr: SocketAddr) -> super::Socket
+        where
+            T: AsMut<BasicSwitch>,
+        {
+            self.0.as_mut().insert_socket(addr)
+        }
+
+        pub fn multicast_socket(&mut self, addr: SocketAddr) -> super::Socket
+        where
+            T: AsMut<BasicSwitch>,
+        {
+            self.0.as_mut().multicast_socket(addr)
+        }
+    }
+
+    pub trait Switch {
+        fn handle_packet(&mut self, packet: Packet);
+    }
+
+    #[async_trait]
+    impl<T> super::Run for Network<T>
+    where
+        T: Switch + AsMut<BasicSwitch> + Send,
+    {
+        async fn run(&mut self, close: impl Future<Output = ()> + Send) {
+            let Self(switch) = self;
+            pin!(close);
+            switch.as_mut().is_running.store(true, SeqCst);
+            while switch.as_mut().is_running.load(SeqCst) {
+                select! {
+                    _ = &mut close => break,
+                    message = switch.as_mut().send_channel.1.recv() => {
+                        switch.handle_packet(message.unwrap())
+                    }
+                }
+            }
+            switch.as_mut().is_running.store(false, SeqCst);
+        }
+    }
+
+    impl BasicSwitch {
+        pub fn forward_packet(&mut self, message: Packet) {
+            let inbox = if message.multicast_outgress {
+                self.inboxes[&message.destination].multicast.clone()
+            } else {
+                self.inboxes[&message.destination].unicast.clone()
+            };
+            let epoch = self.epoch;
+            let is_running = self.is_running.clone();
+            spawn(async move {
+                sleep(message.delay).await;
+                if !is_running.load(SeqCst) {
+                    return;
+                }
+                println!(
+                    "* [{:6?}] [{} -> {}] message length {} {}",
+                    Instant::now() - epoch,
+                    message.source,
+                    message.destination,
+                    message.buffer.len(),
+                    if message.multicast_outgress {
+                        "(multicast)"
+                    } else {
+                        ""
+                    }
+                );
+                if inbox.send((message.source, message.buffer)).await.is_err() {
+                    println!("! send failed and abort simulation");
+                    // the simulation will end as soon as the first attempt of
+                    // sending message into a crashed receiver i.e. the coroutine
+                    // thread running it
+                    // (it will also end if receiver fail to transmit to network,
+                    // but that should not be possible as long as network is
+                    // correctly implementated)
+                    // this may not be as good as end the simulation as soon as any
+                    // receiver crashes, by monitor the liveness of threads, but it
+                    // should be mostly the same
+                    is_running.store(false, SeqCst);
+                }
+            });
+        }
+    }
+
+    impl AsRef<BasicSwitch> for BasicSwitch {
+        fn as_ref(&self) -> &BasicSwitch {
+            self
+        }
+    }
+    impl AsMut<BasicSwitch> for BasicSwitch {
+        fn as_mut(&mut self) -> &mut BasicSwitch {
+            self
+        }
+    }
+    impl Switch for BasicSwitch {
+        fn handle_packet(&mut self, packet: Packet) {
+            self.forward_packet(packet);
+        }
     }
 }
 
