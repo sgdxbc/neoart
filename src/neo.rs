@@ -19,7 +19,7 @@ use crate::{
     },
     transport::{
         Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        InboundAction, InboundPacket, MulticastVariant, Node, SimulatedMessage, SimulatedNetwork,
+        InboundAction, InboundPacket, MulticastVariant, Node, SimulatedNetwork, SimulatedPacket,
         SimulatedSwitch, Transport,
         TransportMessage::{self, Allowed, Signed, Verified},
     },
@@ -325,7 +325,7 @@ impl Replica {
         transport.create_timer(Duration::ZERO, |node| {
             let buf = [&[0xff; 4][..], &[0; 96][..]].concat();
             node.transport
-                .send_buffer(node.transport.config.multicast.unwrap(), &buf);
+                .send_raw(node.transport.config.multicast.unwrap(), &buf);
         });
         Self {
             transport,
@@ -633,11 +633,12 @@ struct Switch {
 }
 
 impl SimulatedSwitch for SimulatedNetwork<Switch> {
-    fn handle_message(&mut self, mut message: SimulatedMessage) {
-        if message.destination != self.switch.config.multicast.unwrap() {
-            return self.send_message(message, 1, 10);
+    fn handle_message(&mut self, mut packet: SimulatedPacket) {
+        if packet.destination != self.switch.config.multicast.unwrap() {
+            return self
+                .forward_packet(packet, Duration::from_millis(thread_rng().gen_range(1..10)));
         }
-        if message.buf[0..4] == [0xff; 4] {
+        if packet.buf[0..4] == [0xff; 4] {
             self.switch.sequence_number = 0;
             return;
         }
@@ -646,26 +647,27 @@ impl SimulatedSwitch for SimulatedNetwork<Switch> {
         println!(
             "* [{:6?}] [{} -> <multicast>] sequence {sequence_number} message length {}",
             Instant::now() - self.epoch,
-            message.source,
-            message.buf[100..].len()
+            packet.source,
+            packet.buf[100..].len()
         );
-        message.buf[0..4].copy_from_slice(&sequence_number.to_be_bytes()[..]);
+        packet.buf[0..4].copy_from_slice(&sequence_number.to_be_bytes()[..]);
         // this is synchronized with switch program
-        message.buf[7] = (sequence_number & 0xff) as u8;
-        message.buf[8] = (sequence_number + 1 & 0xff) as u8;
+        packet.buf[7] = (sequence_number & 0xff) as u8;
+        packet.buf[8] = (sequence_number + 1 & 0xff) as u8;
 
-        let delay = thread_rng().gen_range(1..10);
+        // currently implementation is not good at handle multicast that varies
+        // to much on arriving time, so simply unify it here
+        let delay = Duration::from_millis(thread_rng().gen_range(1..10));
         // TODO more elegant than clone addresses
         for destination in self.switch.config.replicas.clone() {
-            self.send_message(
-                SimulatedMessage {
-                    source: message.source,
+            self.forward_packet(
+                SimulatedPacket {
+                    source: packet.source,
                     destination,
-                    buf: message.buf.clone(),
+                    buf: packet.buf.clone(),
                     multicast_outgress: true,
                 },
                 delay,
-                delay + 1,
             );
         }
     }

@@ -228,18 +228,9 @@ type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
 #[derive(Debug)]
 pub enum Socket {
     Null,
-    Os(UdpSocket),
+    Os(UdpSocket), // both unicast and multicast
     Simulated(SimulatedSocket),
-}
-
-impl From<&'_ Socket> for SocketAddr {
-    fn from(socket: &Socket) -> Self {
-        match socket {
-            Socket::Null => unreachable!(),
-            Socket::Os(socket) => socket.local_addr().unwrap(),
-            Socket::Simulated(SimulatedSocket { addr, .. }) => *addr,
-        }
-    }
+    SimulatedMulticast(mpsc::Receiver<SimulatedMessage>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +242,8 @@ pub enum MulticastVariant {
 
 impl<T: Node> Transport<T> {
     pub fn new(config: Config, socket: Socket, setting: ExecutorSetting) -> Self {
+        assert!(matches!(socket, Socket::Os(_)) || matches!(socket, Socket::Simulated(_)));
+
         let mut timer_table = HashMap::new();
         // insert a sentinel entry to make sure we get always get a `sleep` to
         // select from timer table in `run`
@@ -262,7 +255,7 @@ impl<T: Node> Transport<T> {
                 event: Box::new(|_| unreachable!("you forget to shutdown benchmark for an hour")),
             },
         );
-        let (crypto_sender, crypto_channel) = mpsc::channel(1024);
+        let (crypto_sender, crypto_channel) = mpsc::channel(64);
         Self {
             crypto: Crypto::new(config.clone(), setting, crypto_sender),
             config,
@@ -276,6 +269,14 @@ impl<T: Node> Transport<T> {
     }
 
     pub fn listen_multicast(&mut self, socket: Socket, variant: MulticastVariant) {
+        assert!(
+            matches!((&socket, &self.socket), (Socket::Os(_), Socket::Os(_)))
+                || matches!(
+                    (&socket, &self.socket),
+                    (Socket::SimulatedMulticast(_), Socket::Simulated(_))
+                )
+        );
+
         assert_eq!(variant, MulticastVariant::HalfSipHash);
         self.multicast_socket = socket;
     }
@@ -286,25 +287,31 @@ impl<T: Node> Transport<T> {
     }
 
     pub fn create_id(&self) -> ClientId {
-        random_id((&self.socket).into())
+        random_id(self.socket.local_address())
     }
 
     fn send_message_internal(socket: &Socket, destination: SocketAddr, buf: &[u8]) {
         match socket {
-            Socket::Null => unreachable!(),
+            Socket::Null | Socket::SimulatedMulticast(_) => unreachable!(),
             Socket::Os(socket) => {
                 socket.try_send_to(buf, destination).unwrap();
             }
-            Socket::Simulated(SimulatedSocket { addr, network, .. }) => {
-                network
-                    .try_send(SimulatedMessage {
-                        source: *addr,
-                        destination,
-                        buf: buf.to_vec(),
-                        multicast_outgress: false,
-                    })
-                    .map_err(|_| ())
-                    .unwrap();
+            Socket::Simulated(SimulatedSocket {
+                addr,
+                network,
+                is_running,
+                ..
+            }) => {
+                let result = network.try_send(SimulatedPacket {
+                    source: *addr,
+                    destination,
+                    buf: buf.to_vec(),
+                    multicast_outgress: false,
+                });
+                if result.is_err() {
+                    println!("! network not available and abort simulation");
+                    is_running.store(false, SeqCst);
+                }
             }
         }
     }
@@ -336,7 +343,7 @@ impl<T: Node> Transport<T> {
                 &buf[..len],
             ),
             Destination::ToAll => {
-                let local = (&self.socket).into();
+                let local = self.socket.local_address();
                 for &address in &self.config.replicas {
                     if address != local {
                         Self::send_message_internal(&self.socket, address, &buf[..len]);
@@ -351,7 +358,7 @@ impl<T: Node> Transport<T> {
         }
     }
 
-    pub fn send_buffer(&self, address: impl Into<SocketAddr>, buf: &[u8]) {
+    pub fn send_raw(&self, address: impl Into<SocketAddr>, buf: &[u8]) {
         Self::send_message_internal(&self.socket, address.into(), buf);
     }
 
@@ -400,11 +407,19 @@ impl Socket {
         match self {
             Self::Null => pending().await,
             Self::Os(socket) => socket.recv_from(buf).await.unwrap(),
-            Self::Simulated(SimulatedSocket { inbox, .. }) => {
+            Self::Simulated(SimulatedSocket { inbox, .. }) | Self::SimulatedMulticast(inbox) => {
                 let (remote, message) = inbox.recv().await.unwrap();
                 buf[..message.len()].copy_from_slice(&message);
                 (message.len(), remote)
             }
+        }
+    }
+
+    fn local_address(&self) -> SocketAddr {
+        match self {
+            Socket::Null | Socket::SimulatedMulticast(_) => unreachable!(),
+            Socket::Os(socket) => socket.local_addr().unwrap(),
+            Socket::Simulated(SimulatedSocket { addr, .. }) => *addr,
         }
     }
 }
@@ -496,21 +511,22 @@ where
 
 pub struct SimulatedNetwork<T = ()> {
     send_channel: (
-        mpsc::Sender<SimulatedMessage>,
-        mpsc::Receiver<SimulatedMessage>,
+        mpsc::Sender<SimulatedPacket>,
+        mpsc::Receiver<SimulatedPacket>,
     ),
     inboxes: HashMap<SocketAddr, Inbox>,
-    multicast_listeners: HashMap<SocketAddr, mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+    multicast_listeners: HashMap<SocketAddr, mpsc::Receiver<SimulatedMessage>>,
     pub epoch: Instant,
     is_running: Arc<AtomicBool>,
     pub switch: T,
 }
 struct Inbox {
-    unicast: mpsc::Sender<(SocketAddr, Vec<u8>)>,
-    multicast: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    unicast: mpsc::Sender<SimulatedMessage>,
+    multicast: mpsc::Sender<SimulatedMessage>,
 }
 
-pub struct SimulatedMessage {
+type SimulatedMessage = (SocketAddr, Vec<u8>);
+pub struct SimulatedPacket {
     pub source: SocketAddr,
     pub destination: SocketAddr,
     pub buf: Vec<u8>,
@@ -526,8 +542,9 @@ impl<T: Default> Default for SimulatedNetwork<T> {
 #[derive(Debug)]
 pub struct SimulatedSocket {
     addr: SocketAddr,
-    network: mpsc::Sender<SimulatedMessage>,
-    inbox: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    network: mpsc::Sender<SimulatedPacket>,
+    inbox: mpsc::Receiver<SimulatedMessage>,
+    is_running: Arc<AtomicBool>,
 }
 
 impl<T> SimulatedNetwork<T> {
@@ -543,8 +560,8 @@ impl<T> SimulatedNetwork<T> {
     }
 
     pub fn insert_socket(&mut self, addr: SocketAddr) -> Socket {
-        let (unicast_sender, unicast) = mpsc::channel(1024);
-        let (multicast_sender, multicast) = mpsc::channel(1024);
+        let (unicast_sender, unicast) = mpsc::channel(64);
+        let (multicast_sender, multicast) = mpsc::channel(64);
         self.inboxes.insert(
             addr,
             Inbox {
@@ -557,15 +574,12 @@ impl<T> SimulatedNetwork<T> {
             addr,
             network: self.send_channel.0.clone(),
             inbox: unicast,
+            is_running: self.is_running.clone(),
         })
     }
 
     pub fn multicast_socket(&mut self, addr: SocketAddr) -> Socket {
-        Socket::Simulated(SimulatedSocket {
-            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-            network: self.send_channel.0.clone(), // TODO not allow to send
-            inbox: self.multicast_listeners.remove(&addr).unwrap(),
-        })
+        Socket::SimulatedMulticast(self.multicast_listeners.remove(&addr).unwrap())
     }
 }
 
@@ -590,7 +604,7 @@ impl SimulatedNetwork {
 }
 
 pub trait SimulatedSwitch {
-    fn handle_message(&mut self, message: SimulatedMessage);
+    fn handle_message(&mut self, message: SimulatedPacket);
 }
 
 #[async_trait]
@@ -615,13 +629,12 @@ where
 }
 
 impl<T> SimulatedNetwork<T> {
-    pub fn send_message(&mut self, message: SimulatedMessage, min_delay: u64, max_delay: u64) {
+    pub fn forward_packet(&mut self, message: SimulatedPacket, delay: Duration) {
         let inbox = if message.multicast_outgress {
             self.inboxes[&message.destination].multicast.clone()
         } else {
             self.inboxes[&message.destination].unicast.clone()
         };
-        let delay = Duration::from_millis(thread_rng().gen_range(min_delay..max_delay));
         let epoch = self.epoch;
         let is_running = self.is_running.clone();
         spawn(async move {
@@ -646,6 +659,9 @@ impl<T> SimulatedNetwork<T> {
                 // the simulation will end as soon as the first attempt of
                 // sending message into a crashed receiver i.e. the coroutine
                 // thread running it
+                // (it will also end if receiver fail to transmit to network,
+                // but that should not be possible as long as network is
+                // correctly implementated)
                 // this may not be as good as end the simulation as soon as any
                 // receiver crashes, by monitor the liveness of threads, but it
                 // should be mostly the same
@@ -656,8 +672,8 @@ impl<T> SimulatedNetwork<T> {
 }
 
 impl SimulatedSwitch for SimulatedNetwork {
-    fn handle_message(&mut self, message: SimulatedMessage) {
-        self.send_message(message, 1, 10);
+    fn handle_message(&mut self, packet: SimulatedPacket) {
+        self.forward_packet(packet, Duration::from_millis(thread_rng().gen_range(1..10)));
     }
 }
 

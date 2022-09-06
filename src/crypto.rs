@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     mem::take,
     sync::{Arc, Mutex},
     thread::spawn,
@@ -76,6 +77,10 @@ pub enum ExecutorSetting {
 }
 
 impl<M> Crypto<M> {
+    thread_local! {
+        static BLOCKING_SEND: RefCell<bool> = RefCell::new(false);
+    }
+
     pub fn new(config: Config, setting: ExecutorSetting, sender: Sender<CryptoEvent<M>>) -> Self {
         let executor = match setting {
             ExecutorSetting::Inline => Executor::Inline,
@@ -89,7 +94,11 @@ impl<M> Crypto<M> {
                             // save cpu#0 for transport + receiver
                             cpu_set.set(thread.index() + 1).unwrap();
                             sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+
+                            Self::BLOCKING_SEND
+                                .with(|blocking_send| *blocking_send.borrow_mut() = true);
                             thread.run();
+
                             merge_latency_into(&mut latency.lock().unwrap());
                         });
                         Ok(())
@@ -150,10 +159,16 @@ impl<M> Crypto<M> {
         sender: &Sender<CryptoEvent<M>>,
     ) {
         if verify_message(&mut message, config) {
-            sender
-                .try_send(CryptoEvent::Verified(message))
-                .map_err(|_| ())
-                .unwrap();
+            if Self::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
+                sender
+                    .blocking_send(CryptoEvent::Verified(message))
+                    .map_err(|_| ())
+            } else {
+                sender
+                    .try_send(CryptoEvent::Verified(message))
+                    .map_err(|_| ())
+            }
+            .unwrap();
         } else {
             println!("! verify signature error");
         }
@@ -189,9 +204,16 @@ impl<M> Crypto<M> {
             secp.sign_ecdsa(&Message::from_slice(&message.digest()).unwrap(), secret_key)
         });
         *message.signature_mut() = Signature(signature);
-        sender
-            .try_send(CryptoEvent::Signed(id, message))
-            .map_err(|_| ())
-            .unwrap();
+
+        if Self::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
+            sender
+                .blocking_send(CryptoEvent::Signed(id, message))
+                .map_err(|_| ())
+        } else {
+            sender
+                .try_send(CryptoEvent::Signed(id, message))
+                .map_err(|_| ())
+        }
+        .unwrap();
     }
 }
