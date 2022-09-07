@@ -15,7 +15,7 @@ use crate::{
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
         digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
-        ENTRY_NUMBER,
+        ENTRY_NUMBER, MULTICAST_CONTROL_RESET_PORT,
     },
     transport::{
         simulated,
@@ -322,10 +322,16 @@ impl Replica {
         id: ReplicaId,
         app: impl App + Send + 'static,
     ) -> Self {
+        // TODO consider avoid side effect in constructor by adding a dedicated
+        // initialization method
         transport.create_timer(Duration::ZERO, |node| {
-            let multicast = node.transport.config.multicast;
-            node.transport
-                .send_raw((multicast.ip(), multicast.port() + 1), &[]);
+            node.transport.send_raw(
+                (
+                    node.transport.config.multicast.ip(),
+                    MULTICAST_CONTROL_RESET_PORT,
+                ),
+                &[],
+            );
         });
         Self {
             transport,

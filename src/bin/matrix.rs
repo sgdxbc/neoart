@@ -14,47 +14,21 @@ use neoart::{
         merge_latency_into, push_latency, Latency,
         Point::{RequestBegin, RequestEnd},
     },
-    meta::{Config, OpNumber, ReplicaId},
-    transport::{MulticastVariant, Node, Run, Socket, Transport},
-    unreplicated, zyzzyva, App, Client,
+    meta::{OpNumber, ARGS_SERVER_PORT},
+    transport::{Node, Run, Socket, Transport},
+    unreplicated, zyzzyva, App, Args, Client, Mode,
 };
 use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::Pid,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 use tokio::{
     net::UdpSocket, pin, runtime, select, signal::ctrl_c, spawn, sync::Notify, time::sleep,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-struct Args {
-    config: Config,
-    mode: Mode,
-    replica_id: ReplicaId,
-    host: [u8; 4],
-    num_worker: usize,
-    num_client: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Mode {
-    Unknown,
-    UnreplicatedReplica,
-    UnreplicatedClient,
-    ZyzzyvaReplica { enable_batching: bool },
-    ZyzzyvaClient { assume_byz: bool },
-    NeoReplica { variant: MulticastVariant },
-    NeoClient,
-}
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
 fn main() {
-    let server = TcpListener::bind("0.0.0.0:50000").unwrap();
+    let server = TcpListener::bind(("0.0.0.0", ARGS_SERVER_PORT)).unwrap();
     let (stream, remote) = server.accept().unwrap();
     println!("* configured by {remote}");
     let args = bincode::options()

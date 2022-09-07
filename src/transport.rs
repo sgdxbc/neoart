@@ -507,7 +507,7 @@ pub mod simulated {
         time::{sleep, Instant},
     };
 
-    use crate::meta::Config;
+    use crate::meta::{Config, MULTICAST_PORT, REPLICA_PORT};
 
     pub struct BasicSwitch {
         send_channel: (mpsc::Sender<Packet>, mpsc::Receiver<Packet>),
@@ -600,9 +600,9 @@ pub mod simulated {
                 n,
                 f,
                 replicas: (0..n)
-                    .map(|i| SocketAddr::from(([5, 9, 0, i as u8], 2023)))
+                    .map(|i| SocketAddr::from(([10, 0, 0, i as u8], REPLICA_PORT)))
                     .collect(),
-                multicast: SocketAddr::from(([5, 9, 0, 255], 14159)),
+                multicast: SocketAddr::from(([10, 0, 0, 255], MULTICAST_PORT)),
                 ..Config::default()
             };
             config.gen_keys();
@@ -610,7 +610,7 @@ pub mod simulated {
         }
 
         pub fn client(i: usize) -> SocketAddr {
-            SocketAddr::from(([20, 23, 7, 10], i as u16 + 1))
+            SocketAddr::from(([10, 255, (i / 0xff) as u8, (i % 0xff) as u8], 50000))
         }
     }
 

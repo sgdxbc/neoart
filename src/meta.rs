@@ -68,6 +68,18 @@ pub fn digest(message: impl Serialize) -> Digest {
         .as_ref()
 }
 
+pub const CODE_SERVER_PORT: u16 = 60000;
+pub const ARGS_SERVER_PORT: u16 = 60001;
+pub const REPLICA_PORT: u16 = 60002;
+pub const MULTICAST_PORT: u16 = 60003;
+pub const MULTICAST_CONTROL_RESET_PORT: u16 = 60004;
+/// Basic protocol-independent networking configuration shared by all nodes.
+///
+/// While the fields basically following specpaxos `Configuration` in this
+/// codebase additional shared information is needed. We restrict on some values
+/// to make sure there is no conflict. In particular, all replica addresses must
+/// have `REPLICA_PORT` (thus they must have different IP), and multicast
+/// address if configured must have `MULTICAST_PORT`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub n: usize,

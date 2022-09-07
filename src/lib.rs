@@ -1,6 +1,11 @@
 use std::{future::Future, pin::Pin};
 
-use meta::OpNumber;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    meta::{Config, OpNumber, ReplicaId},
+    transport::MulticastVariant,
+};
 
 pub mod common;
 pub mod crypto;
@@ -29,4 +34,33 @@ pub trait App {
     }
     #[allow(unused_variables)]
     fn commit_upcall(&mut self, op_number: OpNumber) {}
+}
+
+/// Common configuration shared by matrix binary and control plane binary.
+///
+// I guess there is no better place to put sharing pieces so it has to be here
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Args {
+    pub config: Config,
+    pub mode: Mode,
+    pub replica_id: ReplicaId,
+    pub host: [u8; 4],
+    pub num_worker: usize,
+    pub num_client: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    Unknown,
+    UnreplicatedReplica,
+    UnreplicatedClient,
+    ZyzzyvaReplica { enable_batching: bool },
+    ZyzzyvaClient { assume_byz: bool },
+    NeoReplica { variant: MulticastVariant },
+    NeoClient,
+}
+impl Default for Mode {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
