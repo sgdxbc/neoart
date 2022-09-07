@@ -16,7 +16,7 @@ use neoart::{
     },
     meta::{OpNumber, ARGS_SERVER_PORT},
     transport::{Node, Run, Socket, Transport},
-    unreplicated, zyzzyva, App, Args, Client, Mode,
+    unreplicated, zyzzyva, App, MatrixArgs, Client, MatrixTask,
 };
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -32,13 +32,13 @@ fn main() {
     let (stream, remote) = server.accept().unwrap();
     println!("* configured by {remote}");
     let args = bincode::options()
-        .deserialize_from::<_, Args>(stream)
+        .deserialize_from::<_, MatrixArgs>(stream)
         .unwrap();
     let latency = Arc::new(Mutex::new(Latency::default()));
     let runtime;
     let executor;
-    match &args.mode {
-        Mode::UnreplicatedClient | Mode::ZyzzyvaClient { .. } | Mode::NeoClient => {
+    match &args.task {
+        MatrixTask::UnreplicatedClient | MatrixTask::ZyzzyvaClient { .. } | MatrixTask::NeoClient => {
             runtime = runtime::Builder::new_multi_thread()
                 .enable_all()
                 .on_thread_stop({
@@ -47,7 +47,7 @@ fn main() {
                 })
                 .build()
                 .unwrap();
-            executor = Executor::Inline;
+            executor = Executor::Inline; // not used
         }
         _ => {
             runtime = runtime::Builder::new_current_thread().build().unwrap();
@@ -59,18 +59,24 @@ fn main() {
         }
     }
     runtime.block_on(async move {
-        match args.mode {
-            Mode::UnreplicatedReplica => {
+        match args.task {
+            MatrixTask::UnreplicatedReplica => {
                 run_replica(args, executor, |transport| {
                     unreplicated::Replica::new(transport, 0, Null)
                 })
                 .await
             }
-            Mode::UnreplicatedClient => run_client(args, unreplicated::Client::new).await,
-            Mode::ZyzzyvaReplica { enable_batching } => {
+            MatrixTask::UnreplicatedClient => run_client(args, unreplicated::Client::new).await,
+            MatrixTask::ZyzzyvaReplica { enable_batching } => {
                 let replica_id = args.replica_id;
                 run_replica(args, executor, |transport| {
                     zyzzyva::Replica::new(transport, replica_id, Null, enable_batching)
+                })
+                .await
+            }
+            MatrixTask::ZyzzyvaClient { assume_byz } => {
+                run_client(args, move |transport| {
+                    zyzzyva::Client::new(transport, assume_byz)
                 })
                 .await
             }
@@ -86,7 +92,7 @@ impl App for Null {
     }
 }
 
-async fn run_replica<T>(args: Args, executor: Executor, new_replica: impl FnOnce(Transport<T>) -> T)
+async fn run_replica<T>(args: MatrixArgs, executor: Executor, new_replica: impl FnOnce(Transport<T>) -> T)
 where
     T: Node + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage + DeserializeOwned,
@@ -103,7 +109,7 @@ where
 
     let multicast = args.config.multicast;
     let mut transport = Transport::new(args.config, Socket::Os(socket), executor);
-    if let Mode::NeoReplica { variant, .. } = args.mode {
+    if let MatrixTask::NeoReplica { variant, .. } = args.task {
         let socket = UdpSocket::bind(multicast).await.unwrap();
         transport.listen_multicast(Socket::Os(socket), variant);
     }
@@ -113,7 +119,7 @@ where
 }
 
 async fn run_client<T>(
-    args: Args,
+    args: MatrixArgs,
     new_client: impl FnOnce(Transport<T>) -> T + Clone + Send + 'static,
 ) where
     T: Node + Client + AsMut<Transport<T>> + Send,

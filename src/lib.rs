@@ -40,9 +40,9 @@ pub trait App {
 ///
 // I guess there is no better place to put sharing pieces so it has to be here
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Args {
+pub struct MatrixArgs {
     pub config: Config,
-    pub mode: Mode,
+    pub task: MatrixTask,
     pub replica_id: ReplicaId,
     pub host: [u8; 4],
     pub num_worker: usize,
@@ -50,7 +50,7 @@ pub struct Args {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Mode {
+pub enum MatrixTask {
     Unknown,
     UnreplicatedReplica,
     UnreplicatedClient,
@@ -59,8 +59,20 @@ pub enum Mode {
     NeoReplica { variant: MulticastVariant },
     NeoClient,
 }
-impl Default for Mode {
+impl Default for MatrixTask {
     fn default() -> Self {
         Self::Unknown
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodeServerIn {
+    Upgrade(Vec<u8>),
+    Restart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodeServerOut {
+    Ready,
+    Output(String),
 }

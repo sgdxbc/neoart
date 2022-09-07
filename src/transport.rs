@@ -600,7 +600,7 @@ pub mod simulated {
                 n,
                 f,
                 replicas: (0..n)
-                    .map(|i| SocketAddr::from(([10, 0, 0, i as u8], REPLICA_PORT)))
+                    .map(|i| SocketAddr::from(([10, 0, 0, i as u8 + 1], REPLICA_PORT)))
                     .collect(),
                 multicast: SocketAddr::from(([10, 0, 0, 255], MULTICAST_PORT)),
                 ..Config::default()
@@ -610,7 +610,7 @@ pub mod simulated {
         }
 
         pub fn client(i: usize) -> SocketAddr {
-            SocketAddr::from(([10, 255, (i / 0xff) as u8, (i % 0xff) as u8], 50000))
+            SocketAddr::from(([10, 2, 0, 1], 50001 + i as u16))
         }
     }
 
