@@ -2,3 +2,4 @@
 /Cargo.lock
 
 /spec.toml
+/sw/*.py

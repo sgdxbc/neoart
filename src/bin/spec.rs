@@ -1,4 +1,5 @@
 use std::{
+    env::args,
     io::{stdout, Write},
     net::{Ipv4Addr, SocketAddr},
     process::Stdio,
@@ -7,14 +8,17 @@ use std::{
 
 use bincode::Options;
 use neoart::{
-    meta::{Config, ReplicaId, ARGS_SERVER_PORT, MULTICAST_PORT, REPLICA_PORT},
+    meta::{
+        Config, ReplicaId, ARGS_SERVER_PORT, MULTICAST_CONTROL_RESET_PORT, MULTICAST_PORT,
+        REPLICA_PORT,
+    },
     transport::MulticastVariant,
     MatrixArgs, MatrixProtocol,
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Deserialize;
 use tokio::{
-    fs::read_to_string,
+    fs::{read_to_string, write},
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::Command,
@@ -52,7 +56,10 @@ struct Node {
     control_user: String,
     control_host: String,
     ip: Ipv4Addr,
-    // don't care remain fields
+    link: String,
+    #[serde(default)]
+    link_speed: String,
+    dev_port: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +71,15 @@ struct SpecMulticast {
 #[tokio::main]
 async fn main() {
     let mut spec = toml::from_str::<Spec>(&read_to_string("spec.toml").await.unwrap()).unwrap();
+    if args().nth(1).as_deref() == Some("sw") {
+        write("sw/neo_s.py", rewrite_sw(spec.clone(), false))
+            .await
+            .unwrap();
+        write("sw/neo_s-sim.py", rewrite_sw(spec.clone(), true))
+            .await
+            .unwrap();
+        return;
+    }
 
     let rebuild = Command::new("cargo")
         .args(["build", "--release", "--bin", "matrix"])
@@ -177,7 +193,7 @@ async fn up_node(node: Node, tag: String) -> JoinHandle<()> {
         }
         let status = matrix.wait().await.unwrap();
         if status.success() {
-            println!("[S] * node {tag} exit status {status}");
+            println!("[S] * node {tag} {status}");
         } else {
             let mut error_string = String::new();
             matrix
@@ -187,7 +203,7 @@ async fn up_node(node: Node, tag: String) -> JoinHandle<()> {
                 .await
                 .unwrap();
             let mut out = stdout().lock();
-            writeln!(out, "[S] * node {tag} exit status {status}").unwrap();
+            writeln!(out, "[S] * node {tag} {status}").unwrap();
             writeln!(out, "{error_string}").unwrap();
             writeln!(out, "--- end of standard error ---").unwrap();
         }
@@ -273,4 +289,55 @@ fn client_args(spec: Spec, index: usize) -> MatrixArgs {
         num_worker: 0,
         num_client: spec.task.num_client / spec.client.len() as u32,
     }
+}
+
+fn rewrite_sw(spec: Spec, simulate: bool) -> String {
+    let mut dmac = Vec::new();
+    let mut port = Vec::new();
+    let mut replicas = Vec::new();
+    let mut endpoints = Vec::new();
+    for mut node in spec.replica {
+        if node.link_speed.is_empty() {
+            node.link_speed = String::from("100G");
+        }
+        dmac.push((node.link, node.dev_port));
+        port.push((node.dev_port, node.link_speed));
+        replicas.push(node.dev_port);
+        endpoints.push(node.dev_port);
+    }
+    for mut node in spec.client {
+        if node.link_speed.is_empty() {
+            node.link_speed = String::from("100G");
+        }
+        dmac.push((node.link, node.dev_port));
+        port.push((node.dev_port, node.link_speed));
+        endpoints.push(node.dev_port);
+    }
+    const ENDPOINT_GROUP: u16 = 1;
+    const REPLICA_GROUP: u16 = 2;
+    const ENDPOINT_NODE: u16 = 1;
+    const REPLICA_NODE: u16 = 2;
+    let pre_node = [(ENDPOINT_NODE, endpoints), (REPLICA_NODE, replicas)]
+        .into_iter()
+        .map(|(group_id, ports)| (group_id, 0xffff, ports))
+        .collect::<Vec<_>>();
+    let pre_mgid = [
+        (ENDPOINT_GROUP, vec![ENDPOINT_NODE]),
+        (REPLICA_GROUP, vec![REPLICA_NODE]),
+    ];
+
+    let sw = include_str!("spec-sw.in.py");
+    sw.replace(r#""@@PROGRAM@@""#, "bfrt.neo_s")
+        .replace(r#""@@SIMULATE@@""#, if simulate { "True" } else { "False" })
+        .replace(r#""@@MULTICAST_PORT@@""#, &MULTICAST_PORT.to_string())
+        .replace(
+            r#""@@MULTICAST_CONTROL_RESET_PORT@@""#,
+            &MULTICAST_CONTROL_RESET_PORT.to_string(),
+        )
+        .replace(r#""@@DMAC@@""#, &format!("{dmac:?}"))
+        .replace(r#""@@PORT@@""#, &format!("{port:?}"))
+        .replace(r#""@@ENDPOINT_GROUP@@""#, &ENDPOINT_GROUP.to_string())
+        .replace(r#""@@REPLICA_GROUP@@""#, &REPLICA_GROUP.to_string())
+        .replace(r#""@@PRE_NODE@@""#, &format!("{pre_node:?}"))
+        .replace(r#""@@PRE_MGID@@""#, &format!("{pre_mgid:?}"))
 }
