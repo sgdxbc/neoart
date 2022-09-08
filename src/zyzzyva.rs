@@ -320,9 +320,7 @@ impl Client {
                 receiver.invoke.as_ref().unwrap().request.request_number,
                 request_number
             );
-            if request_number != 1 {
-                println!("! client {} resend request {}", receiver.id, request_number);
-            }
+            println!("! client {} resend request {}", receiver.id, request_number);
             receiver.send_request();
         };
         invoke.timer_id = self

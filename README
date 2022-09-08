@@ -4,8 +4,7 @@ Run sanity check:
 $ cargo test --lib
 
 Run benchmark:
-$ cargo build --release
-Copy master.example.py to master.py, and modify content `DB` according to the 
-evaluation system, and modify `TASK` as the evaulation run.
-On each server, run master script in the way you like, e.g.
-$ ssh user@host cat path/to/master.py | python
+Copy spec.example.toml to spec.toml, and modify `[[replica]]`, `[[client]]`` and
+`[multicast]` sections according to the evaluation system, and modify `[task]` 
+as the desired evaluation run.
+$ cargo run --bin spec

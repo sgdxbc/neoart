@@ -1,6 +1,8 @@
 use std::{
     env::args,
-    net::{SocketAddr, TcpListener},
+    fs::{remove_file, write},
+    net::TcpListener,
+    process::id,
     sync::{
         atomic::{AtomicU32, Ordering::SeqCst},
         Arc, Mutex,
@@ -28,39 +30,46 @@ use tokio::{
     net::UdpSocket, pin, runtime, select, signal::ctrl_c, spawn, sync::Notify, time::sleep,
 };
 
-fn main() {
-    let server = TcpListener::bind((args().nth(1).unwrap(), ARGS_SERVER_PORT)).unwrap();
+fn accept_args() -> MatrixArgs {
+    let server = TcpListener::bind((
+        args().nth(1).as_deref().unwrap_or("0.0.0.0"),
+        ARGS_SERVER_PORT,
+    ))
+    .unwrap();
     let (stream, remote) = server.accept().unwrap();
     println!("* configured by {remote}");
-    let args = bincode::options()
-        .deserialize_from::<_, MatrixArgs>(stream)
-        .unwrap();
+    bincode::options().deserialize_from(&stream).unwrap()
+}
+
+fn main() {
+    let mut args = accept_args();
+    args.config.gen_keys();
+    let pid_file = format!("pid.{}", args.instance_id);
+    write(&pid_file, id().to_string()).unwrap();
+
     let latency = Arc::new(Mutex::new(Latency::default()));
-    let runtime;
-    let executor;
-    match &args.protocol {
+    let mut executor = Executor::Inline;
+    let runtime = match &args.protocol {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
-        | MatrixProtocol::NeoClient => {
-            runtime = runtime::Builder::new_multi_thread()
-                .enable_all()
-                .on_thread_stop({
-                    let latency = latency.clone();
-                    move || merge_latency_into(&mut latency.lock().unwrap())
-                })
-                .build()
-                .unwrap();
-            executor = Executor::Inline; // not used
-        }
+        | MatrixProtocol::NeoClient => runtime::Builder::new_multi_thread()
+            .enable_all()
+            .on_thread_stop({
+                let latency = latency.clone();
+                move || merge_latency_into(&mut latency.lock().unwrap())
+            })
+            .build()
+            .unwrap(),
         _ => {
-            runtime = runtime::Builder::new_current_thread().build().unwrap();
             if args.num_worker != 0 {
                 executor = Executor::new_rayon(args.num_worker, latency);
-            } else {
-                executor = Executor::Inline;
             }
+            runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
         }
-    }
+    };
     runtime.block_on(async move {
         match args.protocol {
             MatrixProtocol::UnreplicatedReplica => {
@@ -86,6 +95,8 @@ fn main() {
             _ => unreachable!(),
         }
     });
+
+    remove_file(&pid_file).unwrap();
 }
 
 struct Null;
@@ -133,15 +144,15 @@ async fn run_client<T>(
 {
     let notify = Arc::new(Notify::new());
     let throughput = Arc::new(AtomicU32::new(0));
-    let address = SocketAddr::from((args.host, 0));
     let clients: Vec<tokio::task::JoinHandle<()>> = (0..args.num_client)
         .map(|i| -> tokio::task::JoinHandle<()> {
             let config = args.config.clone();
             let notify = notify.clone();
             let throughput = throughput.clone();
             let new_client = new_client.clone();
+            let host = args.host.clone();
             spawn(async move {
-                let socket = UdpSocket::bind(address).await.unwrap();
+                let socket = UdpSocket::bind((host, 0)).await.unwrap();
                 socket.set_broadcast(true).unwrap();
                 socket.writable().await.unwrap();
                 let transport = Transport::new(config, Socket::Os(socket), Executor::Inline);

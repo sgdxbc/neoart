@@ -41,10 +41,11 @@ pub trait App {
 // I guess there is no better place to put sharing pieces so it has to be here
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MatrixArgs {
+    pub instance_id: String,
     pub config: Config,
     pub protocol: MatrixProtocol,
     pub replica_id: ReplicaId,
-    pub host: [u8; 4],
+    pub host: String,
     pub num_worker: usize,
     pub num_client: u32,
 }
@@ -59,20 +60,9 @@ pub enum MatrixProtocol {
     NeoReplica { variant: MulticastVariant },
     NeoClient,
 }
+
 impl Default for MatrixProtocol {
     fn default() -> Self {
         Self::Unknown
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CodeServerIn {
-    Upgrade(Vec<u8>),
-    Restart,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CodeServerOut {
-    Ready,
-    Output(String),
 }

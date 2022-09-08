@@ -1,5 +1,4 @@
 /target
 /Cargo.lock
 
-/master.py
 /spec.toml
