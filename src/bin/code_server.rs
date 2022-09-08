@@ -4,7 +4,9 @@
 //! * Update matrix executable
 //! * (Re)start matrix executable as subprocess
 //! * Capture and upload matrix excutable's output
-use std::{process::Stdio, sync::Arc};
+use std::{
+    env::args, fs::Permissions, os::unix::prelude::PermissionsExt, process::Stdio, sync::Arc,
+};
 
 use bincode::Options;
 use neoart::{meta::CODE_SERVER_PORT, CodeServerIn, CodeServerOut};
@@ -19,16 +21,15 @@ use tokio::{
 
 #[tokio::main]
 async fn main() {
-    let server = TcpListener::bind(("0.0.0.0", CODE_SERVER_PORT))
-        .await
-        .unwrap();
+    let host = args().nth(1).unwrap_or(String::from("0.0.0.0"));
+    let server = TcpListener::bind((&*host, CODE_SERVER_PORT)).await.unwrap();
     let mut controller = None;
     let restart = Arc::new(Notify::new());
     let mut output = mpsc::channel(64);
     loop {
         if controller.is_none() {
             let (incoming, remote) = server.accept().await.unwrap();
-            println!("* conntected to controller {remote}");
+            println!("* connected to controller {remote}");
             controller = Some(incoming);
         }
         let stream = controller.as_mut().unwrap();
@@ -56,13 +57,19 @@ async fn main() {
                 let ready = oneshot::channel();
                 let output = output.0.clone();
                 let shutdown = restart.clone();
+                let host = host.clone();
                 spawn(async move {
-                    matrix_task(ready.0, shutdown, output).await;
+                    matrix_task(ready.0, shutdown, output, host).await;
                 });
                 ready.1.await.unwrap();
                 write_message(stream, CodeServerOut::Ready).await;
             }
-            CodeServerIn::Upgrade(exe) => fs::write("./neo-matrix", exe).await.unwrap(),
+            CodeServerIn::Upgrade(exe) => {
+                fs::write("./neo-matrix", exe).await.unwrap();
+                fs::set_permissions("./neo-matrix", Permissions::from_mode(0x755))
+                    .await
+                    .unwrap();
+            }
         }
     }
 }
@@ -78,8 +85,10 @@ async fn matrix_task(
     ready: oneshot::Sender<()>,
     shutdown: Arc<Notify>,
     output: mpsc::Sender<String>,
+    host: String,
 ) {
     let mut matrix = Command::new("./neo-matrix")
+        .arg(host)
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -88,7 +97,7 @@ async fn matrix_task(
     loop {
         select! {
             _ = shutdown.notified() => {
-                return;
+                todo!()
             }
             line = output_lines.next_line() => {
                 if let Some(line) = line.unwrap() {

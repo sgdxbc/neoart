@@ -42,7 +42,7 @@ pub trait App {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MatrixArgs {
     pub config: Config,
-    pub task: MatrixTask,
+    pub protocol: MatrixProtocol,
     pub replica_id: ReplicaId,
     pub host: [u8; 4],
     pub num_worker: usize,
@@ -50,7 +50,7 @@ pub struct MatrixArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MatrixTask {
+pub enum MatrixProtocol {
     Unknown,
     UnreplicatedReplica,
     UnreplicatedClient,
@@ -59,7 +59,7 @@ pub enum MatrixTask {
     NeoReplica { variant: MulticastVariant },
     NeoClient,
 }
-impl Default for MatrixTask {
+impl Default for MatrixProtocol {
     fn default() -> Self {
         Self::Unknown
     }

@@ -1,4 +1,5 @@
 use std::{
+    env::args,
     net::{SocketAddr, TcpListener},
     sync::{
         atomic::{AtomicU32, Ordering::SeqCst},
@@ -16,7 +17,7 @@ use neoart::{
     },
     meta::{OpNumber, ARGS_SERVER_PORT},
     transport::{Node, Run, Socket, Transport},
-    unreplicated, zyzzyva, App, MatrixArgs, Client, MatrixTask,
+    unreplicated, zyzzyva, App, Client, MatrixArgs, MatrixProtocol,
 };
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -28,7 +29,7 @@ use tokio::{
 };
 
 fn main() {
-    let server = TcpListener::bind(("0.0.0.0", ARGS_SERVER_PORT)).unwrap();
+    let server = TcpListener::bind((args().nth(1).unwrap(), ARGS_SERVER_PORT)).unwrap();
     let (stream, remote) = server.accept().unwrap();
     println!("* configured by {remote}");
     let args = bincode::options()
@@ -37,8 +38,10 @@ fn main() {
     let latency = Arc::new(Mutex::new(Latency::default()));
     let runtime;
     let executor;
-    match &args.task {
-        MatrixTask::UnreplicatedClient | MatrixTask::ZyzzyvaClient { .. } | MatrixTask::NeoClient => {
+    match &args.protocol {
+        MatrixProtocol::UnreplicatedClient
+        | MatrixProtocol::ZyzzyvaClient { .. }
+        | MatrixProtocol::NeoClient => {
             runtime = runtime::Builder::new_multi_thread()
                 .enable_all()
                 .on_thread_stop({
@@ -59,22 +62,22 @@ fn main() {
         }
     }
     runtime.block_on(async move {
-        match args.task {
-            MatrixTask::UnreplicatedReplica => {
+        match args.protocol {
+            MatrixProtocol::UnreplicatedReplica => {
                 run_replica(args, executor, |transport| {
                     unreplicated::Replica::new(transport, 0, Null)
                 })
                 .await
             }
-            MatrixTask::UnreplicatedClient => run_client(args, unreplicated::Client::new).await,
-            MatrixTask::ZyzzyvaReplica { enable_batching } => {
+            MatrixProtocol::UnreplicatedClient => run_client(args, unreplicated::Client::new).await,
+            MatrixProtocol::ZyzzyvaReplica { enable_batching } => {
                 let replica_id = args.replica_id;
                 run_replica(args, executor, |transport| {
                     zyzzyva::Replica::new(transport, replica_id, Null, enable_batching)
                 })
                 .await
             }
-            MatrixTask::ZyzzyvaClient { assume_byz } => {
+            MatrixProtocol::ZyzzyvaClient { assume_byz } => {
                 run_client(args, move |transport| {
                     zyzzyva::Client::new(transport, assume_byz)
                 })
@@ -92,8 +95,11 @@ impl App for Null {
     }
 }
 
-async fn run_replica<T>(args: MatrixArgs, executor: Executor, new_replica: impl FnOnce(Transport<T>) -> T)
-where
+async fn run_replica<T>(
+    args: MatrixArgs,
+    executor: Executor,
+    new_replica: impl FnOnce(Transport<T>) -> T,
+) where
     T: Node + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage + DeserializeOwned,
 {
@@ -109,7 +115,7 @@ where
 
     let multicast = args.config.multicast;
     let mut transport = Transport::new(args.config, Socket::Os(socket), executor);
-    if let MatrixTask::NeoReplica { variant, .. } = args.task {
+    if let MatrixProtocol::NeoReplica { variant, .. } = args.protocol {
         let socket = UdpSocket::bind(multicast).await.unwrap();
         transport.listen_multicast(Socket::Os(socket), variant);
     }
