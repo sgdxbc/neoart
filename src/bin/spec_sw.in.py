@@ -44,6 +44,6 @@ for group_id, nodes in PRE_MGID:
 PROGRAM.pipe.SwitchIngress.send_to_endpoints.set_default_with_send_to_group(mgid=ENDPOINT_GROUP)
 PROGRAM.pipe.SwitchIngress.send_to_replicas.set_default_with_send_to_group(mgid=REPLICA_GROUP)
 
-PROGRAM.pipe.SwitchIngressParser.neo_port.add(MULTICAST_CONTROL_RESET_PORT)
+PROGRAM.pipe.SwitchIngressParser.neo_port.add(MULTICAST_PORT)
+PROGRAM.pipe.SwitchIngressParser.neo_control_reset_port.add(MULTICAST_CONTROL_RESET_PORT)
 PROGRAM.pipe.SwitchIngress.neo.set_default_with_neo_multicast(port=MULTICAST_PORT)
-

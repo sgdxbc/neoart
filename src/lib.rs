@@ -1,11 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    meta::{Config, OpNumber, ReplicaId},
-    transport::MulticastVariant,
-};
+use crate::meta::OpNumber;
 
 pub mod common;
 pub mod crypto;
@@ -36,33 +31,82 @@ pub trait App {
     fn commit_upcall(&mut self, op_number: OpNumber) {}
 }
 
-/// Common configuration shared by matrix binary and control plane binary.
-///
-// I guess there is no better place to put sharing pieces so it has to be here
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct MatrixArgs {
-    pub instance_id: String,
-    pub config: Config,
-    pub protocol: MatrixProtocol,
-    pub replica_id: ReplicaId,
-    pub host: String,
-    pub num_worker: usize,
-    pub num_client: u32,
-}
+pub mod bin {
+    use std::net::Ipv4Addr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MatrixProtocol {
-    Unknown,
-    UnreplicatedReplica,
-    UnreplicatedClient,
-    ZyzzyvaReplica { enable_batching: bool },
-    ZyzzyvaClient { assume_byz: bool },
-    NeoReplica { variant: MulticastVariant },
-    NeoClient,
-}
+    use serde::{Deserialize, Serialize};
 
-impl Default for MatrixProtocol {
-    fn default() -> Self {
-        Self::Unknown
+    use crate::{
+        meta::{Config, ReplicaId},
+        transport::MulticastVariant,
+    };
+
+    /// Common configuration shared by matrix binary and control plane binary.
+    ///
+    // I guess there is no better place to put sharing pieces so it has to be here
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+    pub struct MatrixArgs {
+        pub instance_id: String,
+        pub config: Config,
+        pub protocol: MatrixProtocol,
+        pub replica_id: ReplicaId,
+        pub host: String,
+        pub num_worker: usize,
+        pub num_client: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum MatrixProtocol {
+        Unknown,
+        UnreplicatedReplica,
+        UnreplicatedClient,
+        ZyzzyvaReplica { enable_batching: bool },
+        ZyzzyvaClient { assume_byz: bool },
+        NeoReplica { variant: MulticastVariant },
+        NeoClient,
+    }
+
+    impl Default for MatrixProtocol {
+        fn default() -> Self {
+            Self::Unknown
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct Spec {
+        pub task: Task,
+        pub replica: Vec<Node>,
+        pub client: Vec<Node>,
+        pub multicast: SpecMulticast,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub struct Task {
+        pub mode: String,
+        #[serde(default)]
+        pub f: usize,
+        pub assume_byz: bool,
+        pub num_worker: usize,
+        pub num_client: u32,
+        pub batching: bool,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub struct Node {
+        pub control_user: String,
+        pub control_host: String,
+        pub ip: Ipv4Addr,
+        pub link: String,
+        #[serde(default)]
+        pub link_speed: String,
+        pub dev_port: u8,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct SpecMulticast {
+        pub ip: Ipv4Addr,
+        pub variant: MulticastVariant,
     }
 }

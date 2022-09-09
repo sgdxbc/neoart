@@ -41,16 +41,15 @@ control SwitchIngress(
         size = 1;
     }
 
-    bit<32> code;
     bit<32> sequence_number;
 
     Register<bit<32>, _>(1, 0) sequence;
     RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
         void apply(inout bit<32> reg, out bit<32> result) {
-            if (code == 0) {
-                reg = reg + 1;
-            } else {
+            if (md.type == META_TYPE_CONTROL_RESET) {
                 reg = 0;
+            } else {
+                reg = reg + 1;
             }
             result = reg;
         }
@@ -61,8 +60,8 @@ control SwitchIngress(
         hdr.udp.dst_port = port;
         hdr.neo.sequence = sequence_number;
         // TODO signature
-        bit<8> n1 = (bit<8>)hdr.neo.sequence;
-        bit<8> n2 = (bit<8>)hdr.neo.sequence + 1;
+        bit<8> n1 = (bit<8>) hdr.neo.sequence;
+        bit<8> n2 = (bit<8>) hdr.neo.sequence + 1;
         hdr.neo.signature[7:0] = n1;
         hdr.neo.signature[15:8] = n2;
         hdr.neo.hash = 0;
@@ -76,26 +75,21 @@ control SwitchIngress(
     apply {
         // No need for egress processing, skip it and use empty controls for egress.
         ig_tm_md.bypass_egress = 1w1;
- 
-        if (!hdr.neo.isValid()) {
-            if (hdr.ethernet.ether_type == ETHERTYPE_ARP) {
-                send_to_endpoints.apply(); // a little bit wild here
-            } else if (hdr.ipv4.protocol == IP_PROTOCOLS_UDP) {
-                dmac.apply();
-            } else {
-                drop();
-            }
-            exit;
-        }
-        
-        code = hdr.neo.sequence;
-        sequence_number = assign_sequence.execute(0);
-        if (code != 0) {
+
+        if (md.type == META_TYPE_UNICAST) { 
+            dmac.apply(); 
+        } else if (md.type == META_TYPE_ARP) { 
+            send_to_endpoints.apply(); // careful...
+        } else if (md.type == META_TYPE_MULTICAST) {
+            sequence_number = assign_sequence.execute(0);
+            neo.apply();
+            send_to_replicas.apply();
+        } else if (md.type == META_TYPE_CONTROL_RESET) {
+            assign_sequence.execute(0);
             drop();
-            exit;
+        } else { 
+            drop(); 
         }
-        neo.apply();
-        send_to_replicas.apply();
     }
 }
 

@@ -363,7 +363,7 @@ struct LogEntry {
 }
 
 impl Replica {
-    const BATCH_SIZE: usize = 10; // is there a way to do adaptive batching?
+    const BATCH_SIZE: usize = 90; // is there a way to do adaptive batching?
 
     pub fn new(
         transport: Transport<Self>,

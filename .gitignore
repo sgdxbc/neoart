@@ -2,4 +2,4 @@
 /Cargo.lock
 
 /spec.toml
-/sw/*.py
+/src-sw/*.py

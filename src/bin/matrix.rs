@@ -12,14 +12,16 @@ use std::{
 
 use bincode::Options;
 use neoart::{
+    bin::{MatrixArgs, MatrixProtocol},
     crypto::{CryptoMessage, Executor},
     latency::{
         merge_latency_into, push_latency, Latency,
         Point::{RequestBegin, RequestEnd},
     },
     meta::{OpNumber, ARGS_SERVER_PORT},
+    neo,
     transport::{Node, Run, Socket, Transport},
-    unreplicated, zyzzyva, App, Client, MatrixArgs, MatrixProtocol,
+    unreplicated, zyzzyva, App, Client,
 };
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -92,6 +94,16 @@ fn main() {
                 })
                 .await
             }
+            MatrixProtocol::NeoReplica { variant } => {
+                let socket = UdpSocket::bind(args.config.multicast).await.unwrap();
+                let replica_id = args.replica_id;
+                run_replica(args, executor, |mut transport| {
+                    transport.listen_multicast(Socket::Os(socket), variant);
+                    neo::Replica::new(transport, replica_id, Null)
+                })
+                .await
+            }
+            MatrixProtocol::NeoClient => run_client(args, neo::Client::new).await,
             _ => unreachable!(),
         }
     });
@@ -123,16 +135,10 @@ async fn run_replica<T>(
         .unwrap();
     socket.set_broadcast(true).unwrap();
     socket.writable().await.unwrap();
-
-    let multicast = args.config.multicast;
-    let mut transport = Transport::new(args.config, Socket::Os(socket), executor);
-    if let MatrixProtocol::NeoReplica { variant, .. } = args.protocol {
-        let socket = UdpSocket::bind(multicast).await.unwrap();
-        transport.listen_multicast(Socket::Os(socket), variant);
-    }
-
-    let mut replica = new_replica(transport);
-    replica.run(async { ctrl_c().await.unwrap() }).await;
+    let transport = Transport::new(args.config, Socket::Os(socket), executor);
+    new_replica(transport)
+        .run(async { ctrl_c().await.unwrap() })
+        .await;
 }
 
 async fn run_client<T>(
