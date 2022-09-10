@@ -32,6 +32,8 @@ use tokio::{
     net::UdpSocket, pin, runtime, select, signal::ctrl_c, spawn, sync::Notify, time::sleep,
 };
 
+// OVERENGINEERING... bypass command line arguments by setting up a server...
+// i learned nothing but these bad practice from SDE :|
 fn accept_args() -> MatrixArgs {
     let server = TcpListener::bind((
         args().nth(1).as_deref().unwrap_or("0.0.0.0"),

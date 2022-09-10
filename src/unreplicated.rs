@@ -213,7 +213,7 @@ impl Node for Replica {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::timeout;
+    use tokio::{task::yield_now, time::timeout};
 
     use crate::{
         common::TestApp,
@@ -247,6 +247,7 @@ mod tests {
         ));
 
         let net = Concurrent::run(net);
+        yield_now().await;
         let replica = Concurrent::run(replica);
         let result = client.invoke("hello".as_bytes());
         timeout(

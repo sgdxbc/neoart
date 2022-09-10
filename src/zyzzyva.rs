@@ -363,7 +363,11 @@ struct LogEntry {
 }
 
 impl Replica {
-    const BATCH_SIZE: usize = 20; // is there a way to do adaptive batching?
+    // batch size 80 cause OrderReq to exceed 1472 bytes and cannot fit in one
+    // packet
+    // in benchmark seems like up to 90-batch is safe but test cases has
+    // non-zero sized op
+    const BATCH_SIZE: usize = 70; // is there a way to do adaptive batching?
 
     pub fn new(
         transport: Transport<Self>,
@@ -635,7 +639,7 @@ mod tests {
 
     use tokio::{
         spawn,
-        task::JoinHandle,
+        task::{yield_now, JoinHandle},
         time::{sleep, timeout},
     };
 
@@ -655,7 +659,7 @@ mod tests {
     }
 
     impl System {
-        fn new(num_client: usize, assume_byz: bool, enable_batching: bool) -> Self {
+        async fn new(num_client: usize, assume_byz: bool, enable_batching: bool) -> Self {
             let config = Network::config(4, 1);
             let mut net = Network::default();
             let clients = (0..num_client)
@@ -686,17 +690,19 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            Self {
+            let system = Self {
                 net: Concurrent::run(net),
                 replicas,
                 clients,
-            }
+            };
+            yield_now().await;
+            system
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn single_op() {
-        let mut system = System::new(1, false, false);
+        let mut system = System::new(1, false, false).await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
             Duration::from_millis(30),
@@ -736,7 +742,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop() {
         let num_client = 10;
-        let mut system = System::new(num_client, false, false);
+        let mut system = System::new(num_client, false, false).await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
         }
@@ -754,7 +760,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_op_byzantine() {
-        let mut system = System::new(1, true, false);
+        let mut system = System::new(1, true, false).await;
         let _byz_replica = system.replicas.remove(3).join().await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
@@ -775,7 +781,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop_byzantine() {
         let num_client = 10;
-        let mut system = System::new(num_client, true, false);
+        let mut system = System::new(num_client, true, false).await;
         let _byz_replica = system.replicas.remove(3).join().await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
@@ -795,18 +801,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop_batching() {
         let num_client = Replica::BATCH_SIZE * 4;
-        let mut system = System::new(num_client, false, true);
+        let mut system = System::new(num_client, false, true).await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
         }
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1) - Duration::from_millis(1)).await;
         let primary_len = system.replicas.remove(0).join().await.log.len();
         assert!(primary_len >= 1000 / 30 * (num_client / Replica::BATCH_SIZE));
         for replica in system.replicas {
             let backup_len = replica.join().await.log.len();
             // stronger assertions?
             assert!(backup_len <= primary_len);
-            assert!(backup_len >= primary_len - num_client);
+            assert!(backup_len >= primary_len - num_client / Replica::BATCH_SIZE);
         }
         system.net.join().await;
     }

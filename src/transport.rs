@@ -257,7 +257,13 @@ impl<T: Node> Transport<T> {
                 event: Box::new(|_| unreachable!("you forget to shutdown benchmark for an hour")),
             },
         );
-        let (crypto_sender, crypto_channel) = mpsc::channel(64);
+        let (crypto_sender, crypto_channel) = mpsc::channel(match executor {
+            // according to maximum number of concurrent submitted tasks
+            // because those tasks may be done instantly by magic
+            Executor::Inline => 1024,
+            // according to maximum number of worker threads
+            Executor::Rayon(_) => 64,
+        });
         Self {
             crypto: Crypto::new(config.clone(), crypto_sender, executor),
             config,
@@ -307,7 +313,7 @@ impl<T: Node> Transport<T> {
     where
         T::Message: Serialize,
     {
-        let mut buf = [0; 1400];
+        let mut buf = [0; 1472];
         let message_offset = if destination == Destination::ToMulticast {
             100 // 4 bytes sequence, up to 64 bytes signature, 32 bytes hash
         } else {
@@ -429,8 +435,8 @@ where
 {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
-        let mut buf = [0; 1400];
-        let mut multicast_buf = [0; 1400];
+        let mut buf = [0; 1472];
+        let mut multicast_buf = [0; 1472];
         loop {
             let transport = self.as_mut();
             let (&id, timer) = transport
@@ -564,6 +570,9 @@ pub mod simulated {
 
     impl Socket {
         pub fn send_to(&self, destination: SocketAddr, buf: &[u8]) {
+            if !self.is_running.load(SeqCst) {
+                return;
+            }
             let result = self.network.try_send(Packet {
                 source: self.addr,
                 destination,
@@ -581,7 +590,11 @@ pub mod simulated {
     impl Default for BasicSwitch {
         fn default() -> Self {
             Self {
-                send_channel: mpsc::channel(64),
+                // this has to not be less than maximum possible number of
+                // concurrent messages
+                // currently setting it according to evaluating system's NIC
+                // queue size (same below)
+                send_channel: mpsc::channel(1024),
                 inboxes: HashMap::new(),
                 multicast_listeners: HashMap::new(),
                 epoch: Instant::now(),
@@ -592,8 +605,10 @@ pub mod simulated {
 
     impl BasicSwitch {
         fn insert_socket(&mut self, addr: SocketAddr) -> super::Socket {
-            let (unicast_sender, unicast) = mpsc::channel(64);
-            let (multicast_sender, multicast) = mpsc::channel(64);
+            // these have to not be less than maximum possible number of
+            // concurrent messages received by node at `addr`
+            let (unicast_sender, unicast) = mpsc::channel(1024);
+            let (multicast_sender, multicast) = mpsc::channel(1024);
             self.inboxes.insert(
                 addr,
                 Inbox {
@@ -665,6 +680,12 @@ pub mod simulated {
         async fn run(&mut self, close: impl Future<Output = ()> + Send) {
             let Self(switch) = self;
             pin!(close);
+            // we maintain a `is_running` flag to early stop simulated network
+            // currently `is_running` is negated when any message is failed to
+            // deliver from node to network (in case network crashed) or from
+            // network to node (in case node crashed)
+            // a cleaner approach may be monitor directly on the liveness of
+            // nodes and network, maybe try it later
             switch.as_mut().is_running.store(true, SeqCst);
             while switch.as_mut().is_running.load(SeqCst) {
                 select! {
@@ -692,7 +713,7 @@ pub mod simulated {
                 if !is_running.load(SeqCst) {
                     return;
                 }
-                if var("NEO_NETLOG").unwrap_or(String::from("0")) != "0" {
+                if var("NEO_NETLOG").as_deref().unwrap_or("0") != "0" {
                     println!(
                         "* [{:6?}] [{} -> {}] message length {} {}",
                         Instant::now() - epoch,
@@ -708,15 +729,6 @@ pub mod simulated {
                 }
                 if inbox.send((message.source, message.buffer)).await.is_err() {
                     println!("! send failed and abort simulation");
-                    // the simulation will end as soon as the first attempt of
-                    // sending message into a crashed receiver i.e. the coroutine
-                    // thread running it
-                    // (it will also end if receiver fail to transmit to network,
-                    // but that should not be possible as long as network is
-                    // correctly implementated)
-                    // this may not be as good as end the simulation as soon as any
-                    // receiver crashes, by monitor the liveness of threads, but it
-                    // should be mostly the same
                     is_running.store(false, SeqCst);
                 }
             });

@@ -708,7 +708,7 @@ where
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::timeout;
+    use tokio::{task::yield_now, time::timeout};
 
     use crate::{
         common::TestApp,
@@ -732,7 +732,7 @@ mod tests {
     }
 
     impl System {
-        fn new(num_client: usize) -> Self {
+        async fn new(num_client: usize) -> Self {
             let config = Network::config(4, 1);
             let mut net = Network(Switch {
                 sequence_number: 0,
@@ -762,17 +762,19 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            Self {
+            let system = Self {
                 net: Concurrent::run(net),
                 replicas,
                 clients,
-            }
+            };
+            yield_now().await;
+            system
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn single_op() {
-        let mut system = System::new(1);
+        let mut system = System::new(1).await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
             Duration::from_millis(40),

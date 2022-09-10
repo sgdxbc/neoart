@@ -12,12 +12,12 @@ as the desired evaluation run.
 
 Then:
 ```
-$ cargo run --bin spec_sw && rsync -a src-sw <switch location>
+$ cargo run --bin spec_sw
 ```
+and transfer `src-sw` to switch.
 
-Then on switch compile, install and run data plane program. Configure the 
-program using the script with same name, through 
-`$SDE/run_bfshell.sh -p <script>`.
+On switch compile, install and run data plane program. Configure the program 
+using the script with same name, through `$SDE/run_bfshell.sh -b <script>`.
 
 Back to project directory:
 ```
