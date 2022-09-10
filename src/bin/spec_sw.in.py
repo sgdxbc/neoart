@@ -6,8 +6,8 @@ DMAC = "@@DMAC@@"
 PORT = "@@PORT@@"
 PRE_MGID = "@@PRE_MGID@@"
 PRE_NODE = "@@PRE_NODE@@"
-ENDPOINT_GROUP = "@@ENDPOINT_GROUP@@"
-REPLICA_GROUP = "@@REPLICA_GROUP@@"
+GROUP_ENDPOINT = "@@GROUP_ENDPOINT@@"
+GROUP_REPLICA = "@@GROUP_REPLICA@@"
 
 if 0: # small hack to suppress IDE warning
     bfrt = ...
@@ -41,8 +41,8 @@ for node_id, rid, ports in PRE_NODE:
     bfrt.pre.node.add(node_id, rid, [], ports)
 for group_id, nodes in PRE_MGID:
     bfrt.pre.mgid.add(group_id, nodes, [0] * len(nodes), [0] * len(nodes))
-PROGRAM.pipe.SwitchIngress.send_to_endpoints.set_default_with_send_to_group(mgid=ENDPOINT_GROUP)
-PROGRAM.pipe.SwitchIngress.send_to_replicas.set_default_with_send_to_group(mgid=REPLICA_GROUP)
+PROGRAM.pipe.SwitchIngress.send_to_endpoints.set_default_with_send_to_group(mgid=GROUP_ENDPOINT)
+PROGRAM.pipe.SwitchIngress.send_to_replicas.set_default_with_send_to_group(mgid=GROUP_REPLICA)
 
 PROGRAM.pipe.SwitchIngressParser.neo_port.add(MULTICAST_PORT)
 PROGRAM.pipe.SwitchIngressParser.neo_control_reset_port.add(MULTICAST_CONTROL_RESET_PORT)

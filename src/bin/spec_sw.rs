@@ -33,17 +33,17 @@ fn rewrite_sw(spec: Spec, simulate: bool) -> String {
         port.push((node.dev_port, node.link_speed));
         endpoints.push(node.dev_port);
     }
-    const ENDPOINT_GROUP: u16 = 1;
-    const REPLICA_GROUP: u16 = 2;
-    const ENDPOINT_NODE: u16 = 1;
-    const REPLICA_NODE: u16 = 2;
-    let pre_node = [(ENDPOINT_NODE, endpoints), (REPLICA_NODE, replicas)]
+    const GROUP_ENDPOINT: u16 = 1;
+    const GROUP_REPLICA: u16 = 2;
+    const NODE_ENDPOINT: u16 = 1;
+    const NODE_REPLICA: u16 = 2;
+    let pre_node = [(NODE_ENDPOINT, endpoints), (NODE_REPLICA, replicas)]
         .into_iter()
         .map(|(group_id, ports)| (group_id, 0xffff, ports))
         .collect::<Vec<_>>();
     let pre_mgid = [
-        (ENDPOINT_GROUP, vec![ENDPOINT_NODE]),
-        (REPLICA_GROUP, vec![REPLICA_NODE]),
+        (GROUP_ENDPOINT, vec![NODE_ENDPOINT]),
+        (GROUP_REPLICA, vec![NODE_REPLICA]),
     ];
 
     let sw = include_str!("spec_sw.in.py");
@@ -56,8 +56,8 @@ fn rewrite_sw(spec: Spec, simulate: bool) -> String {
         )
         .replace(r#""@@DMAC@@""#, &format!("{dmac:?}"))
         .replace(r#""@@PORT@@""#, &format!("{port:?}"))
-        .replace(r#""@@ENDPOINT_GROUP@@""#, &ENDPOINT_GROUP.to_string())
-        .replace(r#""@@REPLICA_GROUP@@""#, &REPLICA_GROUP.to_string())
+        .replace(r#""@@GROUP_ENDPOINT@@""#, &GROUP_ENDPOINT.to_string())
+        .replace(r#""@@GROUP_REPLICA@@""#, &GROUP_REPLICA.to_string())
         .replace(r#""@@PRE_NODE@@""#, &format!("{pre_node:?}"))
         .replace(r#""@@PRE_MGID@@""#, &format!("{pre_mgid:?}"))
 }

@@ -235,13 +235,13 @@ struct header_t {
 }
 
 struct metadata_t {
-    bit<4> type;
+    bit<3> code;
 }
-const bit<4> META_TYPE_NONE = 0;
-const bit<4> META_TYPE_ARP = 1;
-const bit<4> META_TYPE_UNICAST = 2;
-const bit<4> META_TYPE_MULTICAST = 3;
-const bit<4> META_TYPE_CONTROL_RESET = 4;
+const bit<3> META_CODE_NONE = 0;
+const bit<3> META_CODE_UNICAST = 1;
+const bit<3> META_CODE_MULTICAST = 2;
+const bit<3> META_CODE_ARP = 3;
+const bit<3> META_CODE_CONTROL_RESET = 4;
 
 parser SwitchIngressParser(
         packet_in pkt,
@@ -255,7 +255,7 @@ parser SwitchIngressParser(
 
     state start {
         tofino_parser.apply(pkt, ig_intr_md);
-        ig_md.type = META_TYPE_NONE;
+        ig_md.code = META_CODE_NONE;
         transition parse_ethernet;
     }
 
@@ -270,7 +270,7 @@ parser SwitchIngressParser(
 
     state parse_arp {
         // extract ARP header
-        ig_md.type = META_TYPE_ARP;
+        ig_md.code = META_CODE_ARP;
         transition accept;
     }
 
@@ -284,22 +284,26 @@ parser SwitchIngressParser(
 
     state parse_udp {
         pkt.extract(hdr.udp);
-        ig_md.type = META_TYPE_UNICAST;
         transition select (hdr.udp.dst_port) {
             neo_port: parse_neo;
             neo_control_reset_port: parse_neo_control_reset;
-            default: accept;
+            default: accept_unicast;
         }
+    }
+
+    state accept_unicast {
+        ig_md.code = META_CODE_UNICAST;
+        transition accept;
     }
 
     state parse_neo {
         pkt.extract(hdr.neo);
-        ig_md.type = META_TYPE_MULTICAST;
+        ig_md.code = META_CODE_MULTICAST;
         transition accept;
     }
 
     state parse_neo_control_reset {
-        ig_md.type = META_TYPE_CONTROL_RESET;
+        ig_md.code = META_CODE_CONTROL_RESET;
         transition accept;
     }
 }

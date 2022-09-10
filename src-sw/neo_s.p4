@@ -1,5 +1,9 @@
 // NeoBFT switch program, signing mode
 #include "common.p4"
+// workaround for `p4_build.sh` script. the header seems to be renamed as
+// `tofino1_arch.p4` now
+#include "tofino1arch.p4"
+#include "tofino2arch.p4"
 
 control SwitchIngress(
         inout header_t hdr,
@@ -46,12 +50,13 @@ control SwitchIngress(
     Register<bit<32>, _>(1, 0) sequence;
     RegisterAction<bit<32>, _, bit<32>>(sequence) assign_sequence = {
         void apply(inout bit<32> reg, out bit<32> result) {
-            if (md.type == META_TYPE_CONTROL_RESET) {
+            if (md.code == META_CODE_CONTROL_RESET) {
                 reg = 0;
+                result = 0;
             } else {
                 reg = reg + 1;
+                result = reg;
             }
-            result = reg;
         }
     };
 
@@ -76,15 +81,15 @@ control SwitchIngress(
         // No need for egress processing, skip it and use empty controls for egress.
         ig_tm_md.bypass_egress = 1w1;
 
-        if (md.type == META_TYPE_UNICAST) { 
+        if (md.code == META_CODE_UNICAST) { 
             dmac.apply(); 
-        } else if (md.type == META_TYPE_ARP) { 
+        } else if (md.code == META_CODE_ARP) { 
             send_to_endpoints.apply(); // careful...
-        } else if (md.type == META_TYPE_MULTICAST) {
+        } else if (md.code == META_CODE_MULTICAST) {
             sequence_number = assign_sequence.execute(0);
             neo.apply();
             send_to_replicas.apply();
-        } else if (md.type == META_TYPE_CONTROL_RESET) {
+        } else if (md.code == META_CODE_CONTROL_RESET) {
             assign_sequence.execute(0);
             drop();
         } else { 
