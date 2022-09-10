@@ -20,7 +20,7 @@ use neoart::{
     },
     meta::{OpNumber, ARGS_SERVER_PORT},
     neo,
-    transport::{Node, Run, Socket, Transport},
+    transport::{MulticastListener, Node, Run, Socket, Transport},
     unreplicated, zyzzyva, App, Client,
 };
 use nix::{
@@ -94,12 +94,15 @@ fn main() {
                 })
                 .await
             }
-            MatrixProtocol::NeoReplica { variant } => {
+            MatrixProtocol::NeoReplica {
+                variant,
+                enable_vote,
+            } => {
                 let socket = UdpSocket::bind(args.config.multicast).await.unwrap();
                 let replica_id = args.replica_id;
                 run_replica(args, executor, |mut transport| {
-                    transport.listen_multicast(Socket::Os(socket), variant);
-                    neo::Replica::new(transport, replica_id, Null)
+                    transport.listen_multicast(MulticastListener::Os(socket), variant);
+                    neo::Replica::new(transport, replica_id, Null, enable_vote)
                 })
                 .await
             }

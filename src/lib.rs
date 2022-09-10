@@ -60,9 +60,16 @@ pub mod bin {
         Unknown,
         UnreplicatedReplica,
         UnreplicatedClient,
-        ZyzzyvaReplica { enable_batching: bool },
-        ZyzzyvaClient { assume_byz: bool },
-        NeoReplica { variant: MulticastVariant },
+        ZyzzyvaReplica {
+            enable_batching: bool,
+        },
+        ZyzzyvaClient {
+            assume_byz: bool,
+        },
+        NeoReplica {
+            variant: MulticastVariant,
+            enable_vote: bool,
+        },
         NeoClient,
     }
 
@@ -86,10 +93,15 @@ pub mod bin {
         pub mode: String,
         #[serde(default)]
         pub f: usize,
+        #[serde(default)]
         pub assume_byz: bool,
+        #[serde(default)]
         pub num_worker: usize,
         pub num_client: u32,
+        #[serde(default)]
         pub batching: bool,
+        #[serde(default)]
+        pub enable_batching: bool,
     }
 
     #[derive(Debug, Clone, Deserialize)]

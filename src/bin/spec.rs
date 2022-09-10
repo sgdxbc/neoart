@@ -213,6 +213,7 @@ fn replica_args(spec: Spec, index: usize) -> MatrixArgs {
             },
             "neo" => MatrixProtocol::NeoReplica {
                 variant: HalfSipHash,
+                enable_vote: spec.task.enable_batching,
             },
             _ => panic!(),
         },

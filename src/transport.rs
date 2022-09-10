@@ -192,7 +192,7 @@ pub struct Transport<T: Node> {
     crypto: Crypto<T::Message>,
     crypto_channel: mpsc::Receiver<CryptoEvent<T::Message>>,
     socket: Socket,
-    multicast_socket: Socket,
+    multicast_listener: MulticastListener,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
     send_signed: Vec<Destination>,
@@ -223,10 +223,15 @@ type Event<T> = Box<dyn FnOnce(&mut T) + Send>;
 
 #[derive(Debug)]
 pub enum Socket {
-    Null,
-    Os(UdpSocket), // both unicast and multicast
+    Os(UdpSocket),
     Simulated(simulated::Socket),
-    SimulatedMulticast(mpsc::Receiver<simulated::Message>),
+}
+
+#[derive(Debug)]
+pub enum MulticastListener {
+    Null,
+    Os(UdpSocket),
+    Simulated(mpsc::Receiver<simulated::Message>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,24 +263,26 @@ impl<T: Node> Transport<T> {
             config,
             crypto_channel,
             socket,
-            multicast_socket: Socket::Null,
+            multicast_listener: MulticastListener::Null,
             timer_table,
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
         }
     }
 
-    pub fn listen_multicast(&mut self, socket: Socket, variant: MulticastVariant) {
+    pub fn listen_multicast(&mut self, listener: MulticastListener, variant: MulticastVariant) {
         assert!(
-            matches!((&socket, &self.socket), (Socket::Os(_), Socket::Os(_)))
-                || matches!(
-                    (&socket, &self.socket),
-                    (Socket::SimulatedMulticast(_), Socket::Simulated(_))
-                )
+            matches!(
+                (&listener, &self.socket),
+                (MulticastListener::Os(_), Socket::Os(_))
+            ) || matches!(
+                (&listener, &self.socket),
+                (MulticastListener::Simulated(_), Socket::Simulated(_))
+            )
         );
 
         assert_eq!(variant, MulticastVariant::HalfSipHash);
-        self.multicast_socket = socket;
+        self.multicast_listener = listener;
     }
 
     pub fn multicast_variant(&self) -> MulticastVariant {
@@ -289,7 +296,6 @@ impl<T: Node> Transport<T> {
 
     fn send_message_internal(socket: &Socket, destination: SocketAddr, buf: &[u8]) {
         match socket {
-            Socket::Null | Socket::SimulatedMulticast(_) => unreachable!(),
             Socket::Os(socket) => {
                 socket.try_send_to(buf, destination).unwrap();
             }
@@ -384,9 +390,8 @@ impl<T: Node> Transport<T> {
 impl Socket {
     async fn receive_from(&mut self, buf: &mut [u8]) -> (usize, SocketAddr) {
         match self {
-            Self::Null => pending().await,
             Self::Os(socket) => socket.recv_from(buf).await.unwrap(),
-            Self::Simulated(simulated::Socket { inbox, .. }) | Self::SimulatedMulticast(inbox) => {
+            Self::Simulated(simulated::Socket { inbox, .. }) => {
                 let (remote, message) = inbox.recv().await.unwrap();
                 buf[..message.len()].copy_from_slice(&message);
                 (message.len(), remote)
@@ -396,9 +401,22 @@ impl Socket {
 
     fn local_address(&self) -> SocketAddr {
         match self {
-            Socket::Null | Socket::SimulatedMulticast(_) => unreachable!(),
             Socket::Os(socket) => socket.local_addr().unwrap(),
             Socket::Simulated(simulated::Socket { addr, .. }) => *addr,
+        }
+    }
+}
+
+impl MulticastListener {
+    async fn receive_from(&mut self, buf: &mut [u8]) -> (usize, SocketAddr) {
+        match self {
+            Self::Null => pending().await,
+            Self::Os(socket) => socket.recv_from(buf).await.unwrap(),
+            Self::Simulated(inbox) => {
+                let (remote, message) = inbox.recv().await.unwrap();
+                buf[..message.len()].copy_from_slice(&message);
+                (message.len(), remote)
+            }
         }
     }
 }
@@ -421,6 +439,7 @@ where
                 .min_by_key(|(_, timer)| timer.sleep.deadline())
                 .unwrap();
             select! {
+                biased;
                 _ = &mut close => return,
                 _ = timer.sleep.as_mut() => {
                     let timer = self.as_mut().timer_table.remove(&id).unwrap();
@@ -432,7 +451,7 @@ where
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
                     handle_raw_message(self, remote, InboundPacket::new_unicast(&buf[..len]));
                 }
-                (len, remote) = transport.multicast_socket.receive_from(&mut multicast_buf) => {
+                (len, remote) = transport.multicast_listener.receive_from(&mut multicast_buf) => {
                     handle_raw_message(
                         self,
                         remote,
@@ -491,6 +510,7 @@ where
 pub mod simulated {
     use std::{
         collections::HashMap,
+        env::var,
         future::Future,
         net::SocketAddr,
         sync::{
@@ -509,6 +529,8 @@ pub mod simulated {
     };
 
     use crate::meta::{Config, MULTICAST_PORT, REPLICA_PORT};
+
+    use super::MulticastListener;
 
     pub struct BasicSwitch {
         send_channel: (mpsc::Sender<Packet>, mpsc::Receiver<Packet>),
@@ -588,8 +610,8 @@ pub mod simulated {
             })
         }
 
-        fn multicast_socket(&mut self, addr: SocketAddr) -> super::Socket {
-            super::Socket::SimulatedMulticast(self.multicast_listeners.remove(&addr).unwrap())
+        fn multicast_listener(&mut self, addr: SocketAddr) -> MulticastListener {
+            MulticastListener::Simulated(self.multicast_listeners.remove(&addr).unwrap())
         }
     }
 
@@ -623,11 +645,11 @@ pub mod simulated {
             self.0.as_mut().insert_socket(addr)
         }
 
-        pub fn multicast_socket(&mut self, addr: SocketAddr) -> super::Socket
+        pub fn multicast_listener(&mut self, addr: SocketAddr) -> MulticastListener
         where
             T: AsMut<BasicSwitch>,
         {
-            self.0.as_mut().multicast_socket(addr)
+            self.0.as_mut().multicast_listener(addr)
         }
     }
 
@@ -670,18 +692,20 @@ pub mod simulated {
                 if !is_running.load(SeqCst) {
                     return;
                 }
-                println!(
-                    "* [{:6?}] [{} -> {}] message length {} {}",
-                    Instant::now() - epoch,
-                    message.source,
-                    message.destination,
-                    message.buffer.len(),
-                    if message.multicast_outgress {
-                        "(multicast)"
-                    } else {
-                        ""
-                    }
-                );
+                if var("NEO_NETLOG").unwrap_or(String::from("0")) != "0" {
+                    println!(
+                        "* [{:6?}] [{} -> {}] message length {} {}",
+                        Instant::now() - epoch,
+                        message.source,
+                        message.destination,
+                        message.buffer.len(),
+                        if message.multicast_outgress {
+                            "(multicast)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 if inbox.send((message.source, message.buffer)).await.is_err() {
                     println!("! send failed and abort simulation");
                     // the simulation will end as soon as the first attempt of

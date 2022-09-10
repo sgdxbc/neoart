@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    env::var,
     future::Future,
     mem::replace,
     pin::Pin,
@@ -305,6 +306,8 @@ pub struct Replica {
     link_hash: [u8; 32],
     // TODO slow verify buffer
     vote_buffer: Vec<OrderedRequest>, // verified and yet to be voted
+
+    enable_vote: bool,
     vote_quorums: HashMap<(u32, Digest), HashMap<ReplicaId, Signature>>,
     vote_number: u32, // outstanding voting batch is speculative_number..=vote_number
     speculative_number: u32,
@@ -321,6 +324,7 @@ impl Replica {
         mut transport: Transport<Self>,
         id: ReplicaId,
         app: impl App + Send + 'static,
+        enable_vote: bool,
     ) -> Self {
         // TODO consider avoid side effect in constructor by adding a dedicated
         // initialization method
@@ -343,9 +347,10 @@ impl Replica {
             reorder_ordered_request: Reorder::new(1),
             fast_verify: Vec::new(),
             link_hash: Default::default(),
+            enable_vote,
             vote_buffer: Vec::new(),
             vote_quorums: HashMap::new(),
-            vote_number: 0,
+            vote_number: if enable_vote { 0 } else { u32::MAX },
             speculative_number: 0,
         }
     }
@@ -452,11 +457,17 @@ impl Replica {
         // assert every buffered message in `fast_verify` has lower sequence
         // number
         self.vote_buffer.append(&mut self.fast_verify);
+        let sequence_number = request.sequence_number;
         self.vote_buffer.push(request);
         assert_eq!(
             self.vote_buffer[0].sequence_number,
             self.speculative_number + 1
         );
+        if !self.enable_vote {
+            // TODO bypass vote buffer
+            self.speculative_number = sequence_number;
+            self.speculative_commit();
+        }
 
         // only trigger a new voting round if there is no outstanding voting
         if self.id == self.transport.config.primary(self.view_number)
@@ -497,6 +508,7 @@ impl Replica {
 
     fn handle_multicast_vote(&mut self, message: MulticastVote) {
         // TODO assert is primary
+        assert!(self.enable_vote);
 
         if message.sequence_number != self.vote_number {
             return;
@@ -578,6 +590,7 @@ impl Replica {
     }
 
     fn handle_multicast_generic(&mut self, message: MulticastGeneric) {
+        assert!(self.enable_vote);
         if message.sequence_number > self.speculative_number {
             // TODO check local digest match certificate
             self.speculative_number = message.sequence_number;
@@ -592,6 +605,7 @@ impl Replica {
     }
 
     fn send_vote(&mut self) {
+        assert!(self.enable_vote);
         assert_ne!(self.vote_number, self.speculative_number);
         let batch_size = (self.vote_number - self.speculative_number) as usize;
         if self.vote_buffer.len() < batch_size {
@@ -661,12 +675,14 @@ where
 
         self.sequence_number += 1;
         let n = self.sequence_number;
-        println!(
-            "* [{:6?}] [{} -> <multicast>] sequence {n} message length {}",
-            Instant::now() - self.underlying.as_ref().epoch,
-            packet.source,
-            packet.buffer[100..].len()
-        );
+        if var("NEO_NETLOG").unwrap_or(String::from("0")) != "0" {
+            println!(
+                "* [{:6?}] [{} -> <multicast>] sequence {n} message length {}",
+                Instant::now() - self.underlying.as_ref().epoch,
+                packet.source,
+                packet.buffer[100..].len()
+            );
+        }
         packet.buffer[0..4].copy_from_slice(&n.to_be_bytes()[..]);
         // this is synchronized with switch program
         packet.buffer[7] = (n & 0xff) as u8;
@@ -740,8 +756,8 @@ mod tests {
                         Executor::Inline,
                     );
                     transport
-                        .listen_multicast(net.multicast_socket(config.replicas[i]), HalfSipHash);
-                    let replica = Replica::new(transport, i as ReplicaId, TestApp::default());
+                        .listen_multicast(net.multicast_listener(config.replicas[i]), HalfSipHash);
+                    let replica = Replica::new(transport, i as ReplicaId, TestApp::default(), true);
                     Concurrent::run(replica)
                 })
                 .collect::<Vec<_>>();
