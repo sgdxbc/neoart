@@ -58,10 +58,7 @@ fn main() {
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient => runtime::Builder::new_multi_thread()
             .enable_all()
-            .on_thread_stop({
-                let latency = latency.clone();
-                move || merge_latency_into(&mut latency.lock().unwrap())
-            })
+            .on_thread_stop(move || merge_latency_into(&mut latency.lock().unwrap()))
             .build()
             .unwrap(),
         _ => {

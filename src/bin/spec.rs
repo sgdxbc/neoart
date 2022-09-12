@@ -9,7 +9,6 @@ use bincode::Options;
 use neoart::{
     bin::{MatrixArgs, MatrixProtocol, Node, Spec},
     meta::{Config, ReplicaId, ARGS_SERVER_PORT, MULTICAST_PORT, REPLICA_PORT},
-    transport::MulticastVariant::HalfSipHash,
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use tokio::{
@@ -57,14 +56,18 @@ async fn main() {
             let node = node.clone();
             let instance_channel = instance_channel.0.clone();
             spawn(async move {
-                let matrix = up_node(node.clone(), format!("[{index}]")).await;
+                let matrix = up_node(&node, format!("[{index}]")).await;
                 sleep(Duration::from_secs(1)).await;
-                let args = replica_args(spec, index);
+                let args = replica_args(&spec, index);
                 instance_channel
-                    .send((node.clone(), args.instance_id.clone()))
+                    .send((
+                        node.control_user.clone(),
+                        node.control_host.clone(),
+                        args.instance_id.clone(),
+                    ))
                     .await
                     .unwrap();
-                configure_node(node.clone(), args).await;
+                configure_node(&node, &args).await;
                 matrix.await.unwrap();
             })
         })
@@ -79,14 +82,18 @@ async fn main() {
             let node = node.clone();
             let instance_channel = instance_channel.0.clone();
             spawn(async move {
-                let matrix = up_node(node.clone(), format!("[C]")).await;
+                let matrix = up_node(&node, String::from("[C]")).await;
                 sleep(Duration::from_secs(1)).await;
-                let args = client_args(spec, index);
+                let args = client_args(&spec, index);
                 instance_channel
-                    .send((node.clone(), args.instance_id.clone()))
+                    .send((
+                        node.control_user.clone(),
+                        node.control_host.clone(),
+                        args.instance_id.clone(),
+                    ))
                     .await
                     .unwrap();
-                configure_node(node.clone(), args).await;
+                configure_node(&node, &args).await;
                 matrix.await.unwrap();
             })
         })
@@ -100,15 +107,15 @@ async fn main() {
     }
     println!();
     instance_channel.1.close();
-    while let Some((node, instance_id)) = instance_channel.1.recv().await {
-        down_node(node, instance_id).await;
+    while let Some((user, host, instance_id)) = instance_channel.1.recv().await {
+        down_node(&user, &host, &instance_id).await;
     }
     for task in replica_tasks {
         task.await.unwrap();
     }
 }
 
-async fn up_node(node: Node, tag: String) -> JoinHandle<()> {
+async fn up_node(node: &Node, tag: String) -> JoinHandle<()> {
     let rsync = Command::new("rsync")
         .arg("target/release/matrix")
         .arg(format!(
@@ -157,9 +164,9 @@ async fn up_node(node: Node, tag: String) -> JoinHandle<()> {
     })
 }
 
-async fn down_node(node: Node, instance_id: String) {
+async fn down_node(user: &str, host: &str, instance_id: &str) {
     Command::new("ssh")
-        .arg(format!("{}@{}", node.control_user, node.control_host))
+        .arg(format!("{user}@{host}"))
         .arg(format!("kill -INT $(cat pid.{instance_id})"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -170,9 +177,9 @@ async fn down_node(node: Node, instance_id: String) {
         .unwrap();
 }
 
-async fn configure_node(node: Node, args: MatrixArgs) {
-    let message = bincode::options().serialize(&args).unwrap();
-    TcpStream::connect((node.control_host, ARGS_SERVER_PORT))
+async fn configure_node(node: &Node, args: &MatrixArgs) {
+    let message = bincode::options().serialize(args).unwrap();
+    TcpStream::connect((&*node.control_host, ARGS_SERVER_PORT))
         .await
         .unwrap()
         .write_all(&message)
@@ -202,7 +209,7 @@ fn instance_id() -> String {
         .collect()
 }
 
-fn replica_args(spec: Spec, index: usize) -> MatrixArgs {
+fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
     MatrixArgs {
         instance_id: instance_id(),
         config: config(spec.clone()),
@@ -212,7 +219,7 @@ fn replica_args(spec: Spec, index: usize) -> MatrixArgs {
                 enable_batching: spec.task.batching,
             },
             "neo" => MatrixProtocol::NeoReplica {
-                variant: HalfSipHash,
+                variant: spec.multicast.variant,
                 enable_vote: spec.task.enable_batching,
             },
             _ => panic!(),
@@ -224,7 +231,7 @@ fn replica_args(spec: Spec, index: usize) -> MatrixArgs {
     }
 }
 
-fn client_args(spec: Spec, index: usize) -> MatrixArgs {
+fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
     MatrixArgs {
         instance_id: instance_id(),
         config: config(spec.clone()),

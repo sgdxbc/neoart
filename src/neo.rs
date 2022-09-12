@@ -675,7 +675,7 @@ where
 
         self.sequence_number += 1;
         let n = self.sequence_number;
-        if var("NEO_NETLOG").unwrap_or(String::from("0")) != "0" {
+        if var("NEO_NETLOG").as_deref().unwrap_or("0") != "0" {
             println!(
                 "* [{:6?}] [{} -> <multicast>] sequence {n} message length {}",
                 Instant::now() - self.underlying.as_ref().epoch,

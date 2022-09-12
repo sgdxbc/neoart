@@ -7,30 +7,39 @@ use neoart::{
 
 fn main() {
     let spec = toml::from_str::<Spec>(&read_to_string("spec.toml").unwrap()).unwrap();
-    write("src-sw/neo_s.py", rewrite_sw(spec.clone(), false)).unwrap();
-    write("src-sw/neo_s-sim.py", rewrite_sw(spec.clone(), true)).unwrap();
+    write("src-sw/neo_s.py", rewrite_sw(&spec, "neo_s", false)).unwrap();
+    write("src-sw/neo_s-sim.py", rewrite_sw(&spec, "neo_s", true)).unwrap();
+    write("src-sw/neo_r.py", rewrite_sw(&spec, "neo_r", false)).unwrap();
+    write("src-sw/neo_r-sim.py", rewrite_sw(&spec, "neo_r", true)).unwrap();
 }
 
-fn rewrite_sw(spec: Spec, simulate: bool) -> String {
+fn rewrite_sw(spec: &Spec, program: &str, simulate: bool) -> String {
     let mut dmac = Vec::new();
     let mut port = Vec::new();
     let mut replicas = Vec::new();
     let mut endpoints = Vec::new();
-    for mut node in spec.replica {
-        if node.link_speed.is_empty() {
-            node.link_speed = String::from("100G");
-        }
-        dmac.push((node.link, node.dev_port));
-        port.push((node.dev_port, node.link_speed));
+    if let Some(dev_port) = spec.multicast.accel_port {
+        port.push((dev_port, "100G")); //
+    }
+    for node in &spec.replica {
+        let link_speed = if node.link_speed.is_empty() {
+            "100G"
+        } else {
+            &node.link_speed
+        };
+        dmac.push((&node.link, node.dev_port));
+        port.push((node.dev_port, link_speed));
         replicas.push(node.dev_port);
         endpoints.push(node.dev_port);
     }
-    for mut node in spec.client {
-        if node.link_speed.is_empty() {
-            node.link_speed = String::from("100G");
-        }
-        dmac.push((node.link, node.dev_port));
-        port.push((node.dev_port, node.link_speed));
+    for node in &spec.client {
+        let link_speed = if node.link_speed.is_empty() {
+            "100G"
+        } else {
+            &node.link_speed
+        };
+        dmac.push((&node.link, node.dev_port));
+        port.push((node.dev_port, link_speed));
         endpoints.push(node.dev_port);
     }
     const GROUP_ENDPOINT: u16 = 1;
@@ -47,7 +56,7 @@ fn rewrite_sw(spec: Spec, simulate: bool) -> String {
     ];
 
     let sw = include_str!("spec_sw.in.py");
-    sw.replace(r#""@@PROGRAM@@""#, "bfrt.neo_s")
+    sw.replace(r#""@@PROGRAM@@""#, &format!(r#""{program}""#))
         .replace(r#""@@SIMULATE@@""#, if simulate { "True" } else { "False" })
         .replace(r#""@@MULTICAST_PORT@@""#, &MULTICAST_PORT.to_string())
         .replace(
@@ -60,4 +69,13 @@ fn rewrite_sw(spec: Spec, simulate: bool) -> String {
         .replace(r#""@@GROUP_REPLICA@@""#, &GROUP_REPLICA.to_string())
         .replace(r#""@@PRE_NODE@@""#, &format!("{pre_node:?}"))
         .replace(r#""@@PRE_MGID@@""#, &format!("{pre_mgid:?}"))
+        .replace(
+            r#""@@ACCEL_PORT@@""#,
+            spec.multicast
+                .accel_port
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("..."),
+        )
 }

@@ -117,8 +117,10 @@ pub mod bin {
     }
 
     #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
     pub struct SpecMulticast {
         pub ip: Ipv4Addr,
         pub variant: MulticastVariant,
+        pub accel_port: Option<u8>,
     }
 }
