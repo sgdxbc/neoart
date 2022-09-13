@@ -101,7 +101,7 @@ pub mod bin {
         #[serde(default)]
         pub batching: bool,
         #[serde(default)]
-        pub enable_batching: bool,
+        pub enable_vote: bool,
     }
 
     #[derive(Debug, Clone, Deserialize)]

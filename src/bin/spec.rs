@@ -220,7 +220,7 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
             },
             "neo" => MatrixProtocol::NeoReplica {
                 variant: spec.multicast.variant,
-                enable_vote: spec.task.enable_batching,
+                enable_vote: spec.task.enable_vote,
             },
             _ => panic!(),
         },

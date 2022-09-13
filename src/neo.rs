@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::TryInto,
     env::var,
     future::Future,
     mem::replace,
@@ -114,10 +115,8 @@ impl Message {
     fn multicast_action(variant: MulticastVariant, message: OrderedRequest) -> InboundAction<Self> {
         match variant {
             MulticastVariant::Disabled => unreachable!(),
-            MulticastVariant::HalfSipHash if Self::has_network_signature(&message) => {
-                InboundAction::Allow(Message::OrderedRequest(message))
-            }
-            MulticastVariant::HalfSipHash => InboundAction::Block,
+            // TODO inline-check message signature
+            MulticastVariant::HalfSipHash => InboundAction::Allow(Message::OrderedRequest(message)),
             MulticastVariant::Secp256k1 if Self::has_network_signature(&message) => {
                 // selectively verify part of signatures?
                 InboundAction::Verify(
@@ -129,6 +128,43 @@ impl Message {
         }
     }
 
+    fn ordering_state(
+        link_hash: &[u8; 32],
+        message: &Digest,
+        sequence_number: u32,
+    ) -> secp256k1::Message {
+        let mut state = [0; 52];
+        for (dest, source) in state[0..32].iter_mut().zip(link_hash.iter()) {
+            *dest = *source;
+        }
+        for (dest, source) in state[16..48].iter_mut().zip(message.iter()) {
+            *dest ^= *source;
+        }
+        state[48..52].copy_from_slice(&sequence_number.to_be_bytes()[..]);
+        println!("state {state:x?}");
+        secp256k1::Message::from_hashed_data::<sha256::Hash>(&state[..])
+    }
+
+    fn verify_ordering_state(state: secp256k1::Message, signature: &[u8; 64]) -> bool {
+        thread_local! {
+            static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
+        }
+        let key = PublicKey::from_slice(&[
+            0x4, 0x9a, 0xa2, 0xc, 0x8c, 0x99, 0x79, 0xc2, 0x79, 0x40, 0x14, 0xd0, 0x4f, 0x4b, 0x1,
+            0xdc, 0xd9, 0x77, 0x7d, 0xb, 0xf7, 0x9d, 0xa5, 0x3b, 0x2, 0xdd, 0xa9, 0x59, 0x89, 0x49,
+            0xd2, 0x4f, 0xc7, 0x42, 0xdd, 0x98, 0x75, 0x9b, 0x2b, 0xb5, 0xf2, 0xc1, 0x98, 0x4f,
+            0x84, 0x10, 0x9, 0x74, 0x84, 0xa0, 0xd0, 0x25, 0xf4, 0x51, 0x81, 0xd4, 0x2e, 0xc3,
+            0xc3, 0xd0, 0x8e, 0xe5, 0xea, 0x43, 0x85,
+        ])
+        .unwrap();
+        let mut signature = *signature;
+        signature.reverse();
+        let mut signature = secp256k1::ecdsa::Signature::from_compact(&signature[..]).unwrap();
+        signature.normalize_s();
+        SECP.with(|secp| secp.verify_ecdsa(&state, &signature, &key))
+            .is_ok()
+    }
+
     fn verify_ordered_request_secp256k1(&mut self, _config: &Config) -> bool {
         let message_digest = self.digest();
         let message = if let Message::OrderedRequest(request) = self {
@@ -136,32 +172,13 @@ impl Message {
         } else {
             unreachable!();
         };
-        let mut digest_in = [0; 52];
-        digest_in[0..32].copy_from_slice(&message.link_hash[..]);
-        for (digest_byte, byte) in digest_in[16..48].iter_mut().zip(message_digest.iter()) {
-            *digest_byte ^= byte;
-        }
-        digest_in[48..52].copy_from_slice(&message.sequence_number.to_be_bytes()[..]);
-        let network_hash = secp256k1::Message::from_hashed_data::<sha256::Hash>(&digest_in[..]);
-        message.network_digest = *network_hash.as_ref();
-        thread_local! {
-            static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
-        }
-        SECP.with(|secp| {
-            secp.verify_ecdsa(
-                &network_hash,
-                &secp256k1::ecdsa::Signature::from_compact(&message.network_signature[..]).unwrap(),
-                &PublicKey::from_slice(&[
-                    0x4, 0x9a, 0xa2, 0xc, 0x8c, 0x99, 0x79, 0xc2, 0x79, 0x40, 0x14, 0xd0, 0x4f,
-                    0x4b, 0x1, 0xdc, 0xd9, 0x77, 0x7d, 0xb, 0xf7, 0x9d, 0xa5, 0x3b, 0x2, 0xdd,
-                    0xa9, 0x59, 0x89, 0x49, 0xd2, 0x4f, 0xc7, 0x42, 0xdd, 0x98, 0x75, 0x9b, 0x2b,
-                    0xb5, 0xf2, 0xc1, 0x98, 0x4f, 0x84, 0x10, 0x9, 0x74, 0x84, 0xa0, 0xd0, 0x25,
-                    0xf4, 0x51, 0x81, 0xd4, 0x2e, 0xc3, 0xc3, 0xd0, 0x8e, 0xe5, 0xea, 0x43, 0x85,
-                ])
-                .unwrap(),
-            )
-        })
-        .is_ok()
+        let ordering_state =
+            Self::ordering_state(&message.link_hash, &message_digest, message.sequence_number);
+        message.network_digest = *ordering_state.as_ref();
+        Self::verify_ordering_state(
+            ordering_state,
+            &message.network_signature.clone().try_into().unwrap(),
+        )
     }
 
     fn verify_multicast_generic(&mut self, config: &Config) -> bool {
@@ -513,6 +530,7 @@ impl Replica {
             // TODO bypass vote buffer
             self.speculative_number = sequence_number;
             self.speculative_commit();
+            return;
         }
 
         // only trigger a new voting round if there is no outstanding voting
@@ -572,7 +590,6 @@ impl Replica {
                 .collect();
 
             self.speculative_number = message.sequence_number;
-            self.speculative_commit();
             let nontrivial_batch = self.close_vote_batch();
             // send certificate as soon as possible, even when vote batch is
             // empty
@@ -586,6 +603,9 @@ impl Replica {
             };
             self.transport
                 .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
+
+            self.speculative_commit();
+
             // if there is no voting reply expected do not resend actively
             if nontrivial_batch {
                 // TODO set timer
@@ -637,16 +657,17 @@ impl Replica {
 
     fn handle_multicast_generic(&mut self, message: MulticastGeneric) {
         assert!(self.enable_vote);
-        if message.sequence_number > self.speculative_number {
-            // TODO check local digest match certificate
-            self.speculative_number = message.sequence_number;
-            self.speculative_commit();
-        }
         // TODO detect and handle the case where replica misses at least one
         // whole batch
         if message.vote_number > self.vote_number {
             self.vote_number = message.vote_number;
             self.send_vote();
+        }
+
+        if message.sequence_number > self.speculative_number {
+            // TODO check local digest match certificate
+            self.speculative_number = message.sequence_number;
+            self.speculative_commit();
         }
     }
 
@@ -752,15 +773,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::TryInto, net::SocketAddr, time::Duration};
+    use std::time::Duration;
 
     use tokio::{task::yield_now, time::timeout};
 
     use crate::{
         common::TestApp,
         crypto::Executor,
-        meta::{ClientId, Config, ReplicaId},
-        neo::{Message, OrderedRequest},
+        meta::ReplicaId,
+        neo::Message,
         transport::{
             simulated::{BasicSwitch, Network},
             Concurrent,
@@ -846,24 +867,22 @@ mod tests {
 
     #[test]
     fn verify_secp256k1() {
-        const SAMPLE_PACKET: &[u8; 112] = b"\x00\x00\x00\x01\xdc\xe1\xaez\x94\xb50\x1a\x91KT\xcb8\x97v\x1c\x01T\xdf\x86\xd8\xcbf\x1d\x7f\xf0\x92\x99\xd7\x1b\x01`!\xff\x17\x9e\x1a\x93I\xc0\xcc\x9bpv\x18\x120\x0b\xc8\x87\xe7KX\xf9i\x87\xaf\xeb\t\x9b}\rvN\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x00e\xfb\xe4\xb6f\x01\x00";
-        const SAMPLE_PACKET2: &[u8; 112] = b"\x00\x00\x00\x02\x04\xb0mB6\xa8\x9e\xd0\x1f\xefJe5\xcci\x8c/\xfa\x98\xf6v\x8f\x8e\xfc2a\xbe\x87\xbd\xf6\xa2\n\xc5p:\x82\xf5\xff\x96\x1d\xf7\xd9\x04\xf0cp8;\x18\xb4t\x9a\xf6\xaa`\xa9~f>\x92\x9e\x8d\xfcy\xd6\xa3a\x8a*\\\xfbZ\xcc\xbf[6\x04+f\x11\x02\xe4\x10\xd3\x9e.\xbbU2\xe1\xf2\x07\xf1\xd9\xbc'\x00\x00\x0c\x00\x00e\xfb\xe4\xb6f\x01\x00";
-        println!("network digest {:?}", &SAMPLE_PACKET2[68..100]);
-        let mut message = Message::OrderedRequest(OrderedRequest {
-            request_number: 0,
-            client_id: ClientId(SocketAddr::from(([12, 0, 0, 101], 46280)), 102),
-            op: Vec::new(),
-            sequence_number: 1,
-            network_digest: Default::default(),
-            network_signature: SAMPLE_PACKET[4..68].to_vec(),
-            link_hash: SAMPLE_PACKET[68..100].try_into().unwrap(),
-        });
-        assert!(message.verify_ordered_request_secp256k1(&Config::default()));
-        if let Message::OrderedRequest(message) = message {
-            let network_digest: [u8; 32] = SAMPLE_PACKET2[68..100].try_into().unwrap();
-            assert_eq!(message.network_digest, network_digest);
-        } else {
-            unreachable!()
-        }
+        let payload_digest = [
+            243, 212, 139, 81, 238, 147, 91, 10, 96, 155, 86, 225, 100, 38, 67, 64, 228, 202, 178,
+            31, 88, 243, 90, 205, 67, 42, 27, 60, 57, 69, 71, 63,
+        ];
+        let state = Message::ordering_state(&[0; 32], &payload_digest, 1);
+        let expected_state = [
+            80, 26, 28, 235, 101, 124, 189, 202, 190, 170, 121, 73, 120, 209, 62, 117, 93, 73, 219,
+            53, 156, 66, 38, 11, 174, 131, 19, 221, 129, 61, 11, 146,
+        ];
+        assert_eq!(state.as_ref(), &expected_state);
+        let signature = [
+            187, 229, 243, 76, 218, 46, 223, 84, 155, 159, 249, 114, 135, 87, 52, 81, 202, 213, 2,
+            41, 184, 201, 172, 46, 170, 247, 122, 8, 201, 206, 124, 184, 249, 54, 224, 188, 19,
+            241, 1, 134, 176, 153, 111, 131, 69, 200, 49, 181, 41, 82, 157, 248, 133, 79, 52, 73,
+            16, 195, 88, 146, 1, 138, 48, 249,
+        ];
+        assert!(Message::verify_ordering_state(state, &signature));
     }
 }
