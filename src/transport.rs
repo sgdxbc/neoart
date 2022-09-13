@@ -87,6 +87,7 @@
 use std::{
     borrow::Borrow,
     collections::HashMap,
+    convert::TryInto,
     future::{pending, Future},
     net::SocketAddr,
     pin::Pin,
@@ -162,12 +163,20 @@ impl<'a, M> InboundPacket<'a, M> {
     where
         M: DeserializeOwned,
     {
-        assert_eq!(variant, MulticastVariant::HalfSipHash);
-        Self::OrderedMulticast {
-            sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-            signature: &buf[4..8],
-            link_hash: &[0; 32],
-            message: deserialize(&buf[100..]),
+        match variant {
+            MulticastVariant::Disabled => unreachable!(),
+            MulticastVariant::HalfSipHash => Self::OrderedMulticast {
+                sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                signature: &buf[4..8],
+                link_hash: &[0; 32],
+                message: deserialize(&buf[100..]),
+            },
+            MulticastVariant::Secp256k1 => Self::OrderedMulticast {
+                sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                signature: &buf[4..68],
+                link_hash: buf[68..100].try_into().unwrap(),
+                message: deserialize(&buf[100..]),
+            },
         }
     }
 }
@@ -196,6 +205,7 @@ pub struct Transport<T: Node> {
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
     send_signed: Vec<Destination>,
+    varaint: MulticastVariant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -239,7 +249,7 @@ pub enum MulticastListener {
 pub enum MulticastVariant {
     Disabled,
     HalfSipHash,
-    // Secp256k1
+    Secp256k1,
 }
 
 impl<T: Node> Transport<T> {
@@ -273,6 +283,7 @@ impl<T: Node> Transport<T> {
             timer_table,
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
+            varaint: MulticastVariant::Disabled,
         }
     }
 
@@ -287,13 +298,12 @@ impl<T: Node> Transport<T> {
             )
         );
 
-        assert_eq!(variant, MulticastVariant::HalfSipHash);
         self.multicast_listener = listener;
+        self.varaint = variant;
     }
 
     pub fn multicast_variant(&self) -> MulticastVariant {
-        // TODO
-        MulticastVariant::HalfSipHash
+        self.varaint
     }
 
     pub fn create_id(&self) -> ClientId {
@@ -315,16 +325,13 @@ impl<T: Node> Transport<T> {
     {
         let mut buf = [0; 1472];
         let message_offset = if destination == Destination::ToMulticast {
+            // consider eliminate double serailization if possible
+            buf[68..100].copy_from_slice(&digest(message.borrow())[..]);
             100 // 4 bytes sequence, up to 64 bytes signature, 32 bytes hash
         } else {
             0
         };
         let len = serialize(&mut buf[message_offset..], message.borrow()) + message_offset;
-        if destination == Destination::ToMulticast {
-            let d = digest(&buf[message_offset..len]);
-            buf[68..100].copy_from_slice(&d[..]);
-        }
-
         match destination {
             Destination::ToNull | Destination::ToSelf => {
                 unreachable!() // really?

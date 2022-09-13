@@ -25,7 +25,7 @@ pub type Digest = [u8; 32];
 // from previous-running client
 // thus a random id is appended to avoid this, with 1/256 false positive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ClientId(pub SocketAddr, u8);
+pub struct ClientId(pub SocketAddr, pub u8);
 
 pub fn random_id(addr: SocketAddr) -> ClientId {
     ClientId(addr, random())

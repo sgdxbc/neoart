@@ -2,6 +2,7 @@ SIMULATE = "@@SIMULATE@@"
 PROGRAM = "@@PROGRAM@@"
 MULTICAST_PORT = "@@MULTICAST_PORT@@"
 MULTICAST_CONTROL_RESET_PORT = "@@MULTICAST_CONTROL_RESET_PORT@@"
+MULTICAST_ACCEL_PORT = 60004
 DMAC = "@@DMAC@@"
 PORT = "@@PORT@@"
 PRE_MGID = "@@PRE_MGID@@"
@@ -50,10 +51,17 @@ for node_id, rid, ports in PRE_NODE:
 for group_id, nodes in PRE_MGID:
     mgid.add(group_id, nodes, [0] * len(nodes), [0] * len(nodes))
 ig.send_to_endpoints.set_default_with_send_to_group(mgid=GROUP_ENDPOINT)
-ig.send_to_replicas.set_default_with_send_to_group(mgid=GROUP_REPLICA)
+if PROGRAM == "neo_s":
+    ig.send_to_replicas.set_default_with_send_to_group(mgid=GROUP_REPLICA)
 if PROGRAM == "neo_r":
-    ig.send_to_accel.set_default_with_send(port=ACCEL_PORT)
+    ig.send_to_replicas.set_default_with_send_multicast_to_group(
+        dst_port=MULTICAST_PORT, mgid=GROUP_REPLICA
+    )
+    ig.relay_to_accel.set_default_with_send_multicast(
+        dst_port=MULTICAST_ACCEL_PORT, port=ACCEL_PORT
+    )
+    ig.control_accel.set_default_with_send(port=ACCEL_PORT)
 
 ig_prsr.neo_port.add(MULTICAST_PORT)
 ig_prsr.neo_control_reset_port.add(MULTICAST_CONTROL_RESET_PORT)
-ig.set_default_with_neo_multicast(port=MULTICAST_PORT)
+ig_prsr.neo_accel_port.add(MULTICAST_ACCEL_PORT)

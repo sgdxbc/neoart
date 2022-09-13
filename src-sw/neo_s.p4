@@ -60,9 +60,8 @@ control SwitchIngress(
         }
     };
 
-    action neo_multicast(bit<16> port) {
+    action neo() {
         hdr.udp.checksum = 0;
-        hdr.udp.dst_port = port;
         hdr.neo.sequence = sequence_number;
         // TODO signature
         bit<8> n1 = (bit<8>) hdr.neo.sequence;
@@ -70,11 +69,6 @@ control SwitchIngress(
         hdr.neo.signature[7:0] = n1;
         hdr.neo.signature[15:8] = n2;
         hdr.neo.hash = 0;
-    }
-
-    table neo {
-        actions = { neo_multicast; }
-        size = 1;
     }
 
     apply {
@@ -87,7 +81,7 @@ control SwitchIngress(
             send_to_endpoints.apply(); // careful...
         } else if (md.code == META_CODE_MULTICAST) {
             sequence_number = assign_sequence.execute(0);
-            neo.apply();
+            neo();
             send_to_replicas.apply();
         } else if (md.code == META_CODE_CONTROL_RESET) {
             assign_sequence.execute(0);

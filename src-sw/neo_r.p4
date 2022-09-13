@@ -1,5 +1,7 @@
 // NeoBFT switch program, relay mode
 #include "common.p4"
+#include "tofino1arch.p4"
+#include "tofino2arch.p4"
 
 control SwitchIngress(
         inout header_t hdr,
@@ -25,55 +27,61 @@ control SwitchIngress(
     table dmac {
         key = { hdr.ethernet.dst_addr : exact; }
         actions = { send; }
+        size = 8;
+    }
+
+    action send_multicast(bit<16> dst_port, PortId_t port) {
+        hdr.udp.checksum = 0;
+        hdr.udp.dst_port = dst_port;
+        send(port);
+    }
+
+    action send_multicast_to_group(bit<16> dst_port, MulticastGroupId_t mgid) {
+        hdr.udp.checksum = 0;
+        hdr.udp.dst_port = dst_port;
+        send_to_group(mgid);
     }
 
     // keyless tables that always perform default action, need to be configured
     // by control plane
 
-    table send_to_accel {
+    table relay_to_accel {
+        actions = { send_multicast; }
+        size = 1;
+    }
+
+    table control_accel {
+        // reusing received control packet, accelerator accept control packet
+        // in the same format
         actions = { send; }
+        size = 1;
     }
 
     table send_to_replicas {
-        actions = { send_to_group; }
+        actions = { send_multicast_to_group; }
+        size = 1;
     }
 
     table send_to_endpoints {
         actions = { send_to_group; }
+        size = 1;
     }
-
+   
     apply {
         // No need for egress processing, skip it and use empty controls for egress.
         ig_tm_md.bypass_egress = 1w1;
  
-        if (!hdr.neo.isValid()) {
-            if (hdr.ethernet.ether_type == ETHERTYPE_ARP) {
-                send_to_endpoints.apply(); // a little bit wild here
-            } else {
-                drop();
-            }
-            exit;
-        }
-        
-        hdr.neo.variant = NEO_VARIANT_R;
-        hdr.udp.checksum = 0;
-        
-        if (hdr.neo.ty == NEO_TYPE_UCAST) {
+        if (md.code == META_CODE_UNICAST) {
             dmac.apply();
-        } else if (hdr.neo.ty == NEO_TYPE_RELAY_REPLY) {
-            hdr.neo.ty = NEO_TYPE_MCAST_OUTGRESS;
+        } else if (md.code == META_CODE_ARP) {
+            send_to_endpoints.apply();
+        } else if (md.code == META_CODE_MULTICAST) {
+            relay_to_accel.apply();
+        } else if (md.code == META_CODE_CONTROL_RESET) {
+            control_accel.apply();
+        } else if (md.code == META_CODE_ACCEL) {
             send_to_replicas.apply();
-        } else if (hdr.neo.ty == NEO_TYPE_MCAST_INGRESS) {
-            hdr.neo.ty = NEO_TYPE_RELAY;
-            hdr.neo_relay = { 
-                sequence = 0, 
-                hash = hdr.neo_ingress.digest, 
-                signature = 0
-            };
-            hdr.neo_ingress.setInvalid();
-            send_to_accel.apply();
         } else {
-            // unreachable
             drop();
         }
     }

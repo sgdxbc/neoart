@@ -242,6 +242,7 @@ const bit<3> META_CODE_UNICAST = 1;
 const bit<3> META_CODE_MULTICAST = 2;
 const bit<3> META_CODE_ARP = 3;
 const bit<3> META_CODE_CONTROL_RESET = 4;
+const bit<3> META_CODE_ACCEL = 5;
 
 parser SwitchIngressParser(
         packet_in pkt,
@@ -252,6 +253,7 @@ parser SwitchIngressParser(
     TofinoIngressParser() tofino_parser;
     value_set<bit<16>>(1) neo_port;
     value_set<bit<16>>(1) neo_control_reset_port;
+    value_set<bit<16>>(1) neo_accel_port;
 
     state start {
         tofino_parser.apply(pkt, ig_intr_md);
@@ -287,6 +289,7 @@ parser SwitchIngressParser(
         transition select (hdr.udp.dst_port) {
             neo_port: parse_neo;
             neo_control_reset_port: parse_neo_control_reset;
+            neo_accel_port: parse_neo_accel;
             default: accept_unicast;
         }
     }
@@ -304,6 +307,11 @@ parser SwitchIngressParser(
 
     state parse_neo_control_reset {
         ig_md.code = META_CODE_CONTROL_RESET;
+        transition accept;
+    }
+
+    state parse_neo_accel {
+        ig_md.code = META_CODE_ACCEL;
         transition accept;
     }
 }
