@@ -56,15 +56,30 @@ fn main() {
     let runtime = match &args.protocol {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
-        | MatrixProtocol::NeoClient => runtime::Builder::new_multi_thread()
-            .enable_all()
-            .on_thread_stop(move || merge_latency_into(&mut latency.lock().unwrap()))
-            .build()
-            .unwrap(),
+        | MatrixProtocol::NeoClient => {
+            let counter = Arc::new(AtomicU32::new(0));
+            runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(20) // because currently client server has isolation
+                .on_thread_start({
+                    let counter = counter.clone();
+                    move || {
+                        let mut cpu_set = CpuSet::new();
+                        cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
+                        sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                    }
+                })
+                .on_thread_stop(move || merge_latency_into(&mut latency.lock().unwrap()))
+                .build()
+                .unwrap()
+        }
         _ => {
             if args.num_worker != 0 {
                 executor = Executor::new_rayon(args.num_worker, latency);
             }
+            let mut cpu_set = CpuSet::new();
+            cpu_set.set(0).unwrap();
+            sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
             runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -128,10 +143,6 @@ async fn run_replica<T>(
     T: Node + AsMut<Transport<T>> + Send,
     T::Message: CryptoMessage + DeserializeOwned,
 {
-    let mut cpu_set = CpuSet::new();
-    cpu_set.set(0).unwrap();
-    sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
-
     let socket = UdpSocket::bind(args.config.replicas[args.replica_id as usize])
         .await
         .unwrap();

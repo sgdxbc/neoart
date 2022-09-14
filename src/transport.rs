@@ -205,7 +205,7 @@ pub struct Transport<T: Node> {
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
     send_signed: Vec<Destination>,
-    varaint: MulticastVariant,
+    variant: MulticastVariant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -283,7 +283,7 @@ impl<T: Node> Transport<T> {
             timer_table,
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
-            varaint: MulticastVariant::Disabled,
+            variant: MulticastVariant::Disabled,
         }
     }
 
@@ -299,11 +299,11 @@ impl<T: Node> Transport<T> {
         );
 
         self.multicast_listener = listener;
-        self.varaint = variant;
+        self.variant = variant;
     }
 
     pub fn multicast_variant(&self) -> MulticastVariant {
-        self.varaint
+        self.variant
     }
 
     pub fn create_id(&self) -> ClientId {
@@ -465,13 +465,11 @@ where
                     handle_raw_message(self, remote, InboundPacket::new_unicast(&buf[..len]));
                 }
                 (len, remote) = transport.multicast_listener.receive_from(&mut multicast_buf) => {
+                    let variant = transport.variant;
                     handle_raw_message(
                         self,
                         remote,
-                        InboundPacket::new_multicast(
-                            &multicast_buf[..len],
-                            MulticastVariant::HalfSipHash,
-                        ),
+                        InboundPacket::new_multicast(&multicast_buf[..len], variant),
                     );
                 }
             }

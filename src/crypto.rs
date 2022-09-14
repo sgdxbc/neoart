@@ -201,7 +201,7 @@ impl<M> Crypto<M> {
         });
         *message.signature_mut() = Signature(signature);
 
-        if Executor::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
+        let _ = if Executor::BLOCKING_SEND.with(|blocking_send| *blocking_send.borrow()) {
             sender
                 .blocking_send(CryptoEvent::Signed(id, message))
                 .map_err(|_| ())
@@ -209,7 +209,7 @@ impl<M> Crypto<M> {
             sender
                 .try_send(CryptoEvent::Signed(id, message))
                 .map_err(|_| ())
-        }
-        .unwrap();
+        }; // TODO
+           // .unwrap();
     }
 }
