@@ -375,6 +375,7 @@ pub struct Replica {
     enable_vote: bool,
     // keyed by (vote number, batch digest)
     vote_quorums: HashMap<(u32, Digest), HashMap<ReplicaId, Signature>>,
+    will_vote: Option<RangeInclusive<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +425,7 @@ impl Replica {
             link_hash: Default::default(),
             enable_vote,
             vote_quorums: HashMap::new(),
+            will_vote: None,
         }
     }
 }
@@ -524,9 +526,11 @@ impl Replica {
             todo!() // fallback to slow path
         }
 
-        for entry in self.log.get_mut(self.verify_number as usize..).unwrap() {
-            assert_eq!(entry.status, LogStatus::FastVerifying);
-            entry.status = LogStatus::Voting;
+        if self.verify_number < request.sequence_number - 1 {
+            for entry in self.log.get_mut(self.verify_number as usize..).unwrap() {
+                assert_eq!(entry.status, LogStatus::FastVerifying);
+                entry.status = LogStatus::Voting;
+            }
         }
         self.verify_number = request.sequence_number;
         self.log.push(LogEntry {
@@ -537,6 +541,17 @@ impl Replica {
         if !self.enable_vote {
             self.speculative_commit(self.verify_number);
             return;
+        }
+
+        if let Some(will_vote) = &self.will_vote {
+            assert_ne!(self.id, self.transport.config.primary(self.view_number));
+            assert!(self.vote_number < *will_vote.end());
+            if self.verify_number >= *will_vote.end() {
+                // println!("send postponed vote for {:?}", will_vote);
+                self.vote_number = *will_vote.end();
+                self.send_vote(will_vote.clone());
+                self.will_vote = None;
+            }
         }
 
         // only trigger a new voting round if there is no outstanding voting
@@ -613,7 +628,7 @@ impl Replica {
             .map(|entry| entry.status != LogStatus::Voting)
             .unwrap_or(true)
         {
-            todo!() // query missing ordered requests
+            todo!("speculative commit up to {speculative_number}") // query missing ordered requests
         }
 
         for entry in self
@@ -661,17 +676,33 @@ impl Replica {
 
     fn handle_multicast_generic(&mut self, message: MulticastGeneric) {
         assert!(self.enable_vote);
-        if message.vote_number > self.vote_number {
-            if message.vote_number > self.verify_number {
-                todo!() // state transfer, simply ignore or delay until verified?
-            }
-            self.vote_number = message.vote_number;
-        }
         if *message.sequence_number.end() < message.vote_number {
-            self.send_vote(message.sequence_number.end() + 1..=message.vote_number);
+            if self.verify_number >= message.vote_number {
+                if message.vote_number > self.vote_number {
+                    self.vote_number = message.vote_number;
+                }
+                // send the vote for possibly dropping primary
+                if message.vote_number == self.vote_number {
+                    self.send_vote(message.sequence_number.end() + 1..=message.vote_number);
+                }
+            } else {
+                // println!("postpone vote for sequence {}", message.vote_number);
+                let prev = replace(
+                    &mut self.will_vote,
+                    Some(message.sequence_number.end() + 1..=message.vote_number),
+                );
+                if prev.is_some() {
+                    // not sure why this is a possible state in assume byz setup...
+                    println!("will vote: {prev:?} -> {:?}", self.will_vote);
+                }
+                // it is bad to have vote number > verify number, so not update
+                // vote number here
+            }
         }
 
-        if *message.sequence_number.end() > self.speculative_number {
+        if !message.sequence_number.is_empty()
+            && *message.sequence_number.end() > self.speculative_number
+        {
             // TODO check local digest match certificate
             self.speculative_commit(*message.sequence_number.end());
         }
