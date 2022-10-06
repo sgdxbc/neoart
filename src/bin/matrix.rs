@@ -132,7 +132,7 @@ fn main() {
 struct Null;
 impl App for Null {
     fn replica_upcall(&mut self, _: OpNumber, _: &[u8]) -> Vec<u8> {
-        Vec::new()
+        Vec::default()
     }
 }
 
