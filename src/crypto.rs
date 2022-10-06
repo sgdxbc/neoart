@@ -1,9 +1,4 @@
-use std::{
-    cell::RefCell,
-    mem::take,
-    sync::{Arc, Mutex},
-    thread::spawn,
-};
+use std::{cell::RefCell, mem::take, sync::Arc, thread::spawn};
 
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -15,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
-    latency::{merge_latency_into, Latency},
     meta::{digest, Config, Digest, ReplicaId},
     transport::CryptoEvent,
 };
@@ -75,12 +69,11 @@ impl Executor {
         static BLOCKING_SEND: RefCell<bool> = RefCell::new(false);
     }
 
-    pub fn new_rayon(num_threads: usize, latency: Arc<Mutex<Latency>>) -> Self {
+    pub fn new_rayon(num_threads: usize) -> Self {
         Self::Rayon(
             ThreadPoolBuilder::new()
                 .num_threads(num_threads)
                 .spawn_handler(|thread| {
-                    let latency = latency.clone();
                     spawn(move || {
                         let mut cpu_set = CpuSet::new();
                         // save cpu#0 for transport + receiver
@@ -90,8 +83,6 @@ impl Executor {
                         Self::BLOCKING_SEND
                             .with(|blocking_send| *blocking_send.borrow_mut() = true);
                         thread.run();
-
-                        merge_latency_into(&mut latency.lock().unwrap());
                     });
                     Ok(())
                 })
