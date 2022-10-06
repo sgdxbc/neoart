@@ -164,10 +164,10 @@ async fn up_node(node: &Node, tag: String) -> JoinHandle<()> {
     })
 }
 
-async fn down_node(user: &str, host: &str, instance_id: &str) {
+async fn down_node(user: &str, host: &str, inst_id: &str) {
     Command::new("ssh")
         .arg(format!("{user}@{host}"))
-        .arg(format!("kill -INT $(cat pid.{instance_id})"))
+        .arg(format!("kill -INT $(cat pid.{inst_id}); rm pid.{inst_id}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

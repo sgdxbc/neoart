@@ -1,5 +1,6 @@
 /target
 /Cargo.lock
 
-/spec.toml
+/spec*
+!/spec-example.toml
 /src-sw/*.py

@@ -1,6 +1,6 @@
 use std::{
     env::args,
-    fs::{remove_file, write},
+    fs::write,
     net::TcpListener,
     process::id,
     sync::{
@@ -35,6 +35,7 @@ use tokio::{
 // OVERENGINEERING... bypass command line arguments by setting up a server...
 // i learned nothing but these bad practice from SDE :|
 fn accept_args() -> MatrixArgs {
+    // using std instead of tokio because bincode not natively support async
     let server = TcpListener::bind((
         args().nth(1).as_deref().unwrap_or("0.0.0.0"),
         ARGS_SERVER_PORT,
@@ -49,6 +50,8 @@ fn main() {
     let mut args = accept_args();
     args.config.gen_keys();
     let pid_file = format!("pid.{}", args.instance_id);
+    // using std instead of tokio because i don't want the whole main become
+    // async only become of this
     write(&pid_file, id().to_string()).unwrap();
 
     let latency = Arc::new(Mutex::new(Latency::default()));
@@ -57,18 +60,18 @@ fn main() {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient => {
-            let counter = Arc::new(AtomicU32::new(0));
+            // let counter = Arc::new(AtomicU32::new(0));
             runtime::Builder::new_multi_thread()
                 .enable_all()
-                .worker_threads(20) // because currently client server has isolation
-                .on_thread_start({
-                    let counter = counter.clone();
-                    move || {
-                        let mut cpu_set = CpuSet::new();
-                        cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
-                        sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
-                    }
-                })
+                // .worker_threads(20) // because currently client server has isolation
+                // .on_thread_start({
+                //     let counter = counter.clone();
+                //     move || {
+                //         let mut cpu_set = CpuSet::new();
+                //         cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
+                //         sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                //     }
+                // })
                 .on_thread_stop(move || merge_latency_into(&mut latency.lock().unwrap()))
                 .build()
                 .unwrap()
@@ -124,8 +127,6 @@ fn main() {
             _ => unreachable!(),
         }
     });
-
-    remove_file(&pid_file).unwrap();
 }
 
 struct Null;

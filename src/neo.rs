@@ -113,19 +113,35 @@ impl Message {
         !message.network_signature.iter().all(|&b| b == 0)
     }
 
-    fn multicast_action(variant: MulticastVariant, message: OrderedRequest) -> InboundAction<Self> {
-        match variant {
-            MulticastVariant::Disabled => unreachable!(),
+    fn multicast_action(variant: MulticastVariant, message: Message) -> InboundAction<Self> {
+        match (variant, message) {
+            (MulticastVariant::Disabled, _) => unreachable!(),
             // TODO inline-check message signature
-            MulticastVariant::HalfSipHash => InboundAction::Allow(Message::OrderedRequest(message)),
-            MulticastVariant::Secp256k1 if Self::has_network_signature(&message) => {
+            (MulticastVariant::HalfSipHash, message @ Message::OrderedRequest(..)) => {
+                InboundAction::Allow(message)
+            }
+            (MulticastVariant::Secp256k1, Message::OrderedRequest(message))
+                if Self::has_network_signature(&message) =>
+            {
                 // selectively verify part of signatures?
                 InboundAction::Verify(
                     Message::OrderedRequest(message),
                     Self::verify_ordered_request_secp256k1,
                 )
             }
-            MulticastVariant::Secp256k1 => InboundAction::Allow(Message::OrderedRequest(message)),
+            (MulticastVariant::Secp256k1, message @ Message::OrderedRequest(..)) => {
+                let digest = message.digest();
+                let mut message = if let Message::OrderedRequest(message) = message {
+                    message
+                } else {
+                    unreachable!()
+                };
+                message.ordering_state =
+                    *Self::ordering_state(&message.link_hash, &digest, message.sequence_number)
+                        .as_ref();
+                InboundAction::Allow(Message::OrderedRequest(message))
+            }
+            _ => InboundAction::Block,
         }
     }
 
@@ -146,16 +162,15 @@ impl Message {
         secp256k1::Message::from_hashed_data::<sha256::Hash>(&state[..])
     }
 
-    fn verify_ordering_state(state: secp256k1::Message, signature: &[u8; 64]) -> bool {
+    fn verify_ordering_state_secp256k1(state: secp256k1::Message, signature: &[u8; 64]) -> bool {
         thread_local! {
             static SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
         }
         let key = PublicKey::from_slice(&[
-            0x4, 0x9a, 0xa2, 0xc, 0x8c, 0x99, 0x79, 0xc2, 0x79, 0x40, 0x14, 0xd0, 0x4f, 0x4b, 0x1,
-            0xdc, 0xd9, 0x77, 0x7d, 0xb, 0xf7, 0x9d, 0xa5, 0x3b, 0x2, 0xdd, 0xa9, 0x59, 0x89, 0x49,
-            0xd2, 0x4f, 0xc7, 0x42, 0xdd, 0x98, 0x75, 0x9b, 0x2b, 0xb5, 0xf2, 0xc1, 0x98, 0x4f,
-            0x84, 0x10, 0x9, 0x74, 0x84, 0xa0, 0xd0, 0x25, 0xf4, 0x51, 0x81, 0xd4, 0x2e, 0xc3,
-            0xc3, 0xd0, 0x8e, 0xe5, 0xea, 0x43, 0x85,
+            4, 154, 162, 12, 140, 153, 121, 194, 121, 64, 20, 208, 79, 75, 1, 220, 217, 119, 125,
+            11, 247, 157, 165, 59, 2, 221, 169, 89, 137, 73, 210, 79, 199, 66, 221, 152, 117, 155,
+            43, 181, 242, 193, 152, 79, 132, 16, 9, 116, 132, 160, 208, 37, 244, 81, 129, 212, 46,
+            195, 195, 208, 142, 229, 234, 67, 133,
         ])
         .unwrap();
         let mut signature = *signature;
@@ -176,7 +191,7 @@ impl Message {
         let ordering_state =
             Self::ordering_state(&message.link_hash, &message_digest, message.sequence_number);
         message.ordering_state = *ordering_state.as_ref();
-        Self::verify_ordering_state(
+        Self::verify_ordering_state_secp256k1(
             ordering_state,
             &message.network_signature.clone().try_into().unwrap(),
         )
@@ -460,7 +475,10 @@ impl Node for Replica {
                     network_signature: signature.to_vec(),
                     link_hash: *link_hash,
                 };
-                Message::multicast_action(self.transport.multicast_variant(), request)
+                Message::multicast_action(
+                    self.transport.multicast_variant(),
+                    Message::OrderedRequest(request),
+                )
             }
             InboundPacket::Unicast {
                 message: Message::MulticastVote(message),
@@ -523,6 +541,8 @@ impl Replica {
                 });
                 return;
             }
+            println!("{link_hash:?}");
+            println!("{:?}", request);
             todo!() // fallback to slow path
         }
 
@@ -744,6 +764,17 @@ impl Drop for Replica {
                 self.log.len() as f32 / self.vote_quorums.len() as f32
             );
         }
+        if !self.log.is_empty() {
+            let signed_count = self
+                .log
+                .iter()
+                .filter(|entry| Message::has_network_signature(&entry.request))
+                .count();
+            println!(
+                "network signature batch size {}",
+                self.log.len() as f32 / signed_count as f32
+            );
+        }
     }
 }
 
@@ -916,6 +947,27 @@ mod tests {
             241, 1, 134, 176, 153, 111, 131, 69, 200, 49, 181, 41, 82, 157, 248, 133, 79, 52, 73,
             16, 195, 88, 146, 1, 138, 48, 249,
         ];
-        assert!(Message::verify_ordering_state(state, &signature));
+        assert!(Message::verify_ordering_state_secp256k1(state, &signature));
+    }
+
+    #[test]
+    fn verify_secp256k1_2() {
+        let payload_digest = [
+            227, 238, 185, 14, 243, 23, 132, 185, 42, 63, 187, 238, 71, 67, 169, 16, 220, 7, 231,
+            233, 193, 140, 136, 215, 174, 56, 126, 102, 144, 169, 160, 246,
+        ];
+        let state = Message::ordering_state(&[0; 32], &payload_digest, 1);
+        let expected_state = [
+            6, 115, 62, 115, 60, 67, 6, 7, 8, 84, 128, 248, 174, 37, 68, 182, 249, 53, 139, 216,
+            20, 13, 12, 177, 52, 6, 90, 121, 7, 193, 176, 247,
+        ];
+        assert_eq!(state.as_ref(), &expected_state);
+        let signature = [
+            50, 114, 117, 36, 14, 241, 10, 44, 125, 236, 231, 154, 189, 231, 130, 218, 138, 130,
+            201, 58, 157, 33, 144, 156, 19, 101, 18, 80, 246, 217, 239, 159, 249, 54, 224, 188, 19,
+            241, 1, 134, 176, 153, 111, 131, 69, 200, 49, 181, 41, 82, 157, 248, 133, 79, 52, 73,
+            16, 195, 88, 146, 1, 138, 48, 249,
+        ];
+        assert!(Message::verify_ordering_state_secp256k1(state, &signature));
     }
 }
