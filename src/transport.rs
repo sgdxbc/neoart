@@ -31,12 +31,12 @@
 //! # #[tokio::main]
 //! # async fn main() {
 //! #     let config = simulated::Network::config(1, 0);
-//! #     let mut net = simulated::Network::default();
+//! #     let mut net = simulated::Network(simulated::BasicSwitch::default());
 //! #     let replica = Replica::new(
 //! #         Transport::new(
 //! #             config.clone(),
 //! #             net.insert_socket(config.replicas[0]),
-//! #             neoart::crypto::ExecutorSetting::Inline,
+//! #             neoart::crypto::Executor::Inline,
 //! #         ),
 //! #         0,
 //! #         TestApp::default(),
@@ -44,7 +44,7 @@
 //! #     let mut client = Client::new(Transport::new(
 //! #         config.clone(),
 //! #         net.insert_socket(simulated::Network::client(0)),
-//! #         neoart::crypto::ExecutorSetting::Inline,
+//! #         neoart::crypto::Executor::Inline,
 //! #     ));
 //! #     let net = Concurrent::run(net);
 //! #     let replica = Concurrent::run(replica);

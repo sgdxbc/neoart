@@ -1,15 +1,25 @@
-use std::{collections::HashSet, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    mem::take,
+    pin::Pin,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
+    common::Reorder,
     crypto::{CryptoMessage, Signature},
-    meta::{ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber},
+    meta::{digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber},
     transport::{
-        Destination::{ToAll, ToReplica},
+        Destination::{To, ToAll, ToReplica, ToSelf},
+        InboundAction::{Allow, Block, VerifyReplica},
+        InboundPacket::Unicast,
         Node, Transport, TransportMessage,
     },
+    App,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +165,7 @@ impl Node for Client {
         // TODO byzantine on first reply
         if invoke.replied_replicas.is_empty() {
             invoke.result = message.result.clone();
-        } else if &message.result != &invoke.result {
+        } else if message.result != invoke.result {
             println!("! mismatch result");
             return;
         }
@@ -195,5 +205,280 @@ impl Client {
         self.invoke.as_mut().unwrap().timer_id = self
             .transport
             .create_timer(Duration::from_secs(1), on_resend);
+    }
+}
+
+pub struct Replica {
+    transport: Transport<Self>,
+    id: ReplicaId,
+    app: Box<dyn App + Send>,
+
+    view_number: ViewNumber,
+    op_number: OpNumber,
+    commit_number: OpNumber,
+    log: Vec<LogEntry>,
+    client_table: HashMap<ClientId, (RequestNumber, Option<Reply>)>,
+    reorder_pre_prepare: Reorder<(PrePrepare, Vec<Request>)>,
+    prepare_quorums: HashMap<(OpNumber, Digest), HashMap<ReplicaId, Prepare>>,
+    commit_quorums: HashMap<(OpNumber, Digest), HashMap<ReplicaId, Commit>>,
+    batch: Vec<Request>,
+    batch_size: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LogEntry {
+    status: LogStatus,
+    view_number: ViewNumber,
+    requests: Vec<Request>,
+    pre_prepare: PrePrepare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum LogStatus {
+    Preparing,
+    Committing,
+    Committed,
+}
+
+impl Node for Replica {
+    type Message = Message;
+    fn inbound_action(
+        &self,
+        packet: crate::transport::InboundPacket<'_, Self::Message>,
+    ) -> crate::transport::InboundAction<Self::Message> {
+        let message = if let Unicast { message } = packet {
+            message
+        } else {
+            return Block;
+        };
+        match message {
+            Message::Request(_) => Allow(message),
+            Message::PrePrepare(PrePrepare { view_number, .. }, _) => {
+                if view_number == self.view_number {
+                    VerifyReplica(message, self.transport.config.primary(self.view_number))
+                } else {
+                    Block
+                }
+            }
+            Message::Prepare(Prepare { replica_id, .. })
+            | Message::Commit(Commit { replica_id, .. }) => VerifyReplica(message, replica_id),
+            _ => Block,
+        }
+    }
+
+    fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
+        match message {
+            TransportMessage::Allowed(Message::Request(message)) => self.handle_request(message),
+            TransportMessage::Signed(Message::PrePrepare(message, requests)) => {
+                self.transport.send_message(
+                    ToAll,
+                    Message::PrePrepare(message.clone(), requests.clone()),
+                );
+                self.insert_pre_prepare(message, requests);
+            }
+            TransportMessage::Verified(Message::PrePrepare(message, requests)) => {
+                self.handle_pre_prepare(message, requests)
+            }
+            // careful for reusing
+            TransportMessage::Signed(Message::Prepare(message))
+            | TransportMessage::Verified(Message::Prepare(message)) => self.handle_prepare(message),
+            TransportMessage::Signed(Message::Commit(message))
+            | TransportMessage::Verified(Message::Commit(message)) => self.handle_commit(message),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Replica {
+    fn handle_request(&mut self, message: Request) {
+        if let Some((request_number, reply)) = self.client_table.get(&message.client_id) {
+            if message.request_number < *request_number {
+                return;
+            }
+            if message.request_number == *request_number {
+                if let Some(reply) = reply {
+                    self.transport.send_signed_message(
+                        To(message.client_id.0),
+                        Message::Reply(reply.clone()),
+                        self.id,
+                    );
+                }
+                return;
+            }
+        }
+
+        if self.transport.config.primary(self.view_number) != self.id {
+            todo!()
+        }
+
+        self.client_table
+            .insert(message.client_id, (message.request_number, None));
+        self.batch.push(message);
+        if self.batch.len() >= self.batch_size {
+            self.close_batch();
+        }
+    }
+
+    fn close_batch(&mut self) {
+        self.op_number += 1;
+        let batch = take(&mut self.batch);
+        let digest = digest(&batch);
+        let pre_prepare = PrePrepare {
+            view_number: self.view_number,
+            op_number: self.op_number,
+            digest,
+            signature: Signature::default(),
+        };
+        self.transport.send_signed_message(
+            ToSelf,
+            Message::PrePrepare(pre_prepare, batch),
+            self.id,
+        );
+    }
+
+    fn handle_pre_prepare(&mut self, message: PrePrepare, requests: Vec<Request>) {
+        if message.view_number != self.view_number {
+            return;
+        }
+        if message.op_number <= self.op_number {
+            return;
+        }
+        if digest(&requests) != message.digest {
+            return;
+        }
+        self.insert_pre_prepare(message, requests);
+    }
+
+    fn insert_pre_prepare(&mut self, message: PrePrepare, requests: Vec<Request>) {
+        let mut ordered = self
+            .reorder_pre_prepare
+            .insert_reorder(message.op_number, (message, requests));
+        while let Some((message, requests)) = ordered {
+            self.prepare(message, requests);
+            ordered = self.reorder_pre_prepare.expect_next();
+        }
+    }
+
+    fn prepare(&mut self, message: PrePrepare, requests: Vec<Request>) {
+        assert_eq!(message.op_number, self.log.len() as OpNumber + 1);
+        if self.id != self.transport.config.primary(self.view_number) {
+            assert_eq!(message.op_number, self.op_number + 1);
+            self.op_number = message.op_number;
+            let prepare = Prepare {
+                view_number: self.view_number,
+                op_number: self.op_number,
+                digest: message.digest,
+                replica_id: self.id,
+                signature: Signature::default(),
+            };
+            self.transport
+                .send_signed_message(ToSelf, Message::Prepare(prepare), self.id);
+        }
+        self.log.push(LogEntry {
+            status: LogStatus::Preparing,
+            view_number: self.view_number,
+            requests,
+            pre_prepare: message,
+        });
+    }
+
+    fn handle_prepare(&mut self, message: Prepare) {
+        if message.view_number != self.view_number {
+            return;
+        }
+        if self
+            .log
+            .get(message.op_number as usize - 1)
+            .map(|entry| {
+                entry.status == LogStatus::Committing || entry.status == LogStatus::Committed
+            })
+            .unwrap_or(false)
+        {
+            // reply for slow peer
+            return;
+        }
+
+        let quorum = self
+            .prepare_quorums
+            .entry((message.op_number, message.digest))
+            .or_default();
+        quorum.insert(message.replica_id, message.clone());
+        if quorum.len() == self.transport.config.f * 2 + 1 {
+            self.commit(message.op_number);
+        }
+    }
+
+    // in PBFT commit is entering commit phase
+    // reaching commit point is `execute`
+    fn commit(&mut self, op_number: OpNumber) {
+        let entry = &mut self.log[op_number as usize - 1];
+        assert_eq!(entry.status, LogStatus::Preparing);
+        entry.status = LogStatus::Committing;
+        let commit = Commit {
+            view_number: self.view_number,
+            op_number,
+            digest: entry.pre_prepare.digest,
+            replica_id: self.id,
+            signature: Signature::default(),
+        };
+        self.transport
+            .send_signed_message(ToSelf, Message::Commit(commit), self.id);
+    }
+
+    fn handle_commit(&mut self, message: Commit) {
+        if message.view_number != self.view_number {
+            return;
+        }
+        let op_number = message.op_number;
+        if self
+            .log
+            .get(op_number as usize - 1)
+            .map(|entry| entry.status == LogStatus::Committed)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let quorum = self
+            .commit_quorums
+            .entry((op_number, message.digest))
+            .or_default();
+        quorum.insert(message.replica_id, message);
+        if quorum.len() == self.transport.config.f * 2 + 1 {
+            self.execute(op_number);
+        }
+    }
+
+    fn execute(&mut self, op_number: OpNumber) {
+        let entry = &mut self.log[op_number as usize - 1];
+        assert_eq!(entry.status, LogStatus::Committing);
+        entry.status = LogStatus::Committed;
+
+        while let Some(entry) = self.log.get(self.commit_number as usize) {
+            if entry.status != LogStatus::Committed {
+                break;
+            }
+            self.commit_number += 1;
+            for request in &entry.requests {
+                let result = self.app.replica_upcall(self.commit_number, &request.op);
+                let reply = Reply {
+                    view_number: self.view_number,
+                    request_number: request.request_number,
+                    client_id: request.client_id,
+                    result,
+                    replica_id: self.id,
+                    signature: Signature::default(),
+                };
+                self.client_table.insert(
+                    request.client_id,
+                    (request.request_number, Some(reply.clone())),
+                );
+                self.transport.send_signed_message(
+                    To(request.client_id.0),
+                    Message::Reply(reply),
+                    self.id,
+                );
+            }
+        }
     }
 }

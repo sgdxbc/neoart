@@ -343,7 +343,8 @@ pub struct Replica {
     history_digest: Digest,
 
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, (RequestNumber, Option<Message>)>, // always Message::SpecResponse
+    // always Message::SpecResponse(..), i don't want to keep separated parts
+    client_table: HashMap<ClientId, (RequestNumber, Option<Message>)>,
     log: Vec<LogEntry>,
     commit_certificate: CommitCertificate, // highest
     reorder_order_req: Reorder<(OrderReq, Vec<Request>)>,
