@@ -42,6 +42,7 @@ for entry in mgid.dump(return_ents=True) or []:
     entry.remove()
 ig_prsr.neo_port.clear()
 ig_prsr.neo_control_reset_port.clear()
+ig_prsr.neo_accel_port.clear()
 
 for dst_addr, port in DMAC:
     ig.dmac.add_with_send(dst_addr=dst_addr, port=port)

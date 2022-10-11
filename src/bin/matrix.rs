@@ -5,7 +5,10 @@ use std::{
     mem::take,
     net::TcpListener,
     process::id,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering::SeqCst},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -14,7 +17,7 @@ use neoart::{
     bin::{MatrixArgs, MatrixProtocol},
     crypto::{CryptoMessage, Executor},
     meta::{Config, OpNumber, ARGS_SERVER_PORT},
-    neo,
+    neo, pbft,
     transport::{MulticastListener, Node, Run, Socket, Transport},
     unreplicated, zyzzyva, App, Client,
 };
@@ -59,18 +62,18 @@ fn main() {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient => {
-            // let counter = Arc::new(AtomicU32::new(0));
+            let counter = Arc::new(AtomicU32::new(0));
             runtime::Builder::new_multi_thread()
                 .enable_all()
                 // .worker_threads(20) // because currently client server has isolation
-                // .on_thread_start({
-                //     let counter = counter.clone();
-                //     move || {
-                //         let mut cpu_set = CpuSet::new();
-                //         cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
-                //         sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
-                //     }
-                // })
+                .on_thread_start({
+                    let counter = counter.clone();
+                    move || {
+                        let mut cpu_set = CpuSet::new();
+                        cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
+                        sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                    }
+                })
                 .build()
                 .unwrap()
         }
@@ -124,6 +127,14 @@ fn main() {
                 .await
             }
             MatrixProtocol::NeoClient => run_clients(args, neo::Client::new).await,
+            MatrixProtocol::PbftReplica { enable_batching } => {
+                let replica_id = args.replica_id;
+                run_replica(args, executor, |transport| {
+                    pbft::Replica::new(transport, replica_id, Null, enable_batching)
+                })
+                .await
+            }
+            MatrixProtocol::PbftClient => run_clients(args, pbft::Client::new).await,
             _ => unreachable!(),
         }
     });

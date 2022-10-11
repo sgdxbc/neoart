@@ -222,6 +222,9 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
                 variant: spec.multicast.variant,
                 enable_vote: spec.task.enable_vote,
             },
+            "pbft" => MatrixProtocol::PbftReplica {
+                enable_batching: spec.task.batching,
+            },
             _ => panic!(),
         },
         replica_id: index as ReplicaId,
@@ -241,6 +244,7 @@ fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
                 assume_byz: spec.task.assume_byz,
             },
             "neo" => MatrixProtocol::NeoClient,
+            "pbft" => MatrixProtocol::PbftClient,
             _ => panic!(),
         },
         replica_id: 0,

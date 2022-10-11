@@ -12,7 +12,9 @@ use tokio::sync::oneshot;
 use crate::{
     common::Reorder,
     crypto::{CryptoMessage, Signature},
-    meta::{digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber},
+    meta::{
+        digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER,
+    },
     transport::{
         Destination::{To, ToAll, ToReplica, ToSelf},
         InboundAction::{Allow, Block, VerifyReplica},
@@ -170,7 +172,7 @@ impl Node for Client {
             return;
         }
         invoke.replied_replicas.insert(message.replica_id);
-        if invoke.replied_replicas.len() == self.transport.config.f * 2 + 1 {
+        if invoke.replied_replicas.len() == self.transport.config.f + 1 {
             let invoke = self.invoke.take().unwrap();
             self.transport.cancel_timer(invoke.timer_id);
             assert!(message.view_number >= self.view_number);
@@ -222,7 +224,7 @@ pub struct Replica {
     prepare_quorums: HashMap<(OpNumber, Digest), HashMap<ReplicaId, Prepare>>,
     commit_quorums: HashMap<(OpNumber, Digest), HashMap<ReplicaId, Commit>>,
     batch: Vec<Request>,
-    batch_size: usize,
+    enable_batching: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -238,6 +240,37 @@ enum LogStatus {
     Preparing,
     Committing,
     Committed,
+}
+
+impl Replica {
+    pub fn new(
+        transport: Transport<Self>,
+        id: ReplicaId,
+        app: impl App + Send + 'static,
+        enable_batching: bool,
+    ) -> Self {
+        Self {
+            transport,
+            id,
+            app: Box::new(app),
+            view_number: 0,
+            op_number: 0,
+            commit_number: 0,
+            log: Vec::with_capacity(ENTRY_NUMBER),
+            client_table: HashMap::new(),
+            reorder_pre_prepare: Reorder::new(1),
+            prepare_quorums: HashMap::new(),
+            commit_quorums: HashMap::new(),
+            batch: Vec::new(),
+            enable_batching,
+        }
+    }
+}
+
+impl AsMut<Transport<Self>> for Replica {
+    fn as_mut(&mut self) -> &mut Transport<Self> {
+        &mut self.transport
+    }
 }
 
 impl Node for Replica {
@@ -280,10 +313,18 @@ impl Node for Replica {
                 self.handle_pre_prepare(message, requests)
             }
             // careful for reusing
-            TransportMessage::Signed(Message::Prepare(message))
-            | TransportMessage::Verified(Message::Prepare(message)) => self.handle_prepare(message),
-            TransportMessage::Signed(Message::Commit(message))
-            | TransportMessage::Verified(Message::Commit(message)) => self.handle_commit(message),
+            TransportMessage::Signed(Message::Prepare(message)) => {
+                self.transport
+                    .send_message(ToAll, Message::Prepare(message.clone()));
+                self.handle_prepare(message);
+            }
+            TransportMessage::Verified(Message::Prepare(message)) => self.handle_prepare(message),
+            TransportMessage::Signed(Message::Commit(message)) => {
+                self.transport
+                    .send_message(ToAll, Message::Commit(message.clone()));
+                self.handle_commit(message);
+            }
+            TransportMessage::Verified(Message::Commit(message)) => self.handle_commit(message),
             _ => unreachable!(),
         }
     }
@@ -314,7 +355,9 @@ impl Replica {
         self.client_table
             .insert(message.client_id, (message.request_number, None));
         self.batch.push(message);
-        if self.batch.len() >= self.batch_size {
+
+        // everything proposed has been committed already
+        if !self.enable_batching || self.op_number == self.commit_number {
             self.close_batch();
         }
     }
@@ -479,6 +522,27 @@ impl Replica {
                     self.id,
                 );
             }
+        }
+
+        // adaptive batching
+        if self.id == self.transport.config.primary(self.view_number) && !self.batch.is_empty() {
+            self.close_batch();
+        }
+    }
+}
+
+impl Drop for Replica {
+    fn drop(&mut self) {
+        if self.op_number != 0 {
+            let n_request = self
+                .log
+                .iter()
+                .map(|entry| entry.requests.len())
+                .sum::<usize>();
+            println!(
+                "Average batch size {}",
+                n_request as f32 / self.op_number as f32
+            );
         }
     }
 }

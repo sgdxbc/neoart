@@ -71,6 +71,10 @@ pub mod bin {
             enable_vote: bool,
         },
         NeoClient,
+        PbftReplica {
+            enable_batching: bool,
+        },
+        PbftClient,
     }
 
     impl Default for MatrixProtocol {
