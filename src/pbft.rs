@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    mem::take,
     pin::Pin,
     time::Duration,
 };
@@ -98,7 +97,6 @@ pub struct Client {
 
 struct Invoke {
     request: Request,
-    to_all: bool,
     result: Vec<u8>,
     replied_replicas: HashSet<ReplicaId>,
     continuation: oneshot::Sender<Vec<u8>>,
@@ -135,7 +133,6 @@ impl crate::Client for Client {
         let (continuation, result) = oneshot::channel();
         self.invoke = Some(Invoke {
             request,
-            to_all: false,
             timer_id: 0,
             continuation,
             result: Vec::new(),
@@ -185,9 +182,8 @@ impl Node for Client {
 impl Client {
     fn send_request(&mut self) {
         let invoke = &self.invoke.as_ref().unwrap();
-        // TODO send to all on resend
         self.transport.send_message(
-            if invoke.to_all {
+            if invoke.timer_id != 0 {
                 ToAll
             } else {
                 ToReplica(self.transport.config.primary(self.view_number))
@@ -201,7 +197,6 @@ impl Client {
                 request_number
             );
             println!("! client {} resend request {}", receiver.id, request_number);
-            receiver.invoke.as_mut().unwrap().to_all = true;
             receiver.send_request();
         };
         self.invoke.as_mut().unwrap().timer_id = self
@@ -243,6 +238,17 @@ enum LogStatus {
 }
 
 impl Replica {
+    const MAX_BATCH: usize = 70;
+    // the max gap between op_number (proposed sequence) and commit_number
+    // (executed seqeuence), where a lot of reordering is allowed to happen
+    // the number here is somewhat based on, the protocol can be intuitively
+    // pipelined into 7 stages according to critical path's signing/verifying,
+    // i.e. sign + verify pre-prepare, sign + verify prepare, sign + verify
+    // commit, and sign reply.
+    // evaluation also shows that core utilization approaches 100% with this
+    // configuration
+    const MAX_CONCURRENT: u32 = 7;
+
     pub fn new(
         transport: Transport<Self>,
         id: ReplicaId,
@@ -356,15 +362,19 @@ impl Replica {
             .insert(message.client_id, (message.request_number, None));
         self.batch.push(message);
 
-        // everything proposed has been committed already
-        if !self.enable_batching || self.op_number == self.commit_number {
+        // loop here?
+        if !self.enable_batching || self.op_number < self.commit_number + Self::MAX_CONCURRENT {
             self.close_batch();
         }
     }
 
     fn close_batch(&mut self) {
         self.op_number += 1;
-        let batch = take(&mut self.batch);
+        // let batch = take(&mut self.batch);
+        let batch = self
+            .batch
+            .drain(..usize::min(self.batch.len(), Self::MAX_BATCH))
+            .collect::<Vec<_>>();
         let digest = digest(&batch);
         let pre_prepare = PrePrepare {
             view_number: self.view_number,
@@ -466,6 +476,9 @@ impl Replica {
         };
         self.transport
             .send_signed_message(ToSelf, Message::Commit(commit), self.id);
+        // should be fine to not consider the case that commit certification is
+        // already collected, because the `ToSelf` message above will bring us
+        // into `handle_commit` at least once
     }
 
     fn handle_commit(&mut self, message: Commit) {
@@ -473,12 +486,12 @@ impl Replica {
             return;
         }
         let op_number = message.op_number;
-        if self
-            .log
-            .get(op_number as usize - 1)
-            .map(|entry| entry.status == LogStatus::Committed)
-            .unwrap_or(false)
-        {
+        let status = if let Some(entry) = self.log.get(op_number as usize - 1) {
+            entry.status
+        } else {
+            return;
+        };
+        if status == LogStatus::Committed {
             return;
         }
 
@@ -487,7 +500,7 @@ impl Replica {
             .entry((op_number, message.digest))
             .or_default();
         quorum.insert(message.replica_id, message);
-        if quorum.len() == self.transport.config.f * 2 + 1 {
+        if status == LogStatus::Committing && quorum.len() >= self.transport.config.f * 2 + 1 {
             self.execute(op_number);
         }
     }
@@ -525,8 +538,12 @@ impl Replica {
         }
 
         // adaptive batching
-        if self.id == self.transport.config.primary(self.view_number) && !self.batch.is_empty() {
-            self.close_batch();
+        if self.id == self.transport.config.primary(self.view_number) {
+            while !self.batch.is_empty()
+                && self.op_number < self.commit_number + Self::MAX_CONCURRENT
+            {
+                self.close_batch();
+            }
         }
     }
 }

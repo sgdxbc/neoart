@@ -142,8 +142,19 @@ async fn up_node(node: &Node, tag: String) -> JoinHandle<()> {
         .unwrap();
     let mut matrix_stream = BufReader::new(matrix.stdout.take().unwrap()).lines();
     spawn(async move {
+        let mut repeat_resend = 0;
         while let Some(line) = matrix_stream.next_line().await.unwrap() {
-            println!("{tag} {line}");
+            if !line.contains("resend") {
+                repeat_resend = 0;
+                println!("{tag} {line}");
+            } else {
+                repeat_resend += 1;
+                match repeat_resend {
+                    1 => println!("{tag} {line}"),
+                    2 => println!("{tag} (repeating...)"),
+                    _ => {}
+                }
+            }
         }
         let status = matrix.wait().await.unwrap();
         if status.success() {
@@ -250,6 +261,7 @@ fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
         replica_id: 0,
         host: spec.client[index].ip.to_string(),
         num_worker: 0,
-        num_client: spec.task.num_client / spec.client.len() as u32,
+        num_client: spec.task.num_client / spec.client.len() as u32
+            + (index < spec.task.num_client as usize % spec.client.len()) as u32,
     }
 }

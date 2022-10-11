@@ -71,7 +71,7 @@ fn main() {
                     move || {
                         let mut cpu_set = CpuSet::new();
                         cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
-                        sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                        // sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
                     }
                 })
                 .build()
@@ -173,6 +173,9 @@ async fn run_clients<T>(
     T: Node + Client + AsMut<Transport<T>> + Send + 'static,
     T::Message: CryptoMessage + DeserializeOwned,
 {
+    if args.num_client == 0 {
+        return;
+    }
     let notify = Arc::new(Notify::new());
     let latencies = Arc::new(Mutex::new(Vec::new()));
     let clients = repeat_with(|| {
