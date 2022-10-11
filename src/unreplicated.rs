@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -10,7 +10,7 @@ use crate::{
         Destination::{To, ToReplica},
         Node, Transport, TransportMessage,
     },
-    App,
+    App, InvokeResult,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +75,7 @@ impl AsMut<Transport<Self>> for Client {
 }
 
 impl crate::Client for Client {
-    fn invoke(&mut self, op: &[u8]) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> {
+    fn invoke(&mut self, op: &[u8]) -> InvokeResult {
         assert!(self.invoke.is_none());
         self.request_number += 1;
         let request = Request {

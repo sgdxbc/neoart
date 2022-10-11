@@ -1,9 +1,6 @@
-use std::{future::Future, pin::Pin};
-
-use crate::meta::OpNumber;
-
 pub mod common;
 pub mod crypto;
+pub mod hotstuff;
 pub mod meta;
 pub mod neo;
 pub mod pbft;
@@ -12,23 +9,24 @@ pub mod unreplicated;
 pub mod ycsb;
 pub mod zyzzyva;
 
+pub type InvokeResult = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>;
 pub trait Client {
-    fn invoke(&mut self, op: &[u8]) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>>;
+    fn invoke(&mut self, op: &[u8]) -> InvokeResult;
 }
 
 pub trait App {
-    fn replica_upcall(&mut self, op_number: OpNumber, op: &[u8]) -> Vec<u8>;
+    fn replica_upcall(&mut self, op_number: meta::OpNumber, op: &[u8]) -> Vec<u8>;
     #[allow(unused_variables)]
     fn rollback_upcall(
         &mut self,
-        current_number: OpNumber,
-        to_number: OpNumber,
-        ops: &[(OpNumber, &[u8])],
+        current_number: meta::OpNumber,
+        to_number: meta::OpNumber,
+        ops: &[(meta::OpNumber, &[u8])],
     ) {
         unimplemented!()
     }
     #[allow(unused_variables)]
-    fn commit_upcall(&mut self, op_number: OpNumber) {}
+    fn commit_upcall(&mut self, op_number: meta::OpNumber) {}
 }
 
 pub mod bin {

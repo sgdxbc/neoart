@@ -62,12 +62,11 @@ fn main() {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient => {
-            let counter = Arc::new(AtomicU32::new(0));
             runtime::Builder::new_multi_thread()
                 .enable_all()
                 // .worker_threads(20) // because currently client server has isolation
                 .on_thread_start({
-                    let counter = counter.clone();
+                    let counter = Arc::new(AtomicU32::new(0));
                     move || {
                         let mut cpu_set = CpuSet::new();
                         cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();

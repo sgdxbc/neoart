@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     mem::take,
-    pin::Pin,
     time::Duration,
 };
 
@@ -20,7 +18,7 @@ use crate::{
         Destination::{To, ToAll, ToReplica, ToSelf},
         InboundAction, InboundPacket, Node, Transport, TransportMessage,
     },
-    App,
+    App, InvokeResult,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,7 +184,7 @@ impl AsMut<Transport<Self>> for Client {
 }
 
 impl crate::Client for Client {
-    fn invoke(&mut self, op: &[u8]) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> {
+    fn invoke(&mut self, op: &[u8]) -> InvokeResult {
         assert!(self.invoke.is_none());
         self.request_number += 1;
         let request = Request {

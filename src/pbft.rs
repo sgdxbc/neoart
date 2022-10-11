@@ -1,7 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
-    pin::Pin,
     time::Duration,
 };
 
@@ -20,7 +18,7 @@ use crate::{
         InboundPacket::Unicast,
         Node, Transport, TransportMessage,
     },
-    App,
+    App, InvokeResult,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,7 +120,7 @@ impl AsMut<Transport<Self>> for Client {
 }
 
 impl crate::Client for Client {
-    fn invoke(&mut self, op: &[u8]) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> {
+    fn invoke(&mut self, op: &[u8]) -> InvokeResult {
         assert!(self.invoke.is_none());
         self.request_number += 1;
         let request = Request {
@@ -500,7 +498,9 @@ impl Replica {
             .entry((op_number, message.digest))
             .or_default();
         quorum.insert(message.replica_id, message);
-        if status == LogStatus::Committing && quorum.len() >= self.transport.config.f * 2 + 1 {
+        if status == LogStatus::Committing
+            && quorum.len() >= self.transport.config.n - self.transport.config.f
+        {
             self.execute(op_number);
         }
     }
