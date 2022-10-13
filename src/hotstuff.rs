@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     crypto::{verify_message, CryptoMessage, Signature},
-    meta::{digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber},
+    meta::{digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
         Destination::{To, ToAll, ToReplica},
         InboundAction,
@@ -156,7 +156,7 @@ impl Node for Client {
             return;
         }
         invoke.replied_replicas.insert(message.replica_id);
-        if invoke.replied_replicas.len() == self.transport.config.f * 2 + 1 {
+        if invoke.replied_replicas.len() == self.transport.config.f + 1 {
             let invoke = self.invoke.take().unwrap();
             self.transport.cancel_timer(invoke.timer_id);
             invoke.continuation.send(message.result).unwrap();
@@ -345,12 +345,12 @@ impl HotStuffBase {
         }
 
         let mut commit_blocks = Vec::new();
-        let mut block = block;
-        while arena[block].height > arena[self.core.block_execute].height {
-            commit_blocks.push(block);
-            block = arena[block].parent;
+        let mut b = block;
+        while arena[b].height > arena[self.core.block_execute].height {
+            commit_blocks.push(b);
+            b = arena[b].parent;
         }
-        assert_eq!(block, self.core.block_execute);
+        assert_eq!(b, self.core.block_execute);
         for block in commit_blocks.into_iter().rev() {
             // println!("commit {:02x?}", self.core.storage.arena[block].hash);
             self.core.storage.arena[block].status = BlockStatus::Decided;
@@ -359,18 +359,18 @@ impl HotStuffBase {
                 self.do_decide(block, i);
             }
         }
+        self.core.block_execute = block;
     }
 
     fn on_propose(&mut self, requests: Vec<Request>, parent: BlockId) -> BlockId {
         self.core.tails.remove(&parent);
-        let block_new = self.core.storage.arena.len();
         let data = Block {
             requests,
             parent_hash: self.core.storage.arena[parent].hash,
             quorum_certificate: self.core.high_quorum_certificate.1.clone(),
         };
         let hash = digest(&data);
-        self.add_block(StorageBlock {
+        let block_new = self.add_block(StorageBlock {
             data: data.clone(),
             quorum_certificate_reference: self.core.high_quorum_certificate.0,
             quorum_certificate: Some(QuorumCertificate {
@@ -515,8 +515,8 @@ impl HotStuffBase {
     // the beat strategy is modified (mostly simplified), to prevent introduce
     // timeout on critical path when concurrent request number is less than
     // batch size
-    // in this implementation it is equivalent to manual rounds start
-    // immediately after new QC get collected.
+    // in this implementation it is equivalent to next proposing or manual
+    // rounds start immediately after new QC get collected
     const MAX_BATCH: usize = 70;
     fn beat(&mut self) {
         // TODO rotating
@@ -602,6 +602,7 @@ impl HotStuffBase {
             ..Default::default()
         });
         if !self.is_block_delivered(&parent_hash) {
+            println!("! message pending deliver");
             self.waiting_messages
                 .entry(parent_hash)
                 .or_default()
@@ -692,6 +693,14 @@ pub type Replica = HotStuffBase;
 impl Replica {
     const BLOCK_GENESIS: BlockId = 0;
     pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
+        let mut arena = Vec::with_capacity(ENTRY_NUMBER);
+        arena.push(StorageBlock {
+            height: 0,
+            status: BlockStatus::Decided,
+            ..StorageBlock::default()
+        });
+        let mut block_ids = HashMap::with_capacity(ENTRY_NUMBER);
+        block_ids.insert(Digest::default(), Self::BLOCK_GENESIS);
         Self {
             transport,
             core: HotStuffCore {
@@ -701,16 +710,7 @@ impl Replica {
                 high_quorum_certificate: (0, QuorumCertificate::default()),
                 tails: HashSet::new(),
                 id,
-                storage: Storage {
-                    arena: vec![StorageBlock {
-                        height: 0,
-                        status: BlockStatus::Decided,
-                        ..StorageBlock::default()
-                    }],
-                    block_ids: [(Digest::default(), Self::BLOCK_GENESIS)]
-                        .into_iter()
-                        .collect(),
-                },
+                storage: Storage { arena, block_ids },
             },
             pacemaker: PaceMaker {
                 high_quorum_certificate_tail: Self::BLOCK_GENESIS,

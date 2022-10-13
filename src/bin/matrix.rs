@@ -210,7 +210,7 @@ async fn run_clients<T>(
     accumulated_latencies.sort_unstable();
     if !accumulated_latencies.is_empty() {
         println!(
-            "50th {:?} 99th {:?}",
+            "* 50th {:?} 99th {:?}",
             accumulated_latencies[accumulated_latencies.len() / 2],
             accumulated_latencies[accumulated_latencies.len() / 100 * 99]
         );
