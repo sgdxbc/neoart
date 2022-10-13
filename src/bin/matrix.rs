@@ -16,6 +16,7 @@ use bincode::Options;
 use neoart::{
     bin::{MatrixArgs, MatrixProtocol},
     crypto::{CryptoMessage, Executor},
+    hotstuff,
     meta::{Config, OpNumber, ARGS_SERVER_PORT},
     neo, pbft,
     transport::{MulticastListener, Node, Run, Socket, Transport},
@@ -61,7 +62,8 @@ fn main() {
     let runtime = match &args.protocol {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
-        | MatrixProtocol::NeoClient => {
+        | MatrixProtocol::NeoClient
+        | MatrixProtocol::HotStuffClient => {
             runtime::Builder::new_multi_thread()
                 .enable_all()
                 // .worker_threads(20) // because currently client server has isolation
@@ -90,7 +92,9 @@ fn main() {
         }
     };
     runtime.block_on(async move {
+        let replica_id = args.replica_id;
         match args.protocol {
+            MatrixProtocol::Unknown => unreachable!(),
             MatrixProtocol::UnreplicatedReplica => {
                 run_replica(args, executor, |transport| {
                     unreplicated::Replica::new(transport, 0, Null)
@@ -101,7 +105,6 @@ fn main() {
                 run_clients(args, unreplicated::Client::new).await
             }
             MatrixProtocol::ZyzzyvaReplica { enable_batching } => {
-                let replica_id = args.replica_id;
                 run_replica(args, executor, |transport| {
                     zyzzyva::Replica::new(transport, replica_id, Null, enable_batching)
                 })
@@ -118,7 +121,6 @@ fn main() {
                 enable_vote,
             } => {
                 let socket = UdpSocket::bind(args.config.multicast).await.unwrap();
-                let replica_id = args.replica_id;
                 run_replica(args, executor, |mut transport| {
                     transport.listen_multicast(MulticastListener::Os(socket), variant);
                     neo::Replica::new(transport, replica_id, Null, enable_vote)
@@ -127,14 +129,19 @@ fn main() {
             }
             MatrixProtocol::NeoClient => run_clients(args, neo::Client::new).await,
             MatrixProtocol::PbftReplica { enable_batching } => {
-                let replica_id = args.replica_id;
                 run_replica(args, executor, |transport| {
                     pbft::Replica::new(transport, replica_id, Null, enable_batching)
                 })
                 .await
             }
             MatrixProtocol::PbftClient => run_clients(args, pbft::Client::new).await,
-            _ => unreachable!(),
+            MatrixProtocol::HotStuffReplica => {
+                run_replica(args, executor, |transport| {
+                    hotstuff::Replica::new(transport, replica_id, Null)
+                })
+                .await
+            }
+            MatrixProtocol::HotStuffClient => run_clients(args, hotstuff::Client::new).await,
         }
     });
 }

@@ -40,4 +40,12 @@ impl<M> Reorder<M> {
         self.expected += 1;
         self.messages.remove(&self.expected)
     }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&mut self) -> bool {
+        self.len() == 0
+    }
 }

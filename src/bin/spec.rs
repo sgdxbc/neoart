@@ -236,6 +236,7 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
             "pbft" => MatrixProtocol::PbftReplica {
                 enable_batching: spec.task.batching,
             },
+            "hotstuff" => MatrixProtocol::HotStuffReplica,
             _ => panic!(),
         },
         replica_id: index as ReplicaId,
@@ -256,6 +257,7 @@ fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
             },
             "neo" => MatrixProtocol::NeoClient,
             "pbft" => MatrixProtocol::PbftClient,
+            "hotstuff" => MatrixProtocol::HotStuffClient,
             _ => panic!(),
         },
         replica_id: 0,

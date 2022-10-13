@@ -73,6 +73,8 @@ pub mod bin {
             enable_batching: bool,
         },
         PbftClient,
+        HotStuffReplica,
+        HotStuffClient,
     }
 
     impl Default for MatrixProtocol {

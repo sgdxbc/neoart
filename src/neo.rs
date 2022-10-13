@@ -754,24 +754,25 @@ impl Replica {
 
 impl Drop for Replica {
     fn drop(&mut self) {
-        if self.id == self.transport.config.primary(self.view_number)
-            && !self.vote_quorums.is_empty()
-        {
-            println!(
-                "estimated voting batch size {}",
-                self.log.len() as f32 / self.vote_quorums.len() as f32
-            );
-        }
-        if !self.log.is_empty() {
-            let signed_count = self
-                .log
-                .iter()
-                .filter(|entry| Message::has_network_signature(&entry.request))
-                .count();
-            println!(
-                "network signature batch size {}",
-                self.log.len() as f32 / signed_count as f32
-            );
+        println!("reorder size {}", self.reorder_ordered_request.len());
+        if self.id == self.transport.config.primary(self.view_number) {
+            if !self.vote_quorums.is_empty() {
+                println!(
+                    "estimated voting batch size {}",
+                    self.log.len() as f32 / self.vote_quorums.len() as f32
+                );
+            }
+            if !self.log.is_empty() {
+                let signed_count = self
+                    .log
+                    .iter()
+                    .filter(|entry| Message::has_network_signature(&entry.request))
+                    .count();
+                println!(
+                    "network signature batch size {}",
+                    self.log.len() as f32 / signed_count as f32
+                );
+            }
         }
     }
 }
