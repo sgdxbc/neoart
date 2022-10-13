@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, time::Instant};
 
 use crate::{
-    common::Reorder,
+    common::{ClientTable, Reorder},
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
         digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
@@ -21,8 +21,13 @@ use crate::{
     },
     transport::{
         simulated,
-        Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        InboundAction, InboundPacket, MulticastVariant, Node, Transport,
+        // Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
+        Destination::{To, ToAll, ToMulticast, ToSelf},
+        InboundAction,
+        InboundPacket,
+        MulticastVariant,
+        Node,
+        Transport,
         TransportMessage::{self, Allowed, Signed, Verified},
     },
     App, InvokeResult,
@@ -350,7 +355,7 @@ pub struct Replica {
     id: ReplicaId,
     view_number: ViewNumber,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, Reply>,
+    client_table: ClientTable<Reply>,
     // log state:
     // (TODO committed)
     // speculative committed entries: 0..=speculative number, SpeculativeCommitted
@@ -429,7 +434,7 @@ impl Replica {
             id,
             view_number: 0,
             app: Box::new(app),
-            client_table: HashMap::new(),
+            client_table: ClientTable::default(),
             log: Vec::with_capacity(ENTRY_NUMBER),
             verify_number: 0,
             vote_number: 0,
@@ -505,7 +510,12 @@ impl Node for Replica {
             | Allowed(Message::OrderedRequest(message)) => self.handle_ordered_request(message),
             Verified(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
             // need to be caution to reuse...
-            Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
+            // Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
+            Signed(Message::MulticastVote(message)) => {
+                self.transport
+                    .send_message(ToAll, Message::MulticastVote(message.clone()));
+                self.handle_multicast_vote(message);
+            }
             Verified(Message::MulticastGeneric(message)) => self.handle_multicast_generic(message),
             _ => unreachable!(),
         }
@@ -561,38 +571,42 @@ impl Replica {
             return;
         }
 
-        if let Some(will_vote) = &self.will_vote {
-            assert_ne!(self.id, self.transport.config.primary(self.view_number));
-            assert!(self.vote_number < *will_vote.end());
-            if self.verify_number >= *will_vote.end() {
-                // println!("send postponed vote for {:?}", will_vote);
-                self.vote_number = *will_vote.end();
-                self.send_vote(will_vote.clone());
-                self.will_vote = None;
-            }
-        }
+        // if let Some(will_vote) = &self.will_vote {
+        //     assert_ne!(self.id, self.transport.config.primary(self.view_number));
+        //     assert!(self.vote_number < *will_vote.end());
+        //     if self.verify_number >= *will_vote.end() {
+        //         // println!("send postponed vote for {:?}", will_vote);
+        //         self.vote_number = *will_vote.end();
+        //         self.send_vote(will_vote.clone());
+        //         self.will_vote = None;
+        //     }
+        // }
 
-        // only trigger a new voting round if there is no outstanding voting
-        if self.id == self.transport.config.primary(self.view_number)
-            && self.speculative_number == self.vote_number
-        {
-            assert_ne!(self.verify_number, self.vote_number);
+        // // only trigger a new voting round if there is no outstanding voting
+        // if self.id == self.transport.config.primary(self.view_number)
+        //     && self.speculative_number == self.vote_number
+        // {
+        //     assert_ne!(self.verify_number, self.vote_number);
+        //     self.vote_number = self.verify_number;
+        //     let generic = MulticastGeneric {
+        //         vote_number: self.vote_number,
+        //         // there is no higher certificate collected, only an intention
+        //         // of new voting, so a null certificate is acceptable and
+        //         // reducing replica's verifying workload
+        //         view_number: 0,
+        //         sequence_number: u32::MAX..=self.speculative_number,
+        //         digest: Digest::default(),
+        //         quorum_signatures: Vec::new(),
+        //         signature: Signature::default(),
+        //     };
+        //     self.transport
+        //         .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
+        //     // TODO set timer
+        //     self.send_vote(self.speculative_number + 1..=self.vote_number);
+        // }
+        if self.verify_number % 70 == 0 {
+            self.send_vote(self.vote_number + 1..=self.verify_number);
             self.vote_number = self.verify_number;
-            let generic = MulticastGeneric {
-                vote_number: self.vote_number,
-                // there is no higher certificate collected, only an intention
-                // of new voting, so a null certificate is acceptable and
-                // reducing replica's verifying workload
-                view_number: 0,
-                sequence_number: u32::MAX..=self.speculative_number,
-                digest: Digest::default(),
-                quorum_signatures: Vec::new(),
-                signature: Signature::default(),
-            };
-            self.transport
-                .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
-            // TODO set timer
-            self.send_vote(self.speculative_number + 1..=self.vote_number);
         }
     }
 
@@ -600,42 +614,49 @@ impl Replica {
         // TODO assert is primary
         assert!(self.enable_vote);
 
-        if message.sequence_number != (self.speculative_number + 1..=self.vote_number) {
+        // if message.sequence_number != (self.speculative_number + 1..=self.vote_number) {
+        //     return;
+        // }
+        if *message.sequence_number.end() <= self.speculative_number {
             return;
         }
 
         let quorum = self
             .vote_quorums
-            .entry((self.vote_number, message.digest))
+            // .entry((self.vote_number, message.digest))
+            .entry((*message.sequence_number.end(), message.digest))
             .or_default();
         quorum.insert(message.replica_id, message.signature);
         if quorum.len() == self.transport.config.f * 2 + 1 {
-            let quorum_signatures = quorum
-                .iter()
-                .map(|(&id, &signature)| (id, signature))
-                .collect();
+            // let quorum_signatures = quorum
+            //     .iter()
+            //     .map(|(&id, &signature)| (id, signature))
+            //     .collect();
 
-            self.vote_number = self.verify_number;
-            // send certificate as soon as possible, even when vote batch is
-            // empty
-            let generic = MulticastGeneric {
-                view_number: self.view_number,
-                sequence_number: message.sequence_number,
-                digest: message.digest,
-                quorum_signatures,
-                vote_number: self.vote_number,
-                signature: Signature::default(),
-            };
-            self.transport
-                .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
+            // self.vote_number = self.verify_number;
+            // // send certificate as soon as possible, even when vote batch is
+            // // empty
+            // let generic = MulticastGeneric {
+            //     view_number: self.view_number,
+            //     sequence_number: message.sequence_number,
+            //     digest: message.digest,
+            //     quorum_signatures,
+            //     vote_number: self.vote_number,
+            //     signature: Signature::default(),
+            // };
+            // self.transport
+            //     .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
 
-            self.speculative_commit(self.vote_number);
+            // self.speculative_commit(self.vote_number);
 
-            // if there is no voting reply expected do not resend actively
-            if self.vote_number != self.speculative_number {
-                // TODO set timer for above generic
-                self.send_vote(self.speculative_number + 1..=self.vote_number);
-            }
+            // TODO
+            self.speculative_commit(*message.sequence_number.end());
+
+            // // if there is no voting reply expected do not resend actively
+            // if self.vote_number != self.speculative_number {
+            //     // TODO set timer for above generic
+            //     self.send_vote(self.speculative_number + 1..=self.vote_number);
+            // }
         }
     }
 
@@ -656,21 +677,18 @@ impl Replica {
         {
             assert_eq!(entry.status, LogStatus::Voting);
             entry.status = LogStatus::SpeculativeCommitted;
-            let mut execute = true;
-            if let Some(reply) = self.client_table.get(&entry.request.client_id) {
-                if reply.request_number > entry.request.request_number {
-                    execute = false;
-                }
-                if reply.request_number == entry.request.request_number {
+            if let Some(resend) = self
+                .client_table
+                .insert_prepare(entry.request.client_id, entry.request.request_number)
+            {
+                resend(|reply| {
                     self.transport.send_signed_message(
                         To(entry.request.client_id.0),
-                        Message::Reply(reply.clone()),
+                        Message::Reply(reply),
                         self.id,
-                    );
-                    execute = false;
-                }
-            }
-            if execute {
+                    )
+                });
+            } else {
                 let op_number = entry.request.sequence_number as OpNumber;
                 let result = self.app.replica_upcall(op_number, &entry.request.op);
                 let reply = Reply {
@@ -680,8 +698,11 @@ impl Replica {
                     replica_id: self.id,
                     signature: Signature::default(),
                 };
-                self.client_table
-                    .insert(entry.request.client_id, reply.clone());
+                self.client_table.insert_commit(
+                    entry.request.client_id,
+                    entry.request.request_number,
+                    reply.clone(),
+                );
                 self.transport.send_signed_message(
                     To(entry.request.client_id.0),
                     Message::Reply(reply),
@@ -739,13 +760,14 @@ impl Replica {
             replica_id: self.id,
             signature: Signature::default(),
         };
-        let primary_id = self.transport.config.primary(self.view_number);
+        // let primary_id = self.transport.config.primary(self.view_number);
         self.transport.send_signed_message(
-            if self.id == primary_id {
-                ToSelf
-            } else {
-                ToReplica(primary_id)
-            },
+            // if self.id == primary_id {
+            //     ToSelf
+            // } else {
+            //     ToReplica(primary_id)
+            // },
+            ToSelf,
             Message::MulticastVote(vote),
             self.id,
         );

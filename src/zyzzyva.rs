@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    common::Reorder,
+    common::{ClientTable, Reorder},
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{
         digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber,
@@ -342,7 +342,7 @@ pub struct Replica {
 
     app: Box<dyn App + Send>,
     // always Message::SpecResponse(..), i don't want to keep separated parts
-    client_table: HashMap<ClientId, (RequestNumber, Option<Message>)>,
+    client_table: ClientTable<Message>,
     log: Vec<LogEntry>,
     commit_certificate: CommitCertificate, // highest
     reorder_order_req: Reorder<(OrderReq, Vec<Request>)>,
@@ -381,7 +381,7 @@ impl Replica {
             op_number: 0,
             history_digest: Digest::default(),
             app: Box::new(app),
-            client_table: HashMap::new(),
+            client_table: ClientTable::default(),
             log: Vec::with_capacity(ENTRY_NUMBER),
             reorder_order_req: Reorder::new(1),
             commit_certificate: CommitCertificate::default(),
@@ -448,28 +448,21 @@ impl Node for Replica {
 
 impl Replica {
     fn handle_request(&mut self, message: Request) {
-        if let Some((request_number, spec_response)) = self.client_table.get(&message.client_id) {
-            if message.request_number < *request_number {
-                return;
-            }
-            if message.request_number == *request_number {
-                if let Some(spec_response) = spec_response {
-                    self.transport.send_signed_message(
-                        To(message.client_id.0),
-                        spec_response.clone(),
-                        self.id,
-                    );
-                }
-                return;
-            }
+        if let Some(resend) = self
+            .client_table
+            .insert_prepare(message.client_id, message.request_number)
+        {
+            resend(|response| {
+                self.transport
+                    .send_signed_message(To(message.client_id.0), response, self.id)
+            });
+            return;
         }
 
         if self.transport.config.primary(self.view_number) != self.id {
             todo!()
         }
 
-        self.client_table
-            .insert(message.client_id, (message.request_number, None));
         self.batch.push(message);
         if self.batch.len() < self.batch_size {
             return;
@@ -563,7 +556,7 @@ impl Replica {
             let request_number = request.request_number;
             // is this SpecResponse always up to date?
             self.client_table
-                .insert(client_id, (request_number, Some(spec_response.clone())));
+                .insert_commit(client_id, request_number, spec_response.clone());
             self.transport
                 .send_signed_message(To(client_id.0), spec_response, self.id);
         }

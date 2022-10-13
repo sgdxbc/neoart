@@ -1,6 +1,12 @@
-use std::collections::HashMap;
+use std::{
+    cmp::Ordering::{Equal, Greater, Less},
+    collections::HashMap,
+};
 
-use crate::{meta::OpNumber, App};
+use crate::{
+    meta::{ClientId, OpNumber, RequestNumber},
+    App,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TestApp {
@@ -45,7 +51,48 @@ impl<M> Reorder<M> {
         self.messages.len()
     }
 
-    pub fn is_empty(&mut self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+pub struct ClientTable<M>(HashMap<ClientId, (RequestNumber, Option<M>)>);
+impl<M> Default for ClientTable<M> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<M: Clone> ClientTable<M> {
+    pub fn insert_prepare<F: FnOnce(M)>(
+        &mut self,
+        id: ClientId,
+        request_number: RequestNumber,
+    ) -> Option<impl FnOnce(F)> {
+        let reply = if let Some((saved_number, reply)) = self.0.get(&id) {
+            match saved_number.cmp(&request_number) {
+                Greater => reply.clone(),
+                Equal => None,
+                Less => {
+                    self.0.insert(id, (request_number, None));
+                    return None;
+                }
+            }
+        } else {
+            self.0.insert(id, (request_number, None));
+            return None;
+        };
+        Some(|send: F| {
+            if let Some(reply) = reply {
+                send(reply)
+            }
+        })
+    }
+
+    pub fn insert_commit(&mut self, id: ClientId, request_number: RequestNumber, reply: M) {
+        let prev = self.0.insert(id, (request_number, Some(reply)));
+        if let Some((saved_number, _)) = prev {
+            assert!(saved_number <= request_number);
+        }
     }
 }

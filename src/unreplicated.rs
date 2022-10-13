@@ -1,9 +1,10 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
+    common::ClientTable,
     crypto::{CryptoMessage, Signature},
     meta::{ClientId, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
@@ -140,7 +141,7 @@ pub struct Replica {
     id: ReplicaId,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
-    client_table: HashMap<ClientId, Reply>,
+    client_table: ClientTable<Reply>,
     log: Vec<LogEntry>,
 }
 
@@ -157,7 +158,7 @@ impl Replica {
             id,
             op_number: 0,
             app: Box::new(app),
-            client_table: HashMap::new(),
+            client_table: ClientTable::default(),
             log: Vec::with_capacity(ENTRY_NUMBER),
         }
     }
@@ -178,34 +179,36 @@ impl Node for Replica {
         } else {
             unreachable!()
         };
-        if let Some(reply) = self.client_table.get(&message.client_id) {
-            if reply.request_number > message.request_number {
-                return;
-            }
-            if reply.request_number == message.request_number {
+        if let Some(resend) = self
+            .client_table
+            .insert_prepare(message.client_id, message.request_number)
+        {
+            resend(|reply| {
                 println!("! resend");
                 self.transport.send_signed_message(
                     To(message.client_id.0),
-                    Message::Reply(reply.clone()),
+                    Message::Reply(reply),
                     self.id,
                 );
-                return;
-            }
+            });
+            return;
         }
 
         self.op_number += 1;
         let result = self.app.replica_upcall(self.op_number, &message.op);
-        let reply = Message::Reply(Reply {
+        let reply = Reply {
             request_number: message.request_number,
             result,
             signature: Signature::default(),
-        });
+        };
         self.log.push(LogEntry {
             request: message.clone(),
         });
         assert_eq!(self.log.len() as OpNumber, self.op_number);
+        self.client_table
+            .insert_commit(message.client_id, message.request_number, reply.clone());
         self.transport
-            .send_signed_message(To(message.client_id.0), reply, self.id);
+            .send_signed_message(To(message.client_id.0), Message::Reply(reply), self.id);
     }
 }
 
