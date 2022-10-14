@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
+    common::ClientTable,
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
@@ -57,7 +58,10 @@ pub struct Reply {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
-    block: Block,
+    requests: Vec<Request>,
+    parent_hash: Digest,
+    certified_hash: Digest,
+    quorum_certificate: Vec<(ReplicaId, Signature)>,
     proposer: ReplicaId,
 }
 
@@ -185,28 +189,46 @@ impl Client {
 }
 
 type BlockId = usize;
-struct HotStuffCore {
+pub struct Replica {
+    // TODO fetch context
+    transport: Transport<Self>,
+    app: Box<dyn App + Send>,
+    // block hash => list of messages that cannot make progress without keyed
+    // block exist
+    // the explicit state of libhotstuff's `blk_fetch_waiting` and
+    // `blk_deliver_waiting`, which implicit construct this state with varaible
+    // capturing of closures registered to promises
+    waiting_messages: HashMap<Digest, Vec<Message>>,
+    client_table: ClientTable<Reply>,
+    pending_requests: Vec<Request>,
+
     // block0: usize, // fixed zero
     block_lock: BlockId,
     block_execute: BlockId,
     voted_height: OpNumber,
     // (certified block, QC)
-    high_quorum_certificate: (BlockId, QuorumCertificate),
+    high_quorum_certificate: BlockId,
     // libhotstuff uses ordered `std::set`, i don't see why
-    tails: HashSet<BlockId>,
+    // tails: HashSet<BlockId>,
     id: ReplicaId,
     // command cache is never utilize in libhotstuff so omit it
     storage: Storage,
+
+    propose_parent: BlockId,
+    manual_round: u32,
+    quorum_certificate_finished: bool,
 }
 
 #[derive(Default)]
 struct StorageBlock {
-    data: Block,
+    requests: Vec<Request>,
     hash: Digest, // reverse index of `block_ids`
     height: OpNumber,
     status: BlockStatus,
+    parent_hash: Digest,
     parent: BlockId,
-    quorum_certificate_reference: BlockId,
+    certified: BlockId,
+    certified_hash: Digest,
     // the `self_quorum_certificate` in libhotstuff
     // seems like "self" means this is the QC for this block "itself", different
     // from the reference above
@@ -214,7 +236,7 @@ struct StorageBlock {
     // very necessary
     // notice: reusing `QuorumCertificate` struct as container, which may not
     // be fully collected to become a valid QC (yet)
-    quorum_certificate: Option<QuorumCertificate>,
+    quorum_certificate: Option<Vec<(ReplicaId, Signature)>>,
     voted: HashSet<ReplicaId>,
 }
 
@@ -236,407 +258,76 @@ impl Default for BlockStatus {
     }
 }
 
-struct PaceMaker {
-    high_quorum_certificate_tail: BlockId,
-    manual_round: u32,
-    quorum_certificate_finished: bool,
-}
-
-pub struct HotStuffBase {
-    // TODO fetch context
-    transport: Transport<Self>,
-    core: HotStuffCore,
-    pacemaker: PaceMaker,
-    app: Box<dyn App + Send>,
-
-    // block hash => list of messages that cannot make progress without keyed
-    // block exist
-    // the explicit state of libhotstuff's `blk_fetch_waiting` and
-    // `blk_deliver_waiting`, which implicit construct this state with varaible
-    // capturing of closures registered to promises
-    waiting_messages: HashMap<Digest, Vec<Message>>,
-    client_table: HashMap<ClientId, (RequestNumber, Option<Reply>)>,
-    pending_requests: Vec<Request>,
-}
-
-// HotStuffCore
-impl HotStuffBase {
-    // storage
-    fn add_block(&mut self, mut block: StorageBlock) -> BlockId {
-        block.hash = digest(&block.data);
-        let block_id = self.core.storage.arena.len();
-        self.core.storage.block_ids.insert(block.hash, block_id);
-        self.core.storage.arena.push(block);
-        block_id
-    }
-
-    fn is_block_delivered(&self, hash: &Digest) -> bool {
-        if let Some(&block) = self.core.storage.block_ids.get(hash) {
-            self.core.storage.arena[block].status != BlockStatus::Delivering
-        } else {
-            false
+impl Replica {
+    const BLOCK_GENESIS: BlockId = 0;
+    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
+        let mut arena = Vec::with_capacity(ENTRY_NUMBER);
+        // genesis
+        arena.push(StorageBlock {
+            height: 0,
+            status: BlockStatus::Decided,
+            quorum_certificate: Some(Vec::new()),
+            ..StorageBlock::default()
+        });
+        let mut block_ids = HashMap::with_capacity(ENTRY_NUMBER);
+        block_ids.insert(Digest::default(), Self::BLOCK_GENESIS);
+        Self {
+            transport,
+            app: Box::new(app),
+            waiting_messages: HashMap::new(),
+            client_table: ClientTable::default(),
+            pending_requests: Vec::new(),
+            block_lock: Self::BLOCK_GENESIS,
+            block_execute: Self::BLOCK_GENESIS,
+            voted_height: 0,
+            high_quorum_certificate: Self::BLOCK_GENESIS,
+            id,
+            storage: Storage { arena, block_ids },
+            propose_parent: Self::BLOCK_GENESIS,
+            manual_round: 0,
+            quorum_certificate_finished: true,
         }
     }
+}
 
-    fn on_deliver_block(&mut self, block: BlockId) -> bool {
-        let arena = &mut self.core.storage.arena;
-        if arena[block].status != BlockStatus::Delivering {
-            println!("! attempt to deliver a block twice");
+impl AsMut<Transport<Self>> for Replica {
+    fn as_mut(&mut self) -> &mut Transport<Self> {
+        &mut self.transport
+    }
+}
+
+impl Message {
+    fn verify_proposal(&mut self, config: &Config) -> bool {
+        let proposal = if let Self::Proposal(proposal) = self {
+            proposal
+        } else {
+            unreachable!()
+        };
+        // genesis
+        if proposal.certified_hash == Digest::default() {
+            return true;
+        }
+        let signatures = &proposal.quorum_certificate;
+        if signatures.len() < config.n - config.f {
             return false;
         }
-        arena[block].parent = self.core.storage.block_ids[&arena[block].data.parent_hash];
-        arena[block].height = arena[arena[block].parent].height + 1;
-
-        arena[block].quorum_certificate_reference =
-            self.core.storage.block_ids[&arena[block].data.quorum_certificate.object_hash];
-
-        self.core.tails.remove(&arena[block].parent);
-        self.core.tails.insert(block);
-
-        arena[block].status = BlockStatus::Deciding;
+        for &(replica_id, signature) in signatures {
+            if !verify_message(
+                &mut Message::Vote(Vote {
+                    voter: replica_id,
+                    block_hash: proposal.certified_hash,
+                    signature,
+                }),
+                &config.keys[replica_id as usize].public_key(),
+            ) {
+                return false;
+            }
+        }
         true
     }
-
-    fn update_high_quorum_certificate(
-        &mut self,
-        high_quorum_certificate: BlockId,
-        quorum_certificate: QuorumCertificate,
-    ) {
-        let arena = &self.core.storage.arena;
-        assert_eq!(
-            arena[high_quorum_certificate].hash,
-            quorum_certificate.object_hash
-        );
-        if arena[high_quorum_certificate].height > arena[self.core.high_quorum_certificate.0].height
-        {
-            self.core.high_quorum_certificate = (high_quorum_certificate, quorum_certificate);
-            self.on_high_quorum_certificate_update(high_quorum_certificate);
-        }
-    }
-
-    fn update(&mut self, new_block: BlockId) {
-        let arena = &self.core.storage.arena;
-        // println!("update {:02x?}", arena[new_block].hash);
-        let block2 = arena[new_block].quorum_certificate_reference;
-        if arena[block2].status == BlockStatus::Decided {
-            return;
-        }
-        self.update_high_quorum_certificate(
-            block2,
-            arena[new_block].data.quorum_certificate.clone(),
-        );
-
-        let arena = &self.core.storage.arena;
-        let block1 = arena[block2].quorum_certificate_reference;
-        if arena[block1].status == BlockStatus::Decided {
-            return;
-        }
-        if arena[block1].height > arena[self.core.block_lock].height {
-            self.core.block_lock = block1;
-        }
-
-        let block = arena[block1].quorum_certificate_reference;
-        if arena[block].status == BlockStatus::Decided {
-            return;
-        }
-
-        if block1 != arena[block2].parent || block != arena[block1].parent {
-            return;
-        }
-
-        let mut commit_blocks = Vec::new();
-        let mut b = block;
-        while arena[b].height > arena[self.core.block_execute].height {
-            commit_blocks.push(b);
-            b = arena[b].parent;
-        }
-        assert_eq!(b, self.core.block_execute);
-        for block in commit_blocks.into_iter().rev() {
-            // println!("commit {:02x?}", self.core.storage.arena[block].hash);
-            self.core.storage.arena[block].status = BlockStatus::Decided;
-            self.do_consensus(block);
-            for i in 0..self.core.storage.arena[block].data.requests.len() {
-                self.do_decide(block, i);
-            }
-        }
-        self.core.block_execute = block;
-    }
-
-    fn on_propose(&mut self, requests: Vec<Request>, parent: BlockId) -> BlockId {
-        self.core.tails.remove(&parent);
-        let data = Block {
-            requests,
-            parent_hash: self.core.storage.arena[parent].hash,
-            quorum_certificate: self.core.high_quorum_certificate.1.clone(),
-        };
-        let hash = digest(&data);
-        let block_new = self.add_block(StorageBlock {
-            data: data.clone(),
-            quorum_certificate_reference: self.core.high_quorum_certificate.0,
-            quorum_certificate: Some(QuorumCertificate {
-                object_hash: hash,
-                signatures: Vec::new(),
-            }),
-            ..Default::default()
-        });
-        self.on_deliver_block(block_new);
-        assert!(self.core.storage.arena[block_new].height > self.core.voted_height);
-        self.update(block_new);
-        let proposal = Proposal {
-            proposer: self.core.id,
-            block: data,
-        };
-        self.on_receive_proposal(proposal.clone(), block_new);
-        self.on_propose_liveness(block_new);
-        self.do_broadcast_proposal(proposal);
-        block_new
-    }
-
-    fn on_receive_proposal(&mut self, proposal: Proposal, block_new: BlockId) {
-        let self_propose = proposal.proposer == self.core.id;
-        if !self_propose {
-            // sanity check delivered
-            assert_eq!(
-                self.core.storage.arena[block_new].status,
-                BlockStatus::Deciding
-            );
-            self.update(block_new);
-        }
-        let mut opinion = false;
-        let arena = &self.core.storage.arena;
-        if arena[block_new].height > self.core.voted_height {
-            if arena[arena[block_new].quorum_certificate_reference].height
-                > arena[self.core.block_lock].height
-            {
-                opinion = true;
-                self.core.voted_height = arena[block_new].height;
-            } else {
-                let mut block = block_new;
-                while arena[block].height > arena[self.core.block_lock].height {
-                    block = arena[block].parent;
-                }
-                if block == self.core.block_lock {
-                    opinion = true;
-                    self.core.voted_height = arena[block_new].height;
-                }
-            }
-        }
-        if !self_propose {
-            self.on_quorum_certificate_finish(arena[block_new].quorum_certificate_reference);
-        }
-        self.on_receive_proposal_liveness(block_new);
-        if opinion {
-            let block_hash = self.core.storage.arena[block_new].hash;
-            // println!("vote   {block_hash:02x?}");
-            self.do_vote(
-                proposal.proposer,
-                Vote {
-                    voter: self.core.id,
-                    block_hash,
-                    signature: Signature::default(),
-                },
-            );
-        }
-    }
-
-    fn on_receive_vote(&mut self, vote: Vote) {
-        let block = self.core.storage.block_ids[&vote.block_hash];
-        let arena = &mut self.core.storage.arena;
-        let quorum_size = arena[block].voted.len();
-        if quorum_size >= self.transport.config.n - self.transport.config.f {
-            return;
-        }
-        if !arena[block].voted.insert(vote.voter) {
-            println!(
-                "! duplicate vote for {:02x?} from {}",
-                vote.block_hash, vote.voter
-            );
-            return;
-        }
-        let quorum_certificate = arena[block].quorum_certificate.get_or_insert_with(|| {
-            println!("! vote for block not proposed by itself");
-            QuorumCertificate {
-                object_hash: vote.block_hash,
-                signatures: Vec::new(),
-            }
-        });
-        quorum_certificate
-            .signatures
-            .push((vote.voter, vote.signature));
-        if quorum_size + 1 == self.transport.config.n - self.transport.config.f {
-            // compute
-            let quorum_certificate = quorum_certificate.clone();
-            self.update_high_quorum_certificate(block, quorum_certificate);
-            self.on_quorum_certificate_finish(block);
-        }
-    }
 }
 
-// PaceMaker
-impl HotStuffBase {
-    fn check_ancestry(&self, a: BlockId, mut b: BlockId) -> bool {
-        let arena = &self.core.storage.arena;
-        while arena[b].height > arena[a].height {
-            b = arena[b].parent;
-        }
-        b == a
-    }
-
-    fn on_high_quorum_certificate_update(&mut self, high_quorum_certificate: BlockId) {
-        self.pacemaker.high_quorum_certificate_tail = high_quorum_certificate;
-        for &tail in &self.core.tails {
-            let arena = &self.core.storage.arena;
-            if self.check_ancestry(high_quorum_certificate, tail)
-                && arena[tail].height > arena[self.pacemaker.high_quorum_certificate_tail].height
-            {
-                self.pacemaker.high_quorum_certificate_tail = tail;
-            }
-        }
-    }
-
-    fn on_propose_liveness(&mut self, block: BlockId) {
-        self.pacemaker.high_quorum_certificate_tail = block;
-    }
-
-    fn on_receive_proposal_liveness(&mut self, block: BlockId) {
-        let high_quorum_certificate = self.core.high_quorum_certificate.0;
-        let arena = &self.core.storage.arena;
-        if self.check_ancestry(high_quorum_certificate, block)
-            && arena[block].height > arena[high_quorum_certificate].height
-        {
-            self.pacemaker.high_quorum_certificate_tail = block;
-        }
-    }
-
-    fn get_parent(&self) -> BlockId {
-        self.pacemaker.high_quorum_certificate_tail
-    }
-
-    // the beat strategy is modified (mostly simplified), to prevent introduce
-    // timeout on critical path when concurrent request number is less than
-    // batch size
-    // in this implementation it is equivalent to next proposing or manual
-    // rounds start immediately after new QC get collected
-    const MAX_BATCH: usize = 70;
-    fn beat(&mut self) {
-        // TODO rotating
-        if !self.pacemaker.quorum_certificate_finished {
-            return;
-        }
-        if !self.pending_requests.is_empty() {
-            self.pacemaker.manual_round = 0;
-        } else {
-            if self.pacemaker.manual_round == 3 {
-                return;
-            }
-            self.pacemaker.manual_round += 1;
-        }
-
-        self.pacemaker.quorum_certificate_finished = false;
-        let requests = self
-            .pending_requests
-            .drain(..usize::min(Self::MAX_BATCH, self.pending_requests.len()))
-            .collect();
-        let parent = self.get_parent();
-        self.on_propose(requests, parent);
-    }
-
-    fn on_quorum_certificate_finish(&mut self, block: BlockId) {
-        // or simply check whether self is primary?
-        if self.core.storage.arena[block].voted.len()
-            >= self.transport.config.n - self.transport.config.f
-        {
-            self.pacemaker.quorum_certificate_finished = true;
-            self.beat();
-        }
-    }
-
-    fn get_proposer(&self) -> ReplicaId {
-        0 // TODO rotating
-    }
-}
-
-// HotStuffBase
-impl HotStuffBase {
-    fn do_consensus(&mut self, _block: BlockId) {
-        // TODO rotate related
-    }
-
-    fn do_decide(&mut self, block: BlockId, i: usize) {
-        let block = &self.core.storage.arena[block];
-        let request = &block.data.requests[i];
-        let result = self.app.replica_upcall(block.height, &request.op);
-        let reply = Reply {
-            request_number: request.request_number,
-            result,
-            replica_id: self.core.id,
-            signature: Signature::default(),
-        };
-        self.client_table.insert(
-            request.client_id,
-            (request.request_number, Some(reply.clone())),
-        );
-        self.transport.send_signed_message(
-            To(request.client_id.0),
-            Message::Reply(reply),
-            self.core.id,
-        );
-    }
-
-    fn do_broadcast_proposal(&mut self, proposal: Proposal) {
-        self.transport
-            .send_message(ToAll, Message::Proposal(proposal));
-    }
-
-    fn do_vote(&mut self, proposer: ReplicaId, vote: Vote) {
-        // PaceMakerRR has a trivial `beat_resp` so simply inline here
-        self.transport
-            .send_signed_message(ToReplica(proposer), Message::Vote(vote), self.core.id);
-    }
-
-    fn propose_handler(&mut self, message: Proposal) {
-        let parent_hash = message.block.parent_hash;
-        let object_hash = message.block.quorum_certificate.object_hash;
-        let block = self.add_block(StorageBlock {
-            data: message.block.clone(),
-            ..Default::default()
-        });
-        if !self.is_block_delivered(&parent_hash) {
-            println!("! message pending deliver");
-            self.waiting_messages
-                .entry(parent_hash)
-                .or_default()
-                .push(Message::Proposal(message));
-        } else if !self.core.storage.block_ids.contains_key(&object_hash) {
-            unreachable!("expect QC delivered equal or earlier than parent");
-        } else {
-            assert!(self.on_deliver_block(block));
-            self.on_receive_proposal(message, block);
-
-            if let Some(messages) = self
-                .waiting_messages
-                .remove(&self.core.storage.arena[block].hash)
-            {
-                for message in messages {
-                    self.receive_message(Verified(message)); // careful
-                }
-            }
-        }
-    }
-
-    fn vote_handler(&mut self, message: Vote) {
-        if self.is_block_delivered(&message.block_hash) {
-            self.on_receive_vote(message);
-        } else {
-            self.waiting_messages
-                .entry(message.block_hash)
-                .or_default()
-                .push(Message::Vote(message));
-        }
-    }
-}
-
-impl Node for HotStuffBase {
+impl Node for Replica {
     type Message = Message;
     fn inbound_action(
         &self,
@@ -654,80 +345,353 @@ impl Node for HotStuffBase {
             _ => InboundAction::Block,
         }
     }
-
     fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
         match message {
-            Allowed(Message::Request(message)) => {
-                if let Some((request_number, reply)) = self.client_table.get(&message.client_id) {
-                    if request_number > &message.request_number {
-                        return;
-                    }
-                    if request_number == &message.request_number {
-                        if let Some(reply) = reply {
-                            self.transport.send_signed_message(
-                                To(message.client_id.0),
-                                Message::Reply(reply.clone()),
-                                self.core.id,
-                            );
-                        }
-                        return;
-                    }
-                }
-                self.client_table
-                    .insert(message.client_id, (message.request_number, None));
-
-                if self.core.id != self.get_proposer() {
-                    return;
-                }
-                self.pending_requests.push(message);
-                self.beat();
-            }
-            Verified(Message::Proposal(message)) => self.propose_handler(message),
-            Verified(Message::Vote(message)) => self.vote_handler(message),
+            Allowed(Message::Request(message)) => self.handle_request(message),
+            Verified(Message::Proposal(message)) => self.handle_proposal(message),
+            Verified(Message::Vote(message)) => self.handle_vote(message),
             _ => unreachable!(),
         }
     }
 }
 
-pub type Replica = HotStuffBase;
 impl Replica {
-    const BLOCK_GENESIS: BlockId = 0;
-    pub fn new(transport: Transport<Self>, id: ReplicaId, app: impl App + Send + 'static) -> Self {
-        let mut arena = Vec::with_capacity(ENTRY_NUMBER);
-        arena.push(StorageBlock {
-            height: 0,
-            status: BlockStatus::Decided,
-            ..StorageBlock::default()
+    fn handle_request(&mut self, message: Request) {
+        if let Some(resend) = self
+            .client_table
+            .insert_prepare(message.client_id, message.request_number)
+        {
+            resend(|reply| {
+                self.transport.send_signed_message(
+                    To(message.client_id.0),
+                    Message::Reply(reply),
+                    self.id,
+                )
+            });
+            return;
+        }
+        if self.id != self.get_proposer() {
+            return;
+        }
+        self.pending_requests.push(message);
+        self.beat();
+    }
+
+    fn handle_proposal(&mut self, message: Proposal) {
+        let message2 = message.clone();
+        let parent_hash = message.parent_hash;
+        let certified_hash = message.certified_hash;
+        let block = self.add_block(StorageBlock {
+            requests: message.requests,
+            parent_hash: message.parent_hash,
+            certified_hash: message.certified_hash,
+            ..Default::default()
         });
-        let mut block_ids = HashMap::with_capacity(ENTRY_NUMBER);
-        block_ids.insert(Digest::default(), Self::BLOCK_GENESIS);
-        Self {
-            transport,
-            core: HotStuffCore {
-                block_lock: Self::BLOCK_GENESIS,
-                block_execute: Self::BLOCK_GENESIS,
-                voted_height: 0,
-                high_quorum_certificate: (0, QuorumCertificate::default()),
-                tails: HashSet::new(),
-                id,
-                storage: Storage { arena, block_ids },
-            },
-            pacemaker: PaceMaker {
-                high_quorum_certificate_tail: Self::BLOCK_GENESIS,
-                manual_round: 0,
-                quorum_certificate_finished: true,
-            },
-            app: Box::new(app),
-            waiting_messages: HashMap::new(),
-            client_table: HashMap::new(),
-            pending_requests: Vec::new(),
+        if !self.is_block_delivered(&parent_hash) {
+            println!("! message pending deliver");
+            self.waiting_messages
+                .entry(parent_hash)
+                .or_default()
+                .push(Message::Proposal(message2));
+        } else if !self.storage.block_ids.contains_key(&certified_hash) {
+            unreachable!("expect QC delivered equal or earlier than parent");
+        } else {
+            let valid = self.on_deliver_block(block);
+            assert!(valid);
+
+            let certified = self.storage.arena[block].certified;
+            self.storage.arena[certified].quorum_certificate = Some(message.quorum_certificate);
+
+            self.on_receive_proposal(&message2, block);
+
+            if let Some(messages) = self
+                .waiting_messages
+                .remove(&self.storage.arena[block].hash)
+            {
+                for message in messages {
+                    self.receive_message(Verified(message)); // careful
+                }
+            }
         }
     }
-}
 
-impl AsMut<Transport<Self>> for Replica {
-    fn as_mut(&mut self) -> &mut Transport<Self> {
-        &mut self.transport
+    fn handle_vote(&mut self, message: Vote) {
+        if self.is_block_delivered(&message.block_hash) {
+            self.on_receive_vote(message);
+        } else {
+            self.waiting_messages
+                .entry(message.block_hash)
+                .or_default()
+                .push(Message::Vote(message));
+        }
+    }
+
+    fn is_block_delivered(&self, hash: &Digest) -> bool {
+        if let Some(&block) = self.storage.block_ids.get(hash) {
+            self.storage.arena[block].status != BlockStatus::Delivering
+        } else {
+            false
+        }
+    }
+
+    fn get_proposer(&self) -> ReplicaId {
+        0 // TODO rotate
+    }
+
+    // the beat strategy is modified (mostly simplified), to prevent introduce
+    // timeout on critical path when concurrent request number is less than
+    // batch size
+    // in this implementation it is equivalent to next proposing or manual
+    // rounds start immediately after new QC get collected
+    const MAX_BATCH: usize = 70;
+    fn beat(&mut self) {
+        // TODO rotating
+        if !self.quorum_certificate_finished {
+            return;
+        }
+        if !self.pending_requests.is_empty() {
+            self.manual_round = 0;
+        } else {
+            if self.manual_round == 3 {
+                return;
+            }
+            self.manual_round += 1;
+        }
+
+        self.quorum_certificate_finished = false;
+        let requests = self
+            .pending_requests
+            .drain(..usize::min(Self::MAX_BATCH, self.pending_requests.len()))
+            .collect();
+        let parent = self.get_parent();
+        self.on_propose(requests, parent);
+    }
+
+    fn get_parent(&self) -> BlockId {
+        self.propose_parent
+    }
+
+    fn on_propose(&mut self, requests: Vec<Request>, parent: BlockId) -> BlockId {
+        // self.core.tails.remove(&parent);
+        let parent_hash = self.storage.arena[parent].hash;
+        let certified_hash = self.storage.arena[self.high_quorum_certificate].hash;
+        let block_new = self.add_block(StorageBlock {
+            requests: requests.clone(),
+            height: self.storage.arena[parent].height + 1,
+            parent,
+            parent_hash,
+            certified: self.high_quorum_certificate,
+            certified_hash,
+            quorum_certificate: Some(Vec::new()),
+            status: BlockStatus::Deciding,
+            ..Default::default()
+        });
+        // all initialized above already
+        // self.on_deliver_block(block_new);
+        self.update(block_new);
+
+        let proposal = Proposal {
+            requests,
+            proposer: self.id,
+            parent_hash,
+            certified_hash,
+            quorum_certificate: self.storage.arena[self.high_quorum_certificate]
+                .quorum_certificate
+                .clone()
+                .unwrap(),
+        };
+        // self.on_propose_liveness(block_new);
+        self.propose_parent = block_new;
+
+        assert!(self.storage.arena[block_new].height > self.voted_height);
+        self.on_receive_proposal(&proposal, block_new);
+        self.do_broadcast_proposal(proposal);
+        block_new
+    }
+
+    fn do_broadcast_proposal(&mut self, proposal: Proposal) {
+        self.transport
+            .send_message(ToAll, Message::Proposal(proposal));
+    }
+
+    fn on_deliver_block(&mut self, block: BlockId) -> bool {
+        let arena = &mut self.storage.arena;
+        if arena[block].status != BlockStatus::Delivering {
+            println!("! attempt to deliver a block twice");
+            return false;
+        }
+        arena[block].parent = self.storage.block_ids[&arena[block].parent_hash];
+        arena[block].height = arena[arena[block].parent].height + 1;
+
+        arena[block].certified = self.storage.block_ids[&arena[block].certified_hash];
+
+        // self.core.tails.remove(&arena[block].parent);
+        // self.core.tails.insert(block);
+
+        arena[block].status = BlockStatus::Deciding;
+        true
+    }
+
+    fn add_block(&mut self, mut block: StorageBlock) -> BlockId {
+        block.hash = digest((&block.requests, &block.parent_hash));
+        let block_id = self.storage.arena.len();
+        self.storage.block_ids.insert(block.hash, block_id);
+        self.storage.arena.push(block);
+        block_id
+    }
+
+    fn update_high_quorum_certificate(&mut self, high_quorum_certificate: BlockId) {
+        let arena = &self.storage.arena;
+        // assert_eq!(
+        //     arena[high_quorum_certificate].hash,
+        //     quorum_certificate.object_hash
+        // );
+        if arena[high_quorum_certificate].height > arena[self.high_quorum_certificate].height {
+            self.high_quorum_certificate = high_quorum_certificate;
+            // self.on_high_quorum_certificate_update(high_quorum_certificate);
+        }
+    }
+
+    fn on_receive_proposal(&mut self, proposal: &Proposal, block_new: BlockId) {
+        let self_propose = proposal.proposer == self.id;
+        if !self_propose {
+            // sanity check delivered
+            assert_eq!(self.storage.arena[block_new].status, BlockStatus::Deciding);
+            self.update(block_new);
+        }
+        let mut opinion = false;
+        let arena = &self.storage.arena;
+        if arena[block_new].height > self.voted_height {
+            if arena[arena[block_new].certified].height > arena[self.block_lock].height {
+                opinion = true;
+                self.voted_height = arena[block_new].height;
+            } else {
+                let mut block = block_new;
+                while arena[block].height > arena[self.block_lock].height {
+                    block = arena[block].parent;
+                }
+                if block == self.block_lock {
+                    opinion = true;
+                    self.voted_height = arena[block_new].height;
+                }
+            }
+        }
+        // if !self_propose {
+        //     self.on_quorum_certificate_finish(arena[block_new].quorum_certificate_reference);
+        // }
+        // self.on_receive_proposal_liveness(block_new);
+        self.propose_parent = block_new;
+
+        if opinion {
+            let block_hash = self.storage.arena[block_new].hash;
+            // println!("vote   {block_hash:02x?}");
+            self.do_vote(
+                proposal.proposer,
+                Vote {
+                    voter: self.id,
+                    block_hash,
+                    signature: Signature::default(),
+                },
+            );
+        }
+    }
+
+    fn do_vote(&mut self, proposer: ReplicaId, vote: Vote) {
+        // PaceMakerRR has a trivial `beat_resp` so simply inline here
+        self.transport
+            .send_signed_message(ToReplica(proposer), Message::Vote(vote), self.id);
+    }
+
+    fn update(&mut self, new_block: BlockId) {
+        let arena = &self.storage.arena;
+        // println!("update {:02x?}", arena[new_block].hash);
+        let block2 = arena[new_block].certified;
+        if arena[block2].status == BlockStatus::Decided {
+            return;
+        }
+        self.update_high_quorum_certificate(block2);
+
+        let arena = &self.storage.arena;
+        let block1 = arena[block2].certified;
+        if arena[block1].status == BlockStatus::Decided {
+            return;
+        }
+        if arena[block1].height > arena[self.block_lock].height {
+            self.block_lock = block1;
+        }
+
+        let block = arena[block1].certified;
+        if arena[block].status == BlockStatus::Decided {
+            return;
+        }
+
+        if block1 != arena[block2].parent || block != arena[block1].parent {
+            return;
+        }
+
+        let mut commit_blocks = Vec::new();
+        let mut b = block;
+        while arena[b].height > arena[self.block_execute].height {
+            commit_blocks.push(b);
+            b = arena[b].parent;
+        }
+        assert_eq!(b, self.block_execute);
+        for block in commit_blocks.into_iter().rev() {
+            // println!("commit {:02x?}", self.storage.arena[block].hash);
+            self.storage.arena[block].status = BlockStatus::Decided;
+            // self.do_consensus(block);
+            for i in 0..self.storage.arena[block].requests.len() {
+                self.do_decide(block, i);
+            }
+        }
+        self.block_execute = block;
+    }
+
+    fn do_decide(&mut self, block: BlockId, i: usize) {
+        let block = &self.storage.arena[block];
+        let request = &block.requests[i];
+        let result = self.app.replica_upcall(block.height, &request.op);
+        let reply = Reply {
+            request_number: request.request_number,
+            result,
+            replica_id: self.id,
+            signature: Signature::default(),
+        };
+        self.client_table
+            .insert_commit(request.client_id, request.request_number, reply.clone());
+        self.transport
+            .send_signed_message(To(request.client_id.0), Message::Reply(reply), self.id);
+    }
+
+    fn on_receive_vote(&mut self, vote: Vote) {
+        let block = self.storage.block_ids[&vote.block_hash];
+        let arena = &mut self.storage.arena;
+        let quorum_size = arena[block].voted.len();
+        if quorum_size >= self.transport.config.n - self.transport.config.f {
+            return;
+        }
+        if !arena[block].voted.insert(vote.voter) {
+            println!(
+                "! duplicate vote for {:02x?} from {}",
+                vote.block_hash, vote.voter
+            );
+            return;
+        }
+        let quorum_certificate = arena[block].quorum_certificate.get_or_insert_with(|| {
+            println!("! vote for block not proposed by itself");
+            Vec::new()
+        });
+        quorum_certificate.push((vote.voter, vote.signature));
+        if quorum_size + 1 == self.transport.config.n - self.transport.config.f {
+            // compute
+            // let quorum_certificate = quorum_certificate.clone();
+            self.update_high_quorum_certificate(block);
+            self.propose_parent = block;
+
+            // self.on_quorum_certificate_finish(block);
+            self.quorum_certificate_finished = true;
+            self.beat();
+        }
     }
 }
 
@@ -735,44 +699,13 @@ impl Drop for Replica {
     fn drop(&mut self) {
         let mut n_block = 0;
         let mut n_op = 0;
-        for block in &self.core.storage.arena {
+        for block in &self.storage.arena {
             if block.status != BlockStatus::Decided {
                 continue;
             }
             n_block += 1;
-            n_op += block.data.requests.len();
+            n_op += block.requests.len();
         }
         println!("average batch size {}", n_op as f32 / n_block as f32);
-    }
-}
-
-impl Message {
-    fn verify_proposal(&mut self, config: &Config) -> bool {
-        let proposal = if let Self::Proposal(proposal) = self {
-            proposal
-        } else {
-            unreachable!()
-        };
-        // genesis
-        if proposal.block.quorum_certificate.object_hash == Digest::default() {
-            return true;
-        }
-        let signatures = &proposal.block.quorum_certificate.signatures;
-        if signatures.len() < config.n - config.f {
-            return false;
-        }
-        for &(replica_id, signature) in signatures {
-            if !verify_message(
-                &mut Message::Vote(Vote {
-                    voter: replica_id,
-                    block_hash: proposal.block.quorum_certificate.object_hash,
-                    signature,
-                }),
-                &config.keys[replica_id as usize].public_key(),
-            ) {
-                return false;
-            }
-        }
-        true
     }
 }

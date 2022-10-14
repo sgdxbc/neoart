@@ -90,9 +90,12 @@ impl<M: Clone> ClientTable<M> {
     }
 
     pub fn insert_commit(&mut self, id: ClientId, request_number: RequestNumber, reply: M) {
-        let prev = self.0.insert(id, (request_number, Some(reply)));
-        if let Some((saved_number, _)) = prev {
-            assert!(saved_number <= request_number);
+        if let Some((saved_number, reply)) = self.0.get(&id) {
+            if *saved_number > request_number {
+                assert!(reply.is_none());
+                return;
+            }
         }
+        self.0.insert(id, (request_number, Some(reply)));
     }
 }
