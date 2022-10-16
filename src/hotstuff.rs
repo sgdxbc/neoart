@@ -377,73 +377,12 @@ impl Replica {
         self.beat();
     }
 
-    fn handle_proposal(&mut self, message: Proposal) {
-        let message2 = message.clone();
-        let parent_hash = message.parent_hash;
-        let certified_hash = message.certified_hash;
-        let block = self.add_block(StorageBlock {
-            requests: message.requests,
-            parent_hash: message.parent_hash,
-            certified_hash: message.certified_hash,
-            ..Default::default()
-        });
-        if !self.is_block_delivered(&parent_hash) {
-            println!("! message pending deliver");
-            self.waiting_messages
-                .entry(parent_hash)
-                .or_default()
-                .push(Message::Proposal(message2));
-        } else if !self.storage.block_ids.contains_key(&certified_hash) {
-            unreachable!("expect QC delivered equal or earlier than parent");
-        } else {
-            let valid = self.on_deliver_block(block);
-            assert!(valid);
-
-            let certified = self.storage.arena[block].certified;
-            self.storage.arena[certified].quorum_certificate = Some(message.quorum_certificate);
-
-            self.on_receive_proposal(&message2, block);
-
-            if let Some(messages) = self
-                .waiting_messages
-                .remove(&self.storage.arena[block].hash)
-            {
-                for message in messages {
-                    self.receive_message(Verified(message)); // careful
-                }
-            }
-        }
-    }
-
-    fn handle_vote(&mut self, message: Vote) {
-        if self.is_block_delivered(&message.block_hash) {
-            self.on_receive_vote(message);
-        } else {
-            self.waiting_messages
-                .entry(message.block_hash)
-                .or_default()
-                .push(Message::Vote(message));
-        }
-    }
-
-    fn is_block_delivered(&self, hash: &Digest) -> bool {
-        if let Some(&block) = self.storage.block_ids.get(hash) {
-            self.storage.arena[block].status != BlockStatus::Delivering
-        } else {
-            false
-        }
-    }
-
-    fn get_proposer(&self) -> ReplicaId {
-        0 // TODO rotate
-    }
-
     // the beat strategy is modified (mostly simplified), to prevent introduce
     // timeout on critical path when concurrent request number is less than
     // batch size
     // in this implementation it is equivalent to next proposing or manual
     // rounds start immediately after new QC get collected
-    const MAX_BATCH: usize = 70;
+    const MAX_BATCH: usize = 1000;
     fn beat(&mut self) {
         // TODO rotating
         if !self.quorum_certificate_finished {
@@ -467,8 +406,51 @@ impl Replica {
         self.on_propose(requests, parent);
     }
 
-    fn get_parent(&self) -> BlockId {
-        self.propose_parent
+    fn handle_proposal(&mut self, message: Proposal) {
+        let block = self.add_block(StorageBlock {
+            requests: message.requests.clone(),
+            parent_hash: message.parent_hash,
+            certified_hash: message.certified_hash,
+            ..Default::default()
+        });
+        if !self.is_block_delivered(&message.parent_hash) {
+            println!("! message pending deliver");
+            self.waiting_messages
+                .entry(message.parent_hash)
+                .or_default()
+                .push(Message::Proposal(message));
+        } else if !self.storage.block_ids.contains_key(&message.certified_hash) {
+            unreachable!("expect QC delivered equal or earlier than parent");
+        } else {
+            let valid = self.on_deliver_block(block);
+            assert!(valid);
+
+            let certified = self.storage.arena[block].certified;
+            self.storage.arena[certified].quorum_certificate =
+                Some(message.quorum_certificate.clone());
+
+            self.on_receive_proposal(&message, block);
+
+            if let Some(messages) = self
+                .waiting_messages
+                .remove(&self.storage.arena[block].hash)
+            {
+                for message in messages {
+                    self.receive_message(Verified(message)); // careful
+                }
+            }
+        }
+    }
+
+    fn handle_vote(&mut self, message: Vote) {
+        if self.is_block_delivered(&message.block_hash) {
+            self.on_receive_vote(&message);
+        } else {
+            self.waiting_messages
+                .entry(message.block_hash)
+                .or_default()
+                .push(Message::Vote(message));
+        }
     }
 
     fn on_propose(&mut self, requests: Vec<Request>, parent: BlockId) -> BlockId {
@@ -507,49 +489,6 @@ impl Replica {
         self.on_receive_proposal(&proposal, block_new);
         self.do_broadcast_proposal(proposal);
         block_new
-    }
-
-    fn do_broadcast_proposal(&mut self, proposal: Proposal) {
-        self.transport
-            .send_message(ToAll, Message::Proposal(proposal));
-    }
-
-    fn on_deliver_block(&mut self, block: BlockId) -> bool {
-        let arena = &mut self.storage.arena;
-        if arena[block].status != BlockStatus::Delivering {
-            println!("! attempt to deliver a block twice");
-            return false;
-        }
-        arena[block].parent = self.storage.block_ids[&arena[block].parent_hash];
-        arena[block].height = arena[arena[block].parent].height + 1;
-
-        arena[block].certified = self.storage.block_ids[&arena[block].certified_hash];
-
-        // self.core.tails.remove(&arena[block].parent);
-        // self.core.tails.insert(block);
-
-        arena[block].status = BlockStatus::Deciding;
-        true
-    }
-
-    fn add_block(&mut self, mut block: StorageBlock) -> BlockId {
-        block.hash = digest((&block.requests, &block.parent_hash));
-        let block_id = self.storage.arena.len();
-        self.storage.block_ids.insert(block.hash, block_id);
-        self.storage.arena.push(block);
-        block_id
-    }
-
-    fn update_high_quorum_certificate(&mut self, high_quorum_certificate: BlockId) {
-        let arena = &self.storage.arena;
-        // assert_eq!(
-        //     arena[high_quorum_certificate].hash,
-        //     quorum_certificate.object_hash
-        // );
-        if arena[high_quorum_certificate].height > arena[self.high_quorum_certificate].height {
-            self.high_quorum_certificate = high_quorum_certificate;
-            // self.on_high_quorum_certificate_update(high_quorum_certificate);
-        }
     }
 
     fn on_receive_proposal(&mut self, proposal: &Proposal, block_new: BlockId) {
@@ -596,10 +535,94 @@ impl Replica {
         }
     }
 
-    fn do_vote(&mut self, proposer: ReplicaId, vote: Vote) {
-        // PaceMakerRR has a trivial `beat_resp` so simply inline here
+    fn on_receive_vote(&mut self, vote: &Vote) {
+        let block = self.storage.block_ids[&vote.block_hash];
+        let arena = &mut self.storage.arena;
+        let quorum_size = arena[block].voted.len();
+        if quorum_size >= self.transport.config.n - self.transport.config.f {
+            return;
+        }
+        if !arena[block].voted.insert(vote.voter) {
+            println!(
+                "! duplicate vote for {:02x?} from {}",
+                vote.block_hash, vote.voter
+            );
+            return;
+        }
+        let quorum_certificate = arena[block].quorum_certificate.get_or_insert_with(|| {
+            println!("! vote for block not proposed by itself");
+            Vec::new()
+        });
+        quorum_certificate.push((vote.voter, vote.signature));
+        if quorum_size + 1 == self.transport.config.n - self.transport.config.f {
+            // compute
+            // let quorum_certificate = quorum_certificate.clone();
+            self.update_high_quorum_certificate(block);
+            self.propose_parent = block;
+
+            // self.on_quorum_certificate_finish(block);
+            self.quorum_certificate_finished = true;
+            self.beat();
+        }
+    }
+
+    fn add_block(&mut self, mut block: StorageBlock) -> BlockId {
+        block.hash = digest((&block.requests, &block.parent_hash));
+        let block_id = self.storage.arena.len();
+        self.storage.block_ids.insert(block.hash, block_id);
+        self.storage.arena.push(block);
+        block_id
+    }
+
+    fn on_deliver_block(&mut self, block: BlockId) -> bool {
+        let arena = &mut self.storage.arena;
+        if arena[block].status != BlockStatus::Delivering {
+            println!("! attempt to deliver a block twice");
+            return false;
+        }
+        arena[block].parent = self.storage.block_ids[&arena[block].parent_hash];
+        arena[block].height = arena[arena[block].parent].height + 1;
+
+        arena[block].certified = self.storage.block_ids[&arena[block].certified_hash];
+
+        // self.core.tails.remove(&arena[block].parent);
+        // self.core.tails.insert(block);
+
+        arena[block].status = BlockStatus::Deciding;
+        true
+    }
+
+    fn is_block_delivered(&self, hash: &Digest) -> bool {
+        if let Some(&block) = self.storage.block_ids.get(hash) {
+            self.storage.arena[block].status != BlockStatus::Delivering
+        } else {
+            false
+        }
+    }
+
+    fn get_proposer(&self) -> ReplicaId {
+        0 // TODO rotate
+    }
+
+    fn get_parent(&self) -> BlockId {
+        self.propose_parent
+    }
+
+    fn do_broadcast_proposal(&mut self, proposal: Proposal) {
         self.transport
-            .send_signed_message(ToReplica(proposer), Message::Vote(vote), self.id);
+            .send_message(ToAll, Message::Proposal(proposal));
+    }
+
+    fn update_high_quorum_certificate(&mut self, high_quorum_certificate: BlockId) {
+        let arena = &self.storage.arena;
+        // assert_eq!(
+        //     arena[high_quorum_certificate].hash,
+        //     quorum_certificate.object_hash
+        // );
+        if arena[high_quorum_certificate].height > arena[self.high_quorum_certificate].height {
+            self.high_quorum_certificate = high_quorum_certificate;
+            // self.on_high_quorum_certificate_update(high_quorum_certificate);
+        }
     }
 
     fn update(&mut self, new_block: BlockId) {
@@ -647,6 +670,12 @@ impl Replica {
         self.block_execute = block;
     }
 
+    fn do_vote(&mut self, proposer: ReplicaId, vote: Vote) {
+        // PaceMakerRR has a trivial `beat_resp` so simply inline here
+        self.transport
+            .send_signed_message(ToReplica(proposer), Message::Vote(vote), self.id);
+    }
+
     fn do_decide(&mut self, block: BlockId, i: usize) {
         let block = &self.storage.arena[block];
         let request = &block.requests[i];
@@ -661,37 +690,6 @@ impl Replica {
             .insert_commit(request.client_id, request.request_number, reply.clone());
         self.transport
             .send_signed_message(To(request.client_id.0), Message::Reply(reply), self.id);
-    }
-
-    fn on_receive_vote(&mut self, vote: Vote) {
-        let block = self.storage.block_ids[&vote.block_hash];
-        let arena = &mut self.storage.arena;
-        let quorum_size = arena[block].voted.len();
-        if quorum_size >= self.transport.config.n - self.transport.config.f {
-            return;
-        }
-        if !arena[block].voted.insert(vote.voter) {
-            println!(
-                "! duplicate vote for {:02x?} from {}",
-                vote.block_hash, vote.voter
-            );
-            return;
-        }
-        let quorum_certificate = arena[block].quorum_certificate.get_or_insert_with(|| {
-            println!("! vote for block not proposed by itself");
-            Vec::new()
-        });
-        quorum_certificate.push((vote.voter, vote.signature));
-        if quorum_size + 1 == self.transport.config.n - self.transport.config.f {
-            // compute
-            // let quorum_certificate = quorum_certificate.clone();
-            self.update_high_quorum_certificate(block);
-            self.propose_parent = block;
-
-            // self.on_quorum_certificate_finish(block);
-            self.quorum_certificate_finished = true;
-            self.beat();
-        }
     }
 }
 

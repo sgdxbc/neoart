@@ -142,16 +142,16 @@ async fn up_node(node: &Node, tag: String) -> JoinHandle<()> {
         .unwrap();
     let mut matrix_stream = BufReader::new(matrix.stdout.take().unwrap()).lines();
     spawn(async move {
-        let mut repeat_resend = 0;
+        let mut repeat_error = 0;
         while let Some(line) = matrix_stream.next_line().await.unwrap() {
-            if !line.contains("resend") {
-                repeat_resend = 0;
+            if !line.starts_with("! ") {
+                repeat_error = 0;
                 println!("{tag} {line}");
             } else {
-                repeat_resend += 1;
-                match repeat_resend {
+                repeat_error += 1;
+                match repeat_error {
                     1 => println!("{tag} {line}"),
-                    2 => println!("{tag} (repeating...)"),
+                    2 => println!("{tag} (more error...)"),
                     _ => {}
                 }
             }

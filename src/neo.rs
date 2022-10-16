@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     convert::TryInto,
     env::var,
+    hash::{Hash, Hasher},
     mem::replace,
     ops::RangeInclusive,
     time::Duration,
@@ -120,8 +121,16 @@ impl Message {
         match (variant, message) {
             (MulticastVariant::Disabled, _) => unreachable!(),
             // TODO inline-check message signature
-            (MulticastVariant::HalfSipHash, message @ Message::OrderedRequest(..)) => {
-                InboundAction::Allow(message)
+            // for now a standard hashing is used as overhead placeholder
+            // calculate a SipHash1-3 should not be easier than a HalfSipHash2-4
+            (MulticastVariant::HalfSipHash, message @ Message::OrderedRequest(_)) => {
+                let mut hasher = DefaultHasher::new();
+                message.digest().hash(&mut hasher);
+                if hasher.finish() != 0 {
+                    InboundAction::Allow(message)
+                } else {
+                    unreachable!()
+                }
             }
             (MulticastVariant::Secp256k1, Message::OrderedRequest(message))
                 if Self::has_network_signature(&message) =>
@@ -604,9 +613,13 @@ impl Replica {
         //     // TODO set timer
         //     self.send_vote(self.speculative_number + 1..=self.vote_number);
         // }
-        if self.verify_number % 70 == 0 {
-            self.send_vote(self.vote_number + 1..=self.verify_number);
-            self.vote_number = self.verify_number;
+
+        // if self.verify_number % 70 == 0 {
+        const BATCH_SIZE: OpNumber = 200;
+        if self.verify_number / BATCH_SIZE > self.vote_number / BATCH_SIZE {
+            let vote_number = self.verify_number / BATCH_SIZE * BATCH_SIZE;
+            self.send_vote(self.vote_number + 1..=vote_number);
+            self.vote_number = vote_number;
         }
     }
 

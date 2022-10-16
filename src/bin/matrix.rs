@@ -53,6 +53,7 @@ fn accept_args() -> MatrixArgs {
 fn main() {
     let mut args = accept_args();
     args.config.gen_keys();
+
     let pid_file = format!("pid.{}", args.instance_id);
     // using std instead of tokio because i don't want the whole main become
     // async only become of this
@@ -63,21 +64,19 @@ fn main() {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient
-        | MatrixProtocol::HotStuffClient => {
-            runtime::Builder::new_multi_thread()
-                .enable_all()
-                // .worker_threads(20) // because currently client server has isolation
-                .on_thread_start({
-                    let counter = Arc::new(AtomicU32::new(0));
-                    move || {
-                        let mut cpu_set = CpuSet::new();
-                        cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
-                        // sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
-                    }
-                })
-                .build()
-                .unwrap()
-        }
+        | MatrixProtocol::HotStuffClient => runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .on_thread_start({
+                let counter = Arc::new(AtomicU32::new(0));
+                move || {
+                    let mut cpu_set = CpuSet::new();
+                    cpu_set.set(counter.fetch_add(1, SeqCst) as _).unwrap();
+                    sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                }
+            })
+            .build()
+            .unwrap(),
         _ => {
             if args.num_worker != 0 {
                 executor = Executor::new_rayon(args.num_worker);

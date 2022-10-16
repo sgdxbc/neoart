@@ -89,6 +89,7 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     future::{pending, Future},
+    mem::replace,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -196,6 +197,7 @@ pub enum TransportMessage<M> {
     Signed(M),
 }
 
+const BUFFER_SIZE: usize = (64 << 10) - 20 - 8;
 pub struct Transport<T: Node> {
     pub config: Config,
     crypto: Crypto<T::Message>,
@@ -206,6 +208,10 @@ pub struct Transport<T: Node> {
     timer_id: u32,
     send_signed: Vec<Destination>,
     variant: MulticastVariant,
+
+    receive_buffer: Box<[u8]>,
+    receive_multicast_buffer: Box<[u8]>,
+    send_buffer: [u8; BUFFER_SIZE],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,6 +290,10 @@ impl<T: Node> Transport<T> {
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
             variant: MulticastVariant::Disabled,
+
+            receive_buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
+            receive_multicast_buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
+            send_buffer: [0; BUFFER_SIZE],
         }
     }
 
@@ -319,11 +329,12 @@ impl<T: Node> Transport<T> {
         }
     }
 
-    pub fn send_message(&self, destination: Destination, message: impl Borrow<T::Message>)
+    pub fn send_message(&mut self, destination: Destination, message: impl Borrow<T::Message>)
     where
         T::Message: Serialize,
     {
-        let mut buf = [0; 1472];
+        // let mut buf = [0; BUFFER_SIZE];
+        let buf = &mut self.send_buffer;
         let message_offset = if destination == Destination::ToMulticast {
             // consider eliminate double serailization if possible
             buf[68..100].copy_from_slice(&digest(message.borrow())[..]);
@@ -442,8 +453,10 @@ where
 {
     async fn run(&mut self, close: impl Future<Output = ()> + Send) {
         pin!(close);
-        let mut buf = [0; 1472];
-        let mut multicast_buf = [0; 1472];
+        // let mut buf = [0; BUFFER_SIZE];
+        // let mut multicast_buf = [0; BUFFER_SIZE];
+        let mut buf = replace(&mut self.as_mut().receive_buffer, Box::new([]));
+        let mut multicast_buf = replace(&mut self.as_mut().receive_multicast_buffer, Box::new([]));
         loop {
             let transport = self.as_mut();
             let (&id, timer) = transport
@@ -453,7 +466,7 @@ where
                 .unwrap();
             select! {
                 biased;
-                _ = &mut close => return,
+                _ = &mut close => break,
                 _ = timer.sleep.as_mut() => {
                     let timer = self.as_mut().timer_table.remove(&id).unwrap();
                     (timer.event)(self);
@@ -474,6 +487,7 @@ where
                 }
             }
         }
+        self.as_mut().receive_buffer = buf;
 
         fn handle_crypto_event<T>(receiver: &mut T, event: CryptoEvent<T::Message>)
         where

@@ -362,11 +362,7 @@ struct LogEntry {
 }
 
 impl Replica {
-    // batch size 80 cause OrderReq to exceed 1472 bytes and cannot fit in one
-    // packet
-    // in benchmark seems like up to 90-batch is safe but test cases has
-    // non-zero sized op
-    const BATCH_SIZE: usize = 70; // is there a way to do adaptive batching?
+    pub const BATCH_SIZE: usize = 200; // is there a way to do adaptive batching?
 
     pub fn new(
         transport: Transport<Self>,
