@@ -243,6 +243,7 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
         host: String::from("0.0.0.0"),
         num_worker: spec.task.num_worker,
         num_client: 0,
+        drop_rate: spec.task.drop_rate,
     }
 }
 
@@ -265,5 +266,6 @@ fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
         num_worker: 0,
         num_client: spec.task.num_client / spec.client.len() as u32
             + (index < spec.task.num_client as usize % spec.client.len()) as u32,
+        drop_rate: spec.task.drop_rate,
     }
 }

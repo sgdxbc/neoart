@@ -165,7 +165,8 @@ async fn run_replica<T>(
         .unwrap();
     socket.set_broadcast(true).unwrap();
     socket.writable().await.unwrap();
-    let transport = Transport::new(args.config, Socket::Os(socket), executor);
+    let mut transport = Transport::new(args.config, Socket::Os(socket), executor);
+    transport.drop_rate = args.drop_rate;
     new_replica(transport)
         .run(async { ctrl_c().await.unwrap() })
         .await;

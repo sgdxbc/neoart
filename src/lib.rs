@@ -42,7 +42,7 @@ pub mod bin {
     /// Common configuration shared by matrix binary and control plane binary.
     ///
     // I guess there is no better place to put sharing pieces so it has to be here
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
     pub struct MatrixArgs {
         pub instance_id: String,
         pub config: Config,
@@ -51,6 +51,7 @@ pub mod bin {
         pub host: String,
         pub num_worker: usize,
         pub num_client: u32,
+        pub drop_rate: f32,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +107,8 @@ pub mod bin {
         pub batching: bool,
         #[serde(default)]
         pub enable_vote: bool,
+        #[serde(default)]
+        pub drop_rate: f32,
     }
 
     #[derive(Debug, Clone, Deserialize)]

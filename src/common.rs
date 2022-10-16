@@ -71,8 +71,8 @@ impl<M: Clone> ClientTable<M> {
     ) -> Option<impl FnOnce(F)> {
         let reply = if let Some((saved_number, reply)) = self.0.get(&id) {
             match saved_number.cmp(&request_number) {
-                Greater => reply.clone(),
-                Equal => None,
+                Greater => None,
+                Equal => reply.clone(),
                 Less => {
                     self.0.insert(id, (request_number, None));
                     return None;

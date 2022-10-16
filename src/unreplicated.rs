@@ -132,7 +132,7 @@ impl Client {
         };
         self.invoke.as_mut().unwrap().timer_id = self
             .transport
-            .create_timer(Duration::from_secs(1), on_resend);
+            .create_timer(Duration::from_millis(100), on_resend);
     }
 }
 

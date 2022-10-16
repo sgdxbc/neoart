@@ -97,6 +97,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use rand::random;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     net::UdpSocket,
@@ -208,6 +209,7 @@ pub struct Transport<T: Node> {
     timer_id: u32,
     send_signed: Vec<Destination>,
     variant: MulticastVariant,
+    pub drop_rate: f32,
 
     receive_buffer: Box<[u8]>,
     receive_multicast_buffer: Box<[u8]>,
@@ -290,6 +292,7 @@ impl<T: Node> Transport<T> {
             timer_id: 0,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
             variant: MulticastVariant::Disabled,
+            drop_rate: 0.,
 
             receive_buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
             receive_multicast_buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
@@ -475,10 +478,16 @@ where
                     handle_crypto_event(self, event.unwrap());
                 },
                 (len, remote) = transport.socket.receive_from(&mut buf) => {
+                    if self.as_mut().drop_rate != 0. && random::<f32>() < self.as_mut().drop_rate {
+                        continue;
+                    }
                     handle_raw_message(self, remote, InboundPacket::new_unicast(&buf[..len]));
                 }
                 (len, remote) = transport.multicast_listener.receive_from(&mut multicast_buf) => {
                     let variant = transport.variant;
+                    if self.as_mut().drop_rate != 0. && random::<f32>() < self.as_mut().drop_rate {
+                        continue;
+                    }
                     handle_raw_message(
                         self,
                         remote,
