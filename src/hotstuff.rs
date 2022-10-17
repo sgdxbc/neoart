@@ -362,6 +362,7 @@ impl Replica {
             .insert_prepare(message.client_id, message.request_number)
         {
             resend(|reply| {
+                println!("* resend");
                 self.transport.send_signed_message(
                     To(message.client_id.0),
                     Message::Reply(reply),

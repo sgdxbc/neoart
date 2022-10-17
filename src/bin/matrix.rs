@@ -66,7 +66,7 @@ fn main() {
         | MatrixProtocol::NeoClient
         | MatrixProtocol::HotStuffClient => runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(4)
             .on_thread_start({
                 let counter = Arc::new(AtomicU32::new(0));
                 move || {
@@ -103,9 +103,9 @@ fn main() {
             MatrixProtocol::UnreplicatedClient => {
                 run_clients(args, unreplicated::Client::new).await
             }
-            MatrixProtocol::ZyzzyvaReplica { enable_batching } => {
+            MatrixProtocol::ZyzzyvaReplica { batch_size } => {
                 run_replica(args, executor, |transport| {
-                    zyzzyva::Replica::new(transport, replica_id, Null, enable_batching)
+                    zyzzyva::Replica::new(transport, replica_id, Null, batch_size)
                 })
                 .await
             }

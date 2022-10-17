@@ -207,6 +207,7 @@ pub struct Transport<T: Node> {
     multicast_listener: MulticastListener,
     timer_table: HashMap<u32, Timer<T>>,
     timer_id: u32,
+    timer_closest: u32,
     send_signed: Vec<Destination>,
     variant: MulticastVariant,
     pub drop_rate: f32,
@@ -290,6 +291,7 @@ impl<T: Node> Transport<T> {
             multicast_listener: MulticastListener::Null,
             timer_table,
             timer_id: 0,
+            timer_closest: u32::MAX,
             send_signed: Vec::with_capacity(ENTRY_NUMBER),
             variant: MulticastVariant::Disabled,
             drop_rate: 0.,
@@ -393,10 +395,19 @@ impl<T: Node> Transport<T> {
     ) -> u32 {
         self.timer_id += 1;
         let id = self.timer_id;
+        let sleep = Box::pin(sleep(duration));
+        // assert!(
+        //     self.timer_table.contains_key(&self.timer_closest),
+        //     "timer missing: {}",
+        //     self.timer_closest
+        // );
+        if sleep.deadline() < self.timer_table[&self.timer_closest].sleep.deadline() {
+            self.timer_closest = id;
+        }
         self.timer_table.insert(
             id,
             Timer {
-                sleep: Box::pin(sleep(duration)),
+                sleep,
                 duration,
                 event: Box::new(on_timer),
             },
@@ -407,10 +418,25 @@ impl<T: Node> Transport<T> {
     pub fn reset_timer(&mut self, id: u32) {
         let timer = self.timer_table.get_mut(&id).unwrap();
         timer.sleep.as_mut().reset(Instant::now() + timer.duration);
+        if id == self.timer_closest {
+            self.update_closest();
+        }
     }
 
     pub fn cancel_timer(&mut self, id: u32) {
         self.timer_table.remove(&id);
+        if id == self.timer_closest {
+            self.update_closest();
+        }
+    }
+
+    fn update_closest(&mut self) {
+        self.timer_closest = *self
+            .timer_table
+            .iter()
+            .min_by_key(|(_, timer)| timer.sleep.deadline())
+            .unwrap()
+            .0;
     }
 }
 
@@ -462,16 +488,14 @@ where
         let mut multicast_buf = replace(&mut self.as_mut().receive_multicast_buffer, Box::new([]));
         loop {
             let transport = self.as_mut();
-            let (&id, timer) = transport
-                .timer_table
-                .iter_mut()
-                .min_by_key(|(_, timer)| timer.sleep.deadline())
-                .unwrap();
+            let id = transport.timer_closest;
+            let sleep = &mut transport.timer_table.get_mut(&id).unwrap().sleep;
             select! {
                 biased;
                 _ = &mut close => break,
-                _ = timer.sleep.as_mut() => {
+                _ = sleep.as_mut() => {
                     let timer = self.as_mut().timer_table.remove(&id).unwrap();
+                    self.as_mut().update_closest();
                     (timer.event)(self);
                 }
                 event = transport.crypto_channel.recv() => {

@@ -60,7 +60,7 @@ pub mod bin {
         UnreplicatedReplica,
         UnreplicatedClient,
         ZyzzyvaReplica {
-            enable_batching: bool,
+            batch_size: usize,
         },
         ZyzzyvaClient {
             assume_byz: bool,
@@ -104,7 +104,7 @@ pub mod bin {
         pub num_worker: usize,
         pub num_client: u32,
         #[serde(default)]
-        pub batching: bool,
+        pub batch_size: usize,
         #[serde(default)]
         pub enable_vote: bool,
         #[serde(default)]

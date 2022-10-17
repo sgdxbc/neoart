@@ -35,6 +35,7 @@ async fn main() {
     } else {
         3 * spec.task.f + 1
     };
+    spec.task.batch_size = usize::min(spec.task.batch_size, spec.task.num_client as _);
 
     let rebuild = Command::new("cargo")
         .args(["build", "--release", "--bin", "matrix"])
@@ -227,14 +228,14 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
         protocol: match &*spec.task.mode {
             "ur" => MatrixProtocol::UnreplicatedReplica,
             "zyzzyva" => MatrixProtocol::ZyzzyvaReplica {
-                enable_batching: spec.task.batching,
+                batch_size: spec.task.batch_size,
             },
             "neo" => MatrixProtocol::NeoReplica {
                 variant: spec.multicast.variant,
                 enable_vote: spec.task.enable_vote,
             },
             "pbft" => MatrixProtocol::PbftReplica {
-                enable_batching: spec.task.batching,
+                enable_batching: spec.task.batch_size > 1,
             },
             "hotstuff" => MatrixProtocol::HotStuffReplica,
             _ => panic!(),

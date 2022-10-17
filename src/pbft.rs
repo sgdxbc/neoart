@@ -236,7 +236,7 @@ enum LogStatus {
 }
 
 impl Replica {
-    const MAX_BATCH: usize = 70;
+    const MAX_BATCH: usize = 1000;
     // the max gap between op_number (proposed sequence) and commit_number
     // (executed seqeuence), where a lot of reordering is allowed to happen
     // the number here is somewhat based on, the protocol can be intuitively

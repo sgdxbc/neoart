@@ -362,13 +362,11 @@ struct LogEntry {
 }
 
 impl Replica {
-    pub const BATCH_SIZE: usize = 200; // is there a way to do adaptive batching?
-
     pub fn new(
         transport: Transport<Self>,
         id: ReplicaId,
         app: impl App + Send + 'static,
-        enable_batching: bool,
+        batch_size: usize,
     ) -> Self {
         Self {
             transport,
@@ -381,7 +379,7 @@ impl Replica {
             log: Vec::with_capacity(ENTRY_NUMBER),
             reorder_order_req: Reorder::new(1),
             commit_certificate: CommitCertificate::default(),
-            batch_size: if enable_batching { Self::BATCH_SIZE } else { 1 },
+            batch_size,
             batch: Vec::new(),
             checkpoint_quorums: HashMap::new(),
             checkpoint_number: 0,
@@ -647,7 +645,7 @@ mod tests {
     }
 
     impl System {
-        async fn new(num_client: usize, assume_byz: bool, enable_batching: bool) -> Self {
+        async fn new(num_client: usize, assume_byz: bool, batch_size: usize) -> Self {
             let config = Network::config(4, 1);
             let mut net = Network::default();
             let clients = (0..num_client)
@@ -672,7 +670,7 @@ mod tests {
                         ),
                         i as ReplicaId,
                         TestApp::default(),
-                        enable_batching,
+                        batch_size,
                     );
                     Concurrent::run(replica)
                 })
@@ -690,7 +688,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_op() {
-        let mut system = System::new(1, false, false).await;
+        let mut system = System::new(1, false, 1).await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
             Duration::from_millis(30),
@@ -730,7 +728,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop() {
         let num_client = 10;
-        let mut system = System::new(num_client, false, false).await;
+        let mut system = System::new(num_client, false, 1).await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
         }
@@ -748,7 +746,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_op_byzantine() {
-        let mut system = System::new(1, true, false).await;
+        let mut system = System::new(1, true, 1).await;
         let _byz_replica = system.replicas.remove(3).join().await;
         let result = system.clients[0].invoke("hello".as_bytes());
         timeout(
@@ -769,7 +767,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop_byzantine() {
         let num_client = 10;
-        let mut system = System::new(num_client, true, false).await;
+        let mut system = System::new(num_client, true, 1).await;
         let _byz_replica = system.replicas.remove(3).join().await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
@@ -788,19 +786,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_closed_loop_batching() {
-        let num_client = Replica::BATCH_SIZE * 4;
-        let mut system = System::new(num_client, false, true).await;
+        const BATCH_SIZE: usize = 10;
+        let num_client = BATCH_SIZE * 4;
+        let mut system = System::new(num_client, false, BATCH_SIZE).await;
         for (index, client) in system.clients.into_iter().enumerate() {
             closed_loop(index, client);
         }
         sleep(Duration::from_secs(1) - Duration::from_millis(1)).await;
         let primary_len = system.replicas.remove(0).join().await.log.len();
-        assert!(primary_len >= 1000 / 30 * (num_client / Replica::BATCH_SIZE));
+        assert!(primary_len >= 1000 / 30 * (num_client / BATCH_SIZE));
         for replica in system.replicas {
             let backup_len = replica.join().await.log.len();
             // stronger assertions?
             assert!(backup_len <= primary_len);
-            assert!(backup_len >= primary_len - num_client / Replica::BATCH_SIZE);
+            assert!(backup_len >= primary_len - num_client / BATCH_SIZE);
         }
         system.net.join().await;
     }
