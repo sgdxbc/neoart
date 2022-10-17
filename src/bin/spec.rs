@@ -7,7 +7,7 @@ use std::{
 
 use bincode::Options;
 use neoart::{
-    bin::{MatrixArgs, MatrixProtocol, Node, Spec},
+    bin::{MatrixApp, MatrixArgs, MatrixProtocol, Node, Spec},
     meta::{Config, ReplicaId, ARGS_SERVER_PORT, MULTICAST_PORT, REPLICA_PORT},
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -240,6 +240,11 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
             "hotstuff" => MatrixProtocol::HotStuffReplica,
             _ => panic!(),
         },
+        app: match &*spec.task.app {
+            "null" => MatrixApp::Null,
+            "ycsb" => MatrixApp::Ycsb,
+            _ => panic!(),
+        },
         replica_id: index as ReplicaId,
         host: String::from("0.0.0.0"),
         num_worker: spec.task.num_worker,
@@ -260,6 +265,11 @@ fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
             "neo" => MatrixProtocol::NeoClient,
             "pbft" => MatrixProtocol::PbftClient,
             "hotstuff" => MatrixProtocol::HotStuffClient,
+            _ => panic!(),
+        },
+        app: match &*spec.task.app {
+            "null" => MatrixApp::Null,
+            "ycsb" => MatrixApp::Ycsb,
             _ => panic!(),
         },
         replica_id: 0,

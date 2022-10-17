@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -200,7 +200,7 @@ pub struct Replica {
     // capturing of closures registered to promises
     waiting_messages: HashMap<Digest, Vec<Message>>,
     client_table: ClientTable<Reply>,
-    pending_requests: Vec<Request>,
+    pending_requests: VecDeque<Request>,
 
     // block0: usize, // fixed zero
     block_lock: BlockId,
@@ -276,7 +276,7 @@ impl Replica {
             app: Box::new(app),
             waiting_messages: HashMap::new(),
             client_table: ClientTable::default(),
-            pending_requests: Vec::new(),
+            pending_requests: VecDeque::new(),
             block_lock: Self::BLOCK_GENESIS,
             block_execute: Self::BLOCK_GENESIS,
             voted_height: 0,
@@ -374,7 +374,7 @@ impl Replica {
         if self.id != self.get_proposer() {
             return;
         }
-        self.pending_requests.push(message);
+        self.pending_requests.push_back(message);
         self.beat();
     }
 
@@ -383,7 +383,7 @@ impl Replica {
     // batch size
     // in this implementation it is equivalent to next proposing or manual
     // rounds start immediately after new QC get collected
-    const MAX_BATCH: usize = 1000;
+    const MAX_BATCH: usize = 400;
     fn beat(&mut self) {
         // TODO rotating
         if !self.quorum_certificate_finished {

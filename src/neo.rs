@@ -615,7 +615,7 @@ impl Replica {
         // }
 
         // if self.verify_number % 70 == 0 {
-        const BATCH_SIZE: OpNumber = 200;
+        const BATCH_SIZE: OpNumber = 100;
         if self.verify_number / BATCH_SIZE > self.vote_number / BATCH_SIZE {
             let vote_number = self.verify_number / BATCH_SIZE * BATCH_SIZE;
             self.send_vote(self.vote_number + 1..=vote_number);

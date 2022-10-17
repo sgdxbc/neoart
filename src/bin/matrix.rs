@@ -14,18 +14,19 @@ use std::{
 
 use bincode::Options;
 use neoart::{
-    bin::{MatrixArgs, MatrixProtocol},
+    bin::{MatrixApp, MatrixArgs, MatrixProtocol},
     crypto::{CryptoMessage, Executor},
     hotstuff,
-    meta::{Config, OpNumber, ARGS_SERVER_PORT},
+    meta::{Config, OpNumber, ARGS_SERVER_PORT, MULTICAST_CONTROL_RESET_PORT, MULTICAST_PORT},
     neo, pbft,
     transport::{MulticastListener, Node, Run, Socket, Transport},
-    unreplicated, zyzzyva, App, Client,
+    unreplicated, ycsb, zyzzyva, App, Client,
 };
 use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::Pid,
 };
+use rand::{rngs::StdRng, thread_rng, SeedableRng};
 use serde::de::DeserializeOwned;
 use tokio::{
     net::UdpSocket,
@@ -49,6 +50,11 @@ fn accept_args() -> MatrixArgs {
     println!("* configured by {remote}");
     bincode::options().deserialize_from(&stream).unwrap()
 }
+
+const YCSB_N_KEY: usize = 10000;
+const YCSB_N_VALUE: usize = 100000;
+const YCSB_KEY_LEN: usize = 64;
+const YCSB_VALUE_LEN: usize = 128;
 
 fn main() {
     let mut args = accept_args();
@@ -92,11 +98,22 @@ fn main() {
     };
     runtime.block_on(async move {
         let replica_id = args.replica_id;
+        let app = args.app;
+        let ycsb_app = || {
+            ycsb::Workload::new_app(
+                YCSB_N_KEY,
+                YCSB_KEY_LEN,
+                YCSB_VALUE_LEN,
+                &mut StdRng::seed_from_u64(0),
+            )
+        };
         match args.protocol {
             MatrixProtocol::Unknown => unreachable!(),
             MatrixProtocol::UnreplicatedReplica => {
-                run_replica(args, executor, |transport| {
-                    unreplicated::Replica::new(transport, 0, Null)
+                run_replica(args, executor, |transport| match app {
+                    MatrixApp::Null => unreplicated::Replica::new(transport, 0, Null),
+                    MatrixApp::Ycsb => unreplicated::Replica::new(transport, 0, ycsb_app()),
+                    _ => unreachable!(),
                 })
                 .await
             }
@@ -104,8 +121,14 @@ fn main() {
                 run_clients(args, unreplicated::Client::new).await
             }
             MatrixProtocol::ZyzzyvaReplica { batch_size } => {
-                run_replica(args, executor, |transport| {
-                    zyzzyva::Replica::new(transport, replica_id, Null, batch_size)
+                run_replica(args, executor, |transport| match app {
+                    MatrixApp::Null => {
+                        zyzzyva::Replica::new(transport, replica_id, Null, batch_size)
+                    }
+                    MatrixApp::Ycsb => {
+                        zyzzyva::Replica::new(transport, replica_id, ycsb_app(), batch_size)
+                    }
+                    _ => unreachable!(),
                 })
                 .await
             }
@@ -122,21 +145,37 @@ fn main() {
                 let socket = UdpSocket::bind(args.config.multicast).await.unwrap();
                 run_replica(args, executor, |mut transport| {
                     transport.listen_multicast(MulticastListener::Os(socket), variant);
-                    neo::Replica::new(transport, replica_id, Null, enable_vote)
+                    match app {
+                        MatrixApp::Null => {
+                            neo::Replica::new(transport, replica_id, Null, enable_vote)
+                        }
+                        MatrixApp::Ycsb => {
+                            neo::Replica::new(transport, replica_id, ycsb_app(), enable_vote)
+                        }
+                        _ => unreachable!(),
+                    }
                 })
                 .await
             }
             MatrixProtocol::NeoClient => run_clients(args, neo::Client::new).await,
             MatrixProtocol::PbftReplica { enable_batching } => {
-                run_replica(args, executor, |transport| {
-                    pbft::Replica::new(transport, replica_id, Null, enable_batching)
+                run_replica(args, executor, |transport| match app {
+                    MatrixApp::Null => {
+                        pbft::Replica::new(transport, replica_id, Null, enable_batching)
+                    }
+                    MatrixApp::Ycsb => {
+                        pbft::Replica::new(transport, replica_id, ycsb_app(), enable_batching)
+                    }
+                    _ => unreachable!(),
                 })
                 .await
             }
             MatrixProtocol::PbftClient => run_clients(args, pbft::Client::new).await,
             MatrixProtocol::HotStuffReplica => {
-                run_replica(args, executor, |transport| {
-                    hotstuff::Replica::new(transport, replica_id, Null)
+                run_replica(args, executor, |transport| match app {
+                    MatrixApp::Null => hotstuff::Replica::new(transport, replica_id, Null),
+                    MatrixApp::Ycsb => hotstuff::Replica::new(transport, replica_id, ycsb_app()),
+                    _ => unreachable!(),
                 })
                 .await
             }
@@ -176,7 +215,7 @@ async fn run_clients<T>(
     args: MatrixArgs,
     new_client: impl FnOnce(Transport<T>) -> T + Clone + Send + 'static,
 ) where
-    T: Node + Client + AsMut<Transport<T>> + Send + 'static,
+    T: Node + Client + Run + Send + 'static,
     T::Message: CryptoMessage + DeserializeOwned,
 {
     if args.num_client == 0 {
@@ -184,16 +223,45 @@ async fn run_clients<T>(
     }
     let notify = Arc::new(Notify::new());
     let latencies = Arc::new(Mutex::new(Vec::new()));
-    let clients = repeat_with(|| {
-        let config = args.config.clone();
-        let notify = notify.clone();
-        let latencies = latencies.clone();
-        let new_client = new_client.clone();
-        let host = args.host.clone();
-        spawn(run_client(config, notify, latencies, new_client, host))
-    })
-    .take(args.num_client as _)
-    .collect::<Vec<_>>();
+    let clients = match args.app {
+        MatrixApp::Null => repeat_with(|| {
+            let config = args.config.clone();
+            let notify = notify.clone();
+            let latencies = latencies.clone();
+            let new_client = new_client.clone();
+            let host = args.host.clone();
+            spawn(run_null_client(config, notify, latencies, new_client, host))
+        })
+        .take(args.num_client as _)
+        .collect::<Vec<_>>(),
+        MatrixApp::Ycsb => {
+            let workload = Arc::new(ycsb::Workload::new(
+                YCSB_N_KEY,
+                YCSB_N_VALUE,
+                YCSB_KEY_LEN,
+                YCSB_VALUE_LEN,
+                50,
+                50,
+                0,
+                &mut StdRng::seed_from_u64(0),
+            ));
+            repeat_with(|| {
+                let config = args.config.clone();
+                let notify = notify.clone();
+                let latencies = latencies.clone();
+                let new_client = new_client.clone();
+                let host = args.host.clone();
+                let workload = workload.clone();
+                let rand = StdRng::from_rng(thread_rng()).unwrap();
+                spawn(run_ycsb_client(
+                    config, workload, rand, notify, latencies, new_client, host,
+                ))
+            })
+            .take(args.num_client as _)
+            .collect()
+        }
+        _ => unreachable!(),
+    };
 
     let mut accumulated_latencies = Vec::new();
     for _ in 0..20 {
@@ -217,21 +285,27 @@ async fn run_clients<T>(
     }
 }
 
-async fn run_client<T>(
+async fn run_null_client<T>(
     config: Config,
     notify: Arc<Notify>,
     latencies: Arc<Mutex<Vec<Duration>>>,
     new_client: impl FnOnce(Transport<T>) -> T + Send + 'static,
     host: String,
 ) where
-    T: Node + Client + AsMut<Transport<T>> + Send,
+    T: Node + Client + Run + Send,
     T::Message: CryptoMessage + DeserializeOwned,
 {
     let socket = UdpSocket::bind((host, 0)).await.unwrap();
+    if [MULTICAST_PORT, MULTICAST_CONTROL_RESET_PORT].contains(&socket.local_addr().unwrap().port())
+    {
+        println!("* client {socket:?} keeps silence");
+        return;
+    }
     socket.set_broadcast(true).unwrap();
     socket.writable().await.unwrap();
     let transport = Transport::new(config, Socket::Os(socket), Executor::Inline);
     let mut client = new_client(transport);
+
     let notified = notify.notified();
     pin!(notified);
 
@@ -249,5 +323,42 @@ async fn run_client<T>(
                 }
             })
             .await;
+    }
+}
+
+async fn run_ycsb_client<T>(
+    config: Config,
+    workload: Arc<ycsb::Workload>,
+    mut rand: StdRng,
+    notify: Arc<Notify>,
+    latencies: Arc<Mutex<Vec<Duration>>>,
+    new_client: impl FnOnce(Transport<T>) -> T + Send + 'static,
+    host: String,
+) where
+    T: Client + Run + Node,
+{
+    // TODO duplicated
+    let socket = UdpSocket::bind((host, 0)).await.unwrap();
+    if [MULTICAST_PORT, MULTICAST_CONTROL_RESET_PORT].contains(&socket.local_addr().unwrap().port())
+    {
+        println!("* client {socket:?} keeps silence");
+        return;
+    }
+    socket.set_broadcast(true).unwrap();
+    socket.writable().await.unwrap();
+    let transport = Transport::new(config, Socket::Os(socket), Executor::Inline);
+    let mut client = new_client(transport);
+
+    let notified = notify.notified();
+    pin!(notified);
+
+    loop {
+        let instant = Instant::now();
+        select! {
+            _ = workload.invoke(&mut client, &mut rand) => {
+                latencies.lock().await.push(Instant::now() - instant);
+            }
+            _ = &mut notified => break,
+        }
     }
 }

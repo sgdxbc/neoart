@@ -47,6 +47,7 @@ pub mod bin {
         pub instance_id: String,
         pub config: Config,
         pub protocol: MatrixProtocol,
+        pub app: MatrixApp,
         pub replica_id: ReplicaId,
         pub host: String,
         pub num_worker: usize,
@@ -78,7 +79,20 @@ pub mod bin {
         HotStuffClient,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum MatrixApp {
+        Unknown,
+        Null,
+        Ycsb,
+    }
+
     impl Default for MatrixProtocol {
+        fn default() -> Self {
+            Self::Unknown
+        }
+    }
+
+    impl Default for MatrixApp {
         fn default() -> Self {
             Self::Unknown
         }
@@ -96,6 +110,7 @@ pub mod bin {
     #[serde(rename_all = "kebab-case")]
     pub struct Task {
         pub mode: String,
+        pub app: String,
         #[serde(default)]
         pub f: usize,
         #[serde(default)]

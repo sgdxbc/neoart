@@ -71,6 +71,7 @@ impl crate::App for App {
                 }
             }
         };
+        assert_ne!(result, Result::NotFound);
         let mut buf = Vec::new();
         serialize(&mut buf, result);
         buf
@@ -96,7 +97,7 @@ impl Workload {
         })
     }
 
-    pub fn init_app(
+    pub fn new_app(
         n_entries: usize,
         key_len: usize,
         value_len: usize,
