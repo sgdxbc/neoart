@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::Duration,
+    fmt::Display,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,11 @@ use crate::{
     crypto::{verify_message, CryptoMessage, Signature},
     meta::{digest, ClientId, Config, Digest, OpNumber, ReplicaId, RequestNumber, ENTRY_NUMBER},
     transport::{
-        Destination::{To, ToAll, ToReplica},
+        Destination::{To, ToAll, ToReplica, ToSelf},
         InboundAction,
         InboundPacket::Unicast,
         Node, Transport,
-        TransportMessage::{self, Allowed, Verified},
+        TransportMessage::{self, Allowed, Signed, Verified},
     },
     App, InvokeResult,
 };
@@ -173,6 +174,8 @@ impl Client {
         let request = &self.invoke.as_ref().unwrap().request;
         self.transport
             .send_message(ToAll, Message::Request(request.clone()));
+        // self.transport
+        //     .send_message(ToReplica(0), Message::Request(request.clone()));
         let request_number = request.request_number;
         let on_resend = move |receiver: &mut Self| {
             assert_eq!(
@@ -204,6 +207,7 @@ pub struct Replica {
 
     // block0: usize, // fixed zero
     block_lock: BlockId,
+    block_commit: BlockId,
     block_execute: BlockId,
     voted_height: OpNumber,
     // (certified block, QC)
@@ -217,6 +221,16 @@ pub struct Replica {
     propose_parent: BlockId,
     manual_round: u32,
     quorum_certificate_finished: bool,
+
+    profile: Profile,
+}
+
+#[derive(Default)]
+struct Profile {
+    enter_request: Vec<Instant>,
+    exit_request: Vec<Instant>,
+    send_proposal: Vec<Instant>,
+    quorum_certificate_finish: Vec<Instant>,
 }
 
 #[derive(Default)]
@@ -278,6 +292,7 @@ impl Replica {
             client_table: ClientTable::default(),
             pending_requests: VecDeque::new(),
             block_lock: Self::BLOCK_GENESIS,
+            block_commit: Self::BLOCK_GENESIS,
             block_execute: Self::BLOCK_GENESIS,
             voted_height: 0,
             high_quorum_certificate: Self::BLOCK_GENESIS,
@@ -286,6 +301,8 @@ impl Replica {
             propose_parent: Self::BLOCK_GENESIS,
             manual_round: 0,
             quorum_certificate_finished: true,
+
+            profile: Profile::default(),
         }
     }
 }
@@ -339,6 +356,13 @@ impl Node for Replica {
             return InboundAction::Block;
         };
         match message {
+            // Message::Request(_) => {
+            //     if self.id == self.get_proposer() {
+            //         InboundAction::Allow(message)
+            //     } else {
+            //         InboundAction::Block
+            //     }
+            // }
             Message::Request(_) => InboundAction::Allow(message),
             Message::Proposal(_) => InboundAction::Verify(message, Message::verify_proposal),
             Message::Vote(Vote { voter, .. }) => InboundAction::VerifyReplica(message, voter),
@@ -347,9 +371,16 @@ impl Node for Replica {
     }
     fn receive_message(&mut self, message: TransportMessage<Self::Message>) {
         match message {
-            Allowed(Message::Request(message)) => self.handle_request(message),
+            Allowed(Message::Request(message)) => {
+                self.profile.enter_request.push(Instant::now());
+                self.handle_request(message);
+                self.profile.exit_request.push(Instant::now());
+            }
             Verified(Message::Proposal(message)) => self.handle_proposal(message),
-            Verified(Message::Vote(message)) => self.handle_vote(message),
+            // careful
+            Verified(Message::Vote(message)) | Signed(Message::Vote(message)) => {
+                self.handle_vote(message)
+            }
             _ => unreachable!(),
         }
     }
@@ -362,7 +393,7 @@ impl Replica {
             .insert_prepare(message.client_id, message.request_number)
         {
             resend(|reply| {
-                println!("* resend");
+                println!("! resend");
                 self.transport.send_signed_message(
                     To(message.client_id.0),
                     Message::Reply(reply),
@@ -383,7 +414,7 @@ impl Replica {
     // batch size
     // in this implementation it is equivalent to next proposing or manual
     // rounds start immediately after new QC get collected
-    const MAX_BATCH: usize = 400;
+    const MAX_BATCH: usize = 800;
     fn beat(&mut self) {
         // TODO rotating
         if !self.quorum_certificate_finished {
@@ -430,7 +461,7 @@ impl Replica {
             self.storage.arena[certified].quorum_certificate =
                 Some(message.quorum_certificate.clone());
 
-            self.on_receive_proposal(&message, block);
+            self.on_receive_proposal(message, block);
 
             if let Some(messages) = self
                 .waiting_messages
@@ -445,7 +476,7 @@ impl Replica {
 
     fn handle_vote(&mut self, message: Vote) {
         if self.is_block_delivered(&message.block_hash) {
-            self.on_receive_vote(&message);
+            self.on_receive_vote(message);
         } else {
             self.waiting_messages
                 .entry(message.block_hash)
@@ -487,12 +518,14 @@ impl Replica {
         self.propose_parent = block_new;
 
         assert!(self.storage.arena[block_new].height > self.voted_height);
-        self.on_receive_proposal(&proposal, block_new);
-        self.do_broadcast_proposal(proposal);
+        self.do_broadcast_proposal(proposal.clone());
+        self.on_receive_proposal(proposal, block_new);
+
+        self.commit();
         block_new
     }
 
-    fn on_receive_proposal(&mut self, proposal: &Proposal, block_new: BlockId) {
+    fn on_receive_proposal(&mut self, proposal: Proposal, block_new: BlockId) {
         let self_propose = proposal.proposer == self.id;
         if !self_propose {
             // sanity check delivered
@@ -534,9 +567,10 @@ impl Replica {
                 },
             );
         }
+        self.commit();
     }
 
-    fn on_receive_vote(&mut self, vote: &Vote) {
+    fn on_receive_vote(&mut self, vote: Vote) {
         let block = self.storage.block_ids[&vote.block_hash];
         let arena = &mut self.storage.arena;
         let quorum_size = arena[block].voted.len();
@@ -556,8 +590,8 @@ impl Replica {
         });
         quorum_certificate.push((vote.voter, vote.signature));
         if quorum_size + 1 == self.transport.config.n - self.transport.config.f {
+            self.profile.quorum_certificate_finish.push(Instant::now());
             // compute
-            // let quorum_certificate = quorum_certificate.clone();
             self.update_high_quorum_certificate(block);
             self.propose_parent = block;
 
@@ -612,6 +646,7 @@ impl Replica {
     fn do_broadcast_proposal(&mut self, proposal: Proposal) {
         self.transport
             .send_message(ToAll, Message::Proposal(proposal));
+        self.profile.send_proposal.push(Instant::now());
     }
 
     fn update_high_quorum_certificate(&mut self, high_quorum_certificate: BlockId) {
@@ -653,8 +688,29 @@ impl Replica {
             return;
         }
 
+        // let mut commit_blocks = Vec::new();
+        // let mut b = block;
+        // while arena[b].height > arena[self.block_execute].height {
+        //     commit_blocks.push(b);
+        //     b = arena[b].parent;
+        // }
+        // assert_eq!(b, self.block_execute);
+        // for block in commit_blocks.into_iter().rev() {
+        //     // println!("commit {:02x?}", self.storage.arena[block].hash);
+        //     self.storage.arena[block].status = BlockStatus::Decided;
+        //     // self.do_consensus(block);
+        //     for i in 0..self.storage.arena[block].requests.len() {
+        //         self.do_decide(block, i);
+        //     }
+        // }
+        // self.block_execute = block;
+        self.block_commit = block;
+    }
+
+    fn commit(&mut self) {
         let mut commit_blocks = Vec::new();
-        let mut b = block;
+        let mut b = self.block_commit;
+        let arena = &self.storage.arena;
         while arena[b].height > arena[self.block_execute].height {
             commit_blocks.push(b);
             b = arena[b].parent;
@@ -668,13 +724,20 @@ impl Replica {
                 self.do_decide(block, i);
             }
         }
-        self.block_execute = block;
+        self.block_execute = self.block_commit;
     }
 
     fn do_vote(&mut self, proposer: ReplicaId, vote: Vote) {
         // PaceMakerRR has a trivial `beat_resp` so simply inline here
-        self.transport
-            .send_signed_message(ToReplica(proposer), Message::Vote(vote), self.id);
+        self.transport.send_signed_message(
+            if proposer != self.id {
+                ToReplica(proposer)
+            } else {
+                ToSelf
+            },
+            Message::Vote(vote),
+            self.id,
+        );
     }
 
     fn do_decide(&mut self, block: BlockId, i: usize) {
@@ -696,6 +759,10 @@ impl Replica {
 
 impl Drop for Replica {
     fn drop(&mut self) {
+        if self.id != self.get_proposer() {
+            return;
+        }
+
         let mut n_block = 0;
         let mut n_op = 0;
         for block in &self.storage.arena {
@@ -706,5 +773,94 @@ impl Drop for Replica {
             n_op += block.requests.len();
         }
         println!("average batch size {}", n_op as f32 / n_block as f32);
+
+        // let mut instants = Vec::new();
+        // instants.extend(
+        //     self.profile
+        //         .enter_request
+        //         .drain(..)
+        //         .map(|instant| (instant, 0)),
+        // );
+        // instants.extend(
+        //     self.profile
+        //         .exit_request
+        //         .drain(..)
+        //         .map(|instant| (instant, 1)),
+        // );
+        // instants.extend(
+        //     self.profile
+        //         .quorum_certificate_finish
+        //         .drain(..)
+        //         .map(|instant| (instant, 2)),
+        // );
+        // instants.extend(
+        //     self.profile
+        //         .send_proposal
+        //         .drain(..)
+        //         .map(|instant| (instant, 6)),
+        // );
+
+        // instants.sort_unstable();
+
+        // let mut last_proposal = Instant::now();
+        // let mut vote_delays = Vec::new();
+        // let mut proposal_intervals = Vec::new();
+        // let (mut last_instant, mut _last_id) = instants.first().unwrap();
+        // let mut request_delays = Vec::new();
+        // for (instant, id) in instants.into_iter() {
+        //     if id == 6 {
+        //         if instant > last_proposal {
+        //             proposal_intervals.push(instant - last_proposal);
+        //         }
+        //         last_proposal = instant;
+        //     }
+        //     if id == 2 {
+        //         if instant < last_proposal {
+        //             println!("ignore early vote");
+        //             continue;
+        //         }
+        //         vote_delays.push(instant - last_proposal);
+        //     }
+        //     if id == 0 && instant != last_instant {
+        //         request_delays.push(instant - last_instant);
+        //     }
+        //     (last_instant, _last_id) = (instant, id);
+        // }
+
+        // println!("vote delay");
+        // println!("{}", LatencyDistribution::from(vote_delays));
+        // println!("proposal interval");
+        // println!("{}", LatencyDistribution::from(proposal_intervals));
+        // println!("request delay");
+        // println!("{}", LatencyDistribution::from(request_delays));
+    }
+}
+
+struct LatencyDistribution(Vec<Duration>);
+impl From<Vec<Duration>> for LatencyDistribution {
+    fn from(mut durations: Vec<Duration>) -> Self {
+        durations.sort_unstable();
+        Self(durations)
+    }
+}
+
+impl Display for LatencyDistribution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut range = Duration::ZERO..self.0[self.0.len() / 100];
+        let mut range_total = Duration::ZERO;
+        let mut range_count = 0;
+        for &item in &self.0 {
+            while item > range.end {
+                if range_count != 0 {
+                    writeln!(f, "{range:12?} {range_total:12?} {range_count:8}")?;
+                    range_total = Duration::ZERO;
+                    range_count = 0;
+                }
+                range = range.end..range.end * 2;
+            }
+            range_total += item;
+            range_count += 1;
+        }
+        write!(f, "{range:12?} {range_total:12?} {range_count:8}")
     }
 }

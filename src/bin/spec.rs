@@ -199,7 +199,7 @@ async fn configure_node(node: &Node, args: &MatrixArgs) {
         .unwrap();
 }
 
-fn config(spec: Spec) -> Config {
+fn config(spec: &Spec) -> Config {
     Config {
         n: spec.replica.len(),
         f: spec.task.f,
@@ -224,7 +224,7 @@ fn instance_id() -> String {
 fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
     MatrixArgs {
         instance_id: instance_id(),
-        config: config(spec.clone()),
+        config: config(spec),
         protocol: match &*spec.task.mode {
             "ur" => MatrixProtocol::UnreplicatedReplica,
             "zyzzyva" => MatrixProtocol::ZyzzyvaReplica {
@@ -256,7 +256,7 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
 fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
     MatrixArgs {
         instance_id: instance_id(),
-        config: config(spec.clone()),
+        config: config(spec),
         protocol: match &*spec.task.mode {
             "ur" => MatrixProtocol::UnreplicatedClient,
             "zyzzyva" => MatrixProtocol::ZyzzyvaClient {

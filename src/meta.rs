@@ -72,6 +72,7 @@ pub const ARGS_SERVER_PORT: u16 = 60000;
 pub const REPLICA_PORT: u16 = 60001;
 pub const MULTICAST_PORT: u16 = 60002;
 pub const MULTICAST_CONTROL_RESET_PORT: u16 = 60003;
+pub const MULTICAST_ACCEL_PORT: u16 = 60004;
 /// Basic protocol-independent networking configuration shared by all nodes.
 ///
 /// While the fields basically following specpaxos `Configuration` in this

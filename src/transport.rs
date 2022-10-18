@@ -384,6 +384,9 @@ impl<T: Node> Transport<T> {
     ) where
         T::Message: CryptoMessage + Send + 'static,
     {
+        // writing this is probably wrong, anything meaningful should use ToSelf
+        // instead
+        assert_ne!(destination, Destination::ToReplica(id));
         self.crypto.sign(self.send_signed.len(), message, id);
         self.send_signed.push(destination);
     }

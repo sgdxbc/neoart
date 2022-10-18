@@ -17,7 +17,10 @@ use neoart::{
     bin::{MatrixApp, MatrixArgs, MatrixProtocol},
     crypto::{CryptoMessage, Executor},
     hotstuff,
-    meta::{Config, OpNumber, ARGS_SERVER_PORT, MULTICAST_CONTROL_RESET_PORT, MULTICAST_PORT},
+    meta::{
+        Config, OpNumber, ARGS_SERVER_PORT, MULTICAST_ACCEL_PORT, MULTICAST_CONTROL_RESET_PORT,
+        MULTICAST_PORT,
+    },
     neo, pbft,
     transport::{MulticastListener, Node, Run, Socket, Transport},
     unreplicated, ycsb, zyzzyva, App, Client,
@@ -296,7 +299,12 @@ async fn run_null_client<T>(
     T::Message: CryptoMessage + DeserializeOwned,
 {
     let socket = UdpSocket::bind((host, 0)).await.unwrap();
-    if [MULTICAST_PORT, MULTICAST_CONTROL_RESET_PORT].contains(&socket.local_addr().unwrap().port())
+    if [
+        MULTICAST_PORT,
+        MULTICAST_CONTROL_RESET_PORT,
+        MULTICAST_ACCEL_PORT,
+    ]
+    .contains(&socket.local_addr().unwrap().port())
     {
         println!("* client {socket:?} keeps silence");
         return;
