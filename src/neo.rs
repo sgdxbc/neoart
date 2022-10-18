@@ -439,7 +439,6 @@ impl Replica {
             );
         });
         Self {
-            transport,
             id,
             view_number: 0,
             app: Box::new(app),
@@ -451,8 +450,11 @@ impl Replica {
             reorder_ordered_request: Reorder::new(1),
             link_hash: Default::default(),
             enable_vote,
-            vote_quorums: HashMap::new(),
+            vote_quorums: HashMap::with_capacity(
+                ENTRY_NUMBER * (transport.config.n - transport.config.f),
+            ),
             will_vote: None,
+            transport,
         }
     }
 }

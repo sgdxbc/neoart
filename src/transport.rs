@@ -169,7 +169,7 @@ impl<'a, M> InboundPacket<'a, M> {
             MulticastVariant::Disabled => unreachable!(),
             MulticastVariant::HalfSipHash => Self::OrderedMulticast {
                 sequence_number: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-                signature: &buf[4..8],
+                signature: &buf[4..8], // TODO offset base on replica id
                 link_hash: &[0; 32],
                 message: deserialize(&buf[100..]),
             },
@@ -353,6 +353,7 @@ impl<T: Node> Transport<T> {
                 unreachable!() // really?
             }
             Destination::To(addr) => Self::send_message_internal(&self.socket, addr, &buf[..len]),
+            // check not loopback?
             Destination::ToReplica(id) => Self::send_message_internal(
                 &self.socket,
                 self.config.replicas[id as usize],
@@ -384,8 +385,8 @@ impl<T: Node> Transport<T> {
     ) where
         T::Message: CryptoMessage + Send + 'static,
     {
-        // writing this is probably wrong, anything meaningful should use ToSelf
-        // instead
+        // anything meaningful should use ToSelf instead so this is probably
+        // by mistake
         assert_ne!(destination, Destination::ToReplica(id));
         self.crypto.sign(self.send_signed.len(), message, id);
         self.send_signed.push(destination);
@@ -508,14 +509,14 @@ where
                     if self.as_mut().drop_rate != 0. && random::<f32>() < self.as_mut().drop_rate {
                         continue;
                     }
-                    handle_raw_message(self, remote, InboundPacket::new_unicast(&buf[..len]));
+                    handle_packet(self, remote, InboundPacket::new_unicast(&buf[..len]));
                 }
                 (len, remote) = transport.multicast_listener.receive_from(&mut multicast_buf) => {
                     let variant = transport.variant;
                     if self.as_mut().drop_rate != 0. && random::<f32>() < self.as_mut().drop_rate {
                         continue;
                     }
-                    handle_raw_message(
+                    handle_packet(
                         self,
                         remote,
                         InboundPacket::new_multicast(&multicast_buf[..len], variant),
@@ -544,7 +545,7 @@ where
             }
         }
 
-        fn handle_raw_message<T>(
+        fn handle_packet<T>(
             receiver: &mut T,
             _remote: SocketAddr,
             buffer: InboundPacket<'_, T::Message>,

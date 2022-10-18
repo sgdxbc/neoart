@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt::Display,
     time::{Duration, Instant},
 };
@@ -64,6 +64,7 @@ pub struct Proposal {
     certified_hash: Digest,
     quorum_certificate: Vec<(ReplicaId, Signature)>,
     proposer: ReplicaId,
+    signature: Signature,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,8 +77,10 @@ pub struct Vote {
 impl CryptoMessage for Message {
     fn signature_mut(&mut self) -> &mut Signature {
         match self {
-            Self::Request(_) | Self::Proposal(_) => unreachable!(),
-            Self::Reply(Reply { signature, .. }) | Self::Vote(Vote { signature, .. }) => signature,
+            Self::Request(_) => unreachable!(),
+            Self::Reply(Reply { signature, .. })
+            | Self::Vote(Vote { signature, .. })
+            | Self::Proposal(Proposal { signature, .. }) => signature,
         }
     }
 }
@@ -203,9 +206,10 @@ pub struct Replica {
     // capturing of closures registered to promises
     waiting_messages: HashMap<Digest, Vec<Message>>,
     client_table: ClientTable<Reply>,
-    pending_requests: VecDeque<Request>,
+    pending_requests: Vec<Request>,
 
     // block0: usize, // fixed zero
+    block_proposal: BlockId,
     block_lock: BlockId,
     block_commit: BlockId,
     block_execute: BlockId,
@@ -290,7 +294,8 @@ impl Replica {
             app: Box::new(app),
             waiting_messages: HashMap::new(),
             client_table: ClientTable::default(),
-            pending_requests: VecDeque::new(),
+            pending_requests: Vec::new(),
+            block_proposal: Self::BLOCK_GENESIS,
             block_lock: Self::BLOCK_GENESIS,
             block_commit: Self::BLOCK_GENESIS,
             block_execute: Self::BLOCK_GENESIS,
@@ -315,6 +320,14 @@ impl AsMut<Transport<Self>> for Replica {
 
 impl Message {
     fn verify_proposal(&mut self, config: &Config) -> bool {
+        if let Self::Proposal(proposal) = self {
+            let id = proposal.proposer;
+            if !verify_message(self, &config.keys[id as usize].public_key()) {
+                return false;
+            }
+        } else {
+            unreachable!();
+        }
         let proposal = if let Self::Proposal(proposal) = self {
             proposal
         } else {
@@ -377,6 +390,11 @@ impl Node for Replica {
                 self.profile.exit_request.push(Instant::now());
             }
             Verified(Message::Proposal(message)) => self.handle_proposal(message),
+            Signed(Message::Proposal(message)) => {
+                self.transport
+                    .send_message(ToAll, Message::Proposal(message.clone()));
+                self.on_receive_proposal(message, self.block_proposal);
+            }
             // careful
             Verified(Message::Vote(message)) | Signed(Message::Vote(message)) => {
                 self.handle_vote(message)
@@ -405,7 +423,7 @@ impl Replica {
         if self.id != self.get_proposer() {
             return;
         }
-        self.pending_requests.push_back(message);
+        self.pending_requests.push(message);
         self.beat();
     }
 
@@ -513,13 +531,14 @@ impl Replica {
                 .quorum_certificate
                 .clone()
                 .unwrap(),
+            signature: Signature::default(),
         };
         // self.on_propose_liveness(block_new);
         self.propose_parent = block_new;
 
         assert!(self.storage.arena[block_new].height > self.voted_height);
-        self.do_broadcast_proposal(proposal.clone());
-        self.on_receive_proposal(proposal, block_new);
+        self.do_broadcast_proposal(proposal.clone(), block_new);
+        // self.on_receive_proposal(proposal, block_new);
 
         self.commit();
         block_new
@@ -643,9 +662,12 @@ impl Replica {
         self.propose_parent
     }
 
-    fn do_broadcast_proposal(&mut self, proposal: Proposal) {
+    fn do_broadcast_proposal(&mut self, proposal: Proposal, block: BlockId) {
+        // self.transport
+        //     .send_message(ToAll, Message::Proposal(proposal));
+        self.block_proposal = block;
         self.transport
-            .send_message(ToAll, Message::Proposal(proposal));
+            .send_signed_message(ToSelf, Message::Proposal(proposal), self.id);
         self.profile.send_proposal.push(Instant::now());
     }
 

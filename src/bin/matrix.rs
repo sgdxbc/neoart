@@ -2,7 +2,6 @@ use std::{
     env::args,
     fs::write,
     iter::repeat_with,
-    mem::take,
     net::TcpListener,
     process::id,
     sync::{
@@ -32,12 +31,7 @@ use nix::{
 use rand::{rngs::StdRng, thread_rng, SeedableRng};
 use serde::de::DeserializeOwned;
 use tokio::{
-    net::UdpSocket,
-    pin, runtime, select,
-    signal::ctrl_c,
-    spawn,
-    sync::{Mutex, Notify},
-    time::sleep,
+    net::UdpSocket, pin, runtime, select, signal::ctrl_c, spawn, sync::Notify, time::sleep,
 };
 
 // OVERENGINEERING... bypass command line arguments by setting up a server...
@@ -73,9 +67,10 @@ fn main() {
         MatrixProtocol::UnreplicatedClient
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient
-        | MatrixProtocol::HotStuffClient => runtime::Builder::new_multi_thread()
+        | MatrixProtocol::HotStuffClient
+        | MatrixProtocol::PbftClient => runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(4)
+            .worker_threads(6)
             .on_thread_start({
                 let counter = Arc::new(AtomicU32::new(0));
                 move || {
@@ -225,15 +220,19 @@ async fn run_clients<T>(
         return;
     }
     let notify = Arc::new(Notify::new());
-    let latencies = Arc::new(Mutex::new(Vec::new()));
+    // let latencies = Arc::new(Mutex::new(Vec::new()));
+    let throughput = Arc::new(AtomicU32::new(0));
     let clients = match args.app {
         MatrixApp::Null => repeat_with(|| {
             let config = args.config.clone();
             let notify = notify.clone();
-            let latencies = latencies.clone();
+            // let latencies = latencies.clone();
+            let throughput = throughput.clone();
             let new_client = new_client.clone();
             let host = args.host.clone();
-            spawn(run_null_client(config, notify, latencies, new_client, host))
+            spawn(run_null_client(
+                config, notify, throughput, new_client, host,
+            ))
         })
         .take(args.num_client as _)
         .collect::<Vec<_>>(),
@@ -251,13 +250,14 @@ async fn run_clients<T>(
             repeat_with(|| {
                 let config = args.config.clone();
                 let notify = notify.clone();
-                let latencies = latencies.clone();
+                // let latencies = latencies.clone();
+                let throughput = throughput.clone();
                 let new_client = new_client.clone();
                 let host = args.host.clone();
                 let workload = workload.clone();
                 let rand = StdRng::from_rng(thread_rng()).unwrap();
                 spawn(run_ycsb_client(
-                    config, workload, rand, notify, latencies, new_client, host,
+                    config, workload, rand, notify, throughput, new_client, host,
                 ))
             })
             .take(args.num_client as _)
@@ -266,32 +266,37 @@ async fn run_clients<T>(
         _ => unreachable!(),
     };
 
-    let mut accumulated_latencies = Vec::new();
+    // let mut accumulated_latencies = Vec::new();
     for _ in 0..20 {
         sleep(Duration::from_secs(1)).await;
-        let latencies = take(&mut *latencies.lock().await);
-        println!("* interval throughput {} ops/sec", latencies.len());
-        accumulated_latencies.extend(latencies);
+        // let latencies = take(&mut *latencies.lock().await);
+        // println!("* interval throughput {} ops/sec", latencies.len());
+        println!(
+            "* interval throughput {} ops/sec",
+            throughput.swap(0, SeqCst)
+        );
+        // accumulated_latencies.extend(latencies);
     }
     notify.notify_waiters();
     for client in clients {
         client.await.unwrap();
     }
 
-    accumulated_latencies.sort_unstable();
-    if !accumulated_latencies.is_empty() {
-        println!(
-            "* 50th {:?} 99th {:?}",
-            accumulated_latencies[accumulated_latencies.len() / 2],
-            accumulated_latencies[accumulated_latencies.len() / 100 * 99]
-        );
-    }
+    // accumulated_latencies.sort_unstable();
+    // if !accumulated_latencies.is_empty() {
+    //     println!(
+    //         "* 50th {:?} 99th {:?}",
+    //         accumulated_latencies[accumulated_latencies.len() / 2],
+    //         accumulated_latencies[accumulated_latencies.len() / 100 * 99]
+    //     );
+    // }
 }
 
 async fn run_null_client<T>(
     config: Config,
     notify: Arc<Notify>,
-    latencies: Arc<Mutex<Vec<Duration>>>,
+    // latencies: Arc<Mutex<Vec<Duration>>>,
+    throughput: Arc<AtomicU32>,
     new_client: impl FnOnce(Transport<T>) -> T + Send + 'static,
     host: String,
 ) where
@@ -318,6 +323,7 @@ async fn run_null_client<T>(
     pin!(notified);
 
     let mut closed = false;
+    let mut latencies = Vec::new();
     while !closed {
         let instant = Instant::now();
         let result = client.invoke(&[]);
@@ -325,7 +331,9 @@ async fn run_null_client<T>(
             .run(async {
                 select! {
                     _ = result => {
-                        latencies.lock().await.push(Instant::now() - instant);
+                        // latencies.lock().await.push(Instant::now() - instant);
+                        latencies.push(Instant::now() - instant);
+                        throughput.fetch_add(1, SeqCst);
                     }
                     _ = &mut notified => closed = true,
                 }
@@ -339,7 +347,8 @@ async fn run_ycsb_client<T>(
     workload: Arc<ycsb::Workload>,
     mut rand: StdRng,
     notify: Arc<Notify>,
-    latencies: Arc<Mutex<Vec<Duration>>>,
+    // latencies: Arc<Mutex<Vec<Duration>>>,
+    throughput: Arc<AtomicU32>,
     new_client: impl FnOnce(Transport<T>) -> T + Send + 'static,
     host: String,
 ) where
@@ -360,11 +369,14 @@ async fn run_ycsb_client<T>(
     let notified = notify.notified();
     pin!(notified);
 
+    let mut latencies = Vec::new();
     loop {
         let instant = Instant::now();
         select! {
             _ = workload.invoke(&mut client, &mut rand) => {
-                latencies.lock().await.push(Instant::now() - instant);
+                // latencies.lock().await.push(Instant::now() - instant);
+                latencies.push(Instant::now() - instant);
+                throughput.fetch_add(1, SeqCst);
             }
             _ = &mut notified => break,
         }

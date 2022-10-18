@@ -35,6 +35,7 @@ impl<M> Reorder<M> {
     pub fn insert_reorder(&mut self, order: u32, message: M) -> Option<M> {
         assert!(order >= self.expected);
         if self.expected != order {
+            // println!("! reorder");
             self.messages.insert(order, message);
             None
         } else {
