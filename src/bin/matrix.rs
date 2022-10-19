@@ -68,7 +68,7 @@ fn main() {
         | MatrixProtocol::HotStuffClient
         | MatrixProtocol::PbftClient => runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(6)
+            .worker_threads(8)
             .on_thread_start({
                 let counter = Arc::new(AtomicU32::new(0));
                 move || {

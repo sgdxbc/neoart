@@ -353,6 +353,7 @@ pub struct Replica {
     verify_number: u32,
     vote_number: u32,
     speculative_number: u32,
+    n_speculative: u32,
 
     reorder_ordered_request: Reorder<OrderedRequest>, // received and yet to be reordered
 
@@ -377,6 +378,8 @@ pub struct Replica {
     votes: HashMap<ReplicaId, MulticastVote>,
     pending_votes: HashMap<u32, Vec<MulticastVote>>,
     pending_generics: HashMap<u32, Vec<MulticastGeneric>>,
+
+    replies: Vec<(ClientId, Reply)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,11 +423,13 @@ impl Replica {
             verify_number: 0,
             vote_number: 0,
             speculative_number: 0,
+            n_speculative: 0,
             reorder_ordered_request: Reorder::new(1),
             enable_vote,
             votes: HashMap::new(),
             pending_votes: HashMap::new(),
             pending_generics: HashMap::new(),
+            replies: Vec::new(),
             transport,
         }
     }
@@ -626,11 +631,15 @@ impl Replica {
         assert_eq!(generic.votes.len(), self.transport.config.f * 2 + 1);
         self.transport
             .send_message(ToAll, Message::MulticastGeneric(generic));
+        if self.vote_number < self.verify_number {
+            self.send_vote(self.verify_number);
+        }
 
         self.speculative_commit(voted_number);
     }
 
     fn speculative_commit(&mut self, speculative_number: u32) {
+        self.n_speculative += 1;
         if self
             .log
             .get(speculative_number as usize - 1)
@@ -652,11 +661,13 @@ impl Replica {
                 .insert_prepare(entry.request.client_id, entry.request.request_number)
             {
                 resend(|reply| {
-                    self.transport.send_signed_message(
-                        To(entry.request.client_id.0),
-                        Message::Reply(reply),
-                        self.id,
-                    )
+                    // self.transport.send_signed_message(
+                    //     To(entry.request.client_id.0),
+                    //     Message::Reply(reply),
+                    //     self.id,
+                    // )
+                    self.transport
+                        .send_message(To(entry.request.client_id.0), Message::Reply(reply))
                 });
             } else {
                 let op_number = entry.request.sequence_number as OpNumber;
@@ -673,11 +684,13 @@ impl Replica {
                     entry.request.request_number,
                     reply.clone(),
                 );
-                self.transport.send_signed_message(
-                    To(entry.request.client_id.0),
-                    Message::Reply(reply),
-                    self.id,
-                );
+                // self.transport.send_signed_message(
+                //     To(entry.request.client_id.0),
+                //     Message::Reply(reply),
+                //     self.id,
+                // );
+                self.transport
+                    .send_message(To(entry.request.client_id.0), Message::Reply(reply));
             }
         }
         self.speculative_number = speculative_number;
@@ -743,7 +756,10 @@ impl Replica {
 
 impl Drop for Replica {
     fn drop(&mut self) {
-        // println!("reorder size {}", self.reorder_ordered_request.len());
+        println!(
+            "average speculative size {}",
+            self.speculative_number / self.n_speculative
+        );
         if self.id == self.transport.config.primary(self.view_number) {
             if !self.log.is_empty() {
                 let signed_count = self

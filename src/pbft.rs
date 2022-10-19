@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::{
-    common::Reorder,
+    common::{ClientTable, Reorder},
     crypto::{CryptoMessage, Signature},
     meta::{
         digest, ClientId, Digest, OpNumber, ReplicaId, RequestNumber, ViewNumber, ENTRY_NUMBER,
@@ -212,7 +212,7 @@ pub struct Replica {
     op_number: OpNumber,
     commit_number: OpNumber,
     log: Vec<LogEntry>,
-    client_table: HashMap<ClientId, (RequestNumber, Option<Reply>)>,
+    client_table: ClientTable<Reply>,
     reorder_pre_prepare: Reorder<(PrePrepare, Vec<Request>)>,
     prepare_quorums: HashMap<(OpNumber, Digest), HashMap<ReplicaId, Prepare>>,
     commit_quorums: HashMap<(OpNumber, Digest), HashMap<ReplicaId, Commit>>,
@@ -261,7 +261,7 @@ impl Replica {
             op_number: 0,
             commit_number: 0,
             log: Vec::with_capacity(ENTRY_NUMBER),
-            client_table: HashMap::new(),
+            client_table: ClientTable::default(),
             reorder_pre_prepare: Reorder::new(1),
             prepare_quorums: HashMap::new(),
             commit_quorums: HashMap::new(),
@@ -336,28 +336,26 @@ impl Node for Replica {
 
 impl Replica {
     fn handle_request(&mut self, message: Request) {
-        if let Some((request_number, reply)) = self.client_table.get(&message.client_id) {
-            if message.request_number < *request_number {
-                return;
-            }
-            if message.request_number == *request_number {
-                if let Some(reply) = reply {
-                    self.transport.send_signed_message(
-                        To(message.client_id.0),
-                        Message::Reply(reply.clone()),
-                        self.id,
-                    );
-                }
-                return;
-            }
+        if let Some(resend) = self
+            .client_table
+            .insert_prepare(message.client_id, message.request_number)
+        {
+            resend(|reply| {
+                println!("! resend");
+                // self.transport.send_signed_message(
+                //     To(message.client_id.0),
+                //     Message::Reply(reply),
+                //     self.id,
+                // );
+                self.transport
+                    .send_message(To(message.client_id.0), Message::Reply(reply));
+            });
+            return;
         }
 
         if self.transport.config.primary(self.view_number) != self.id {
             todo!()
         }
-
-        self.client_table
-            .insert(message.client_id, (message.request_number, None));
         self.batch.push(message);
 
         // loop here?
@@ -525,15 +523,18 @@ impl Replica {
                     replica_id: self.id,
                     signature: Signature::default(),
                 };
-                self.client_table.insert(
+                self.client_table.insert_commit(
                     request.client_id,
-                    (request.request_number, Some(reply.clone())),
+                    request.request_number,
+                    reply.clone(),
                 );
-                self.transport.send_signed_message(
-                    To(request.client_id.0),
-                    Message::Reply(reply),
-                    self.id,
-                );
+                // self.transport.send_signed_message(
+                //     To(request.client_id.0),
+                //     Message::Reply(reply),
+                //     self.id,
+                // );
+                self.transport
+                    .send_message(To(request.client_id.0), Message::Reply(reply));
             }
         }
 

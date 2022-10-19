@@ -138,7 +138,7 @@ impl Client {
 
 pub struct Replica {
     transport: Transport<Self>,
-    id: ReplicaId,
+    // id: ReplicaId,
     op_number: OpNumber,
     app: Box<dyn App + Send>,
     client_table: ClientTable<Reply>,
@@ -155,7 +155,7 @@ impl Replica {
         assert_eq!(id, 0);
         Self {
             transport,
-            id,
+            // id,
             op_number: 0,
             app: Box::new(app),
             client_table: ClientTable::default(),
@@ -185,11 +185,13 @@ impl Node for Replica {
         {
             resend(|reply| {
                 println!("! resend");
-                self.transport.send_signed_message(
-                    To(message.client_id.0),
-                    Message::Reply(reply),
-                    self.id,
-                );
+                // self.transport.send_signed_message(
+                //     To(message.client_id.0),
+                //     Message::Reply(reply),
+                //     self.id,
+                // );
+                self.transport
+                    .send_message(To(message.client_id.0), Message::Reply(reply));
             });
             return;
         }
@@ -207,8 +209,10 @@ impl Node for Replica {
         assert_eq!(self.log.len() as OpNumber, self.op_number);
         self.client_table
             .insert_commit(message.client_id, message.request_number, reply.clone());
+        // self.transport
+        //     .send_signed_message(To(message.client_id.0), Message::Reply(reply), self.id);
         self.transport
-            .send_signed_message(To(message.client_id.0), Message::Reply(reply), self.id);
+            .send_message(To(message.client_id.0), Message::Reply(reply));
     }
 }
 

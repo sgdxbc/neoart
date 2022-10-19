@@ -593,8 +593,10 @@ impl Replica {
             client_id: message.client_id,
             signature: Signature::default(),
         });
+        // self.transport
+        //     .send_signed_message(To(message.client_id.0), local_commit, self.id);
         self.transport
-            .send_signed_message(To(message.client_id.0), local_commit, self.id);
+            .send_message(To(message.client_id.0), local_commit);
     }
 
     fn handle_checkpoint(&mut self, message: Checkpoint) {

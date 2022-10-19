@@ -412,11 +412,13 @@ impl Replica {
         {
             resend(|reply| {
                 println!("! resend");
-                self.transport.send_signed_message(
-                    To(message.client_id.0),
-                    Message::Reply(reply),
-                    self.id,
-                )
+                // self.transport.send_signed_message(
+                //     To(message.client_id.0),
+                //     Message::Reply(reply),
+                //     self.id,
+                // );
+                self.transport
+                    .send_message(To(message.client_id.0), Message::Reply(reply));
             });
             return;
         }
@@ -774,8 +776,10 @@ impl Replica {
         };
         self.client_table
             .insert_commit(request.client_id, request.request_number, reply.clone());
+        // self.transport
+        //     .send_signed_message(To(request.client_id.0), Message::Reply(reply), self.id);
         self.transport
-            .send_signed_message(To(request.client_id.0), Message::Reply(reply), self.id);
+            .send_message(To(request.client_id.0), Message::Reply(reply));
     }
 }
 
