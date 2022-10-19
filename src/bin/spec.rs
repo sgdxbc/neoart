@@ -27,6 +27,9 @@ use tokio::{
 #[tokio::main]
 async fn main() {
     let mut spec = toml::from_str::<Spec>(&read_to_string("spec.toml").await.unwrap()).unwrap();
+    if spec.task.mode == "ur" {
+        spec.task.f = 0;
+    }
     let n = if spec.task.assume_byz {
         2 * spec.task.f + 1
     } else {
