@@ -108,15 +108,10 @@ fn main() {
         match args.protocol {
             MatrixProtocol::Unknown => unreachable!(),
             MatrixProtocol::UnreplicatedReplica => {
-                // run_replica(args, executor, |transport| match app {
-                let socket = UdpSocket::bind(args.config.multicast).await.unwrap();
-                run_replica(args, executor, |mut transport| {
-                    transport.listen_multicast(MulticastListener::Os(socket), neoart::transport::MulticastVariant::HalfSipHash);
-                    match app {
-                        MatrixApp::Null => unreplicated::Replica::new(transport, 0, Null),
-                        MatrixApp::Ycsb => unreplicated::Replica::new(transport, 0, ycsb_app()),
-                        _ => unreachable!(),
-                    }
+                run_replica(args, executor, |transport| match app {
+                    MatrixApp::Null => unreplicated::Replica::new(transport, 0, Null),
+                    MatrixApp::Ycsb => unreplicated::Replica::new(transport, 0, ycsb_app()),
+                    _ => unreachable!(),
                 })
                 .await
             }

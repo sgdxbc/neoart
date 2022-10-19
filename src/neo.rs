@@ -50,15 +50,15 @@ pub struct Request {
     op: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct OrderedRequest {
-    pub client_id: ClientId,
-    pub request_number: RequestNumber,
-    pub op: Vec<u8>,
-    pub sequence_number: u32,
-    pub ordering_state: [u8; 32],
-    pub network_signature: Vec<u8>,
-    pub link_hash: [u8; 32],
+    client_id: ClientId,
+    request_number: RequestNumber,
+    op: Vec<u8>,
+    sequence_number: u32,
+    ordering_state: [u8; 32],
+    network_signature: Vec<u8>,
+    link_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
