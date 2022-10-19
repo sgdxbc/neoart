@@ -214,7 +214,6 @@ pub struct Replica {
     block_commit: BlockId,
     block_execute: BlockId,
     voted_height: OpNumber,
-    // (certified block, QC)
     high_quorum_certificate: BlockId,
     // libhotstuff uses ordered `std::set`, i don't see why
     // tails: HashSet<BlockId>,
@@ -320,14 +319,14 @@ impl AsMut<Transport<Self>> for Replica {
 
 impl Message {
     fn verify_proposal(&mut self, config: &Config) -> bool {
-        if let Self::Proposal(proposal) = self {
-            let id = proposal.proposer;
-            if !verify_message(self, &config.keys[id as usize].public_key()) {
-                return false;
-            }
-        } else {
-            unreachable!();
-        }
+        // if let Self::Proposal(proposal) = self {
+        //     let id = proposal.proposer;
+        //     if !verify_message(self, &config.keys[id as usize].public_key()) {
+        //         return false;
+        //     }
+        // } else {
+        //     unreachable!();
+        // }
         let proposal = if let Self::Proposal(proposal) = self {
             proposal
         } else {
@@ -434,7 +433,7 @@ impl Replica {
     // batch size
     // in this implementation it is equivalent to next proposing or manual
     // rounds start immediately after new QC get collected
-    const MAX_BATCH: usize = 800;
+    const MAX_BATCH: usize = 1000;
     fn beat(&mut self) {
         // TODO rotating
         if !self.quorum_certificate_finished {
@@ -668,9 +667,12 @@ impl Replica {
         // self.transport
         //     .send_message(ToAll, Message::Proposal(proposal));
         self.block_proposal = block;
+        // self.transport
+        //     .send_signed_message(ToSelf, Message::Proposal(proposal), self.id);
         self.transport
-            .send_signed_message(ToSelf, Message::Proposal(proposal), self.id);
+            .send_message(ToAll, Message::Proposal(proposal.clone()));
         self.profile.send_proposal.push(Instant::now());
+        self.on_receive_proposal(proposal, self.block_proposal);
     }
 
     fn update_high_quorum_certificate(&mut self, high_quorum_certificate: BlockId) {

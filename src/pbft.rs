@@ -236,7 +236,7 @@ enum LogStatus {
 }
 
 impl Replica {
-    const MAX_BATCH: usize = 400;
+    const MAX_BATCH: usize = 10;
     // the max gap between op_number (proposed sequence) and commit_number
     // (executed seqeuence), where a lot of reordering is allowed to happen
     // the number here is somewhat based on, the protocol can be intuitively
@@ -452,7 +452,7 @@ impl Replica {
             .entry((message.op_number, message.digest))
             .or_default();
         quorum.insert(message.replica_id, message.clone());
-        if quorum.len() == self.transport.config.f * 2 + 1 {
+        if quorum.len() == self.transport.config.f * 2 {
             self.commit(message.op_number);
         }
     }
