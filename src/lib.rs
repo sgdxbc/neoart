@@ -111,7 +111,6 @@ pub mod bin {
     pub struct Task {
         pub mode: String,
         pub app: String,
-        #[serde(default)]
         pub f: usize,
         #[serde(default)]
         pub assume_byz: bool,

@@ -1,9 +1,7 @@
 use std::{
     env::args,
-    fs::write,
     iter::repeat_with,
     net::TcpListener,
-    process::id,
     sync::{
         atomic::{AtomicU32, Ordering::SeqCst},
         Arc,
@@ -57,10 +55,10 @@ fn main() {
     let mut args = accept_args();
     args.config.gen_keys();
 
-    let pid_file = format!("pid.{}", args.instance_id);
+    // let pid_file = format!("pid.{}", args.instance_id);
     // using std instead of tokio because i don't want the whole main become
     // async only become of this
-    write(&pid_file, id().to_string()).unwrap();
+    // write(&pid_file, id().to_string()).unwrap();
 
     let mut executor = Executor::Inline;
     let runtime = match &args.protocol {

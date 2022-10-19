@@ -27,7 +27,7 @@ control SwitchIngress(
     table dmac {
         key = { hdr.ethernet.dst_addr : exact; }
         actions = { send; }
-        size = 8;
+        size = 16;
     }
 
     action send_multicast(bit<16> dst_port, PortId_t port) {

@@ -29,7 +29,7 @@ control SwitchIngress(
     table dmac {
         key = { hdr.ethernet.dst_addr : exact; }
         actions = { send; }
-        size = 8;
+        size = 16;
     }
 
     // keyless tables that always perform default action, need to be configured

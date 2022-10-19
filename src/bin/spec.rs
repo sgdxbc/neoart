@@ -27,9 +27,6 @@ use tokio::{
 #[tokio::main]
 async fn main() {
     let mut spec = toml::from_str::<Spec>(&read_to_string("spec.toml").await.unwrap()).unwrap();
-    if spec.task.f == 0 {
-        spec.task.f = if spec.task.mode == "ur" { 0 } else { 1 };
-    }
     let n = if spec.task.assume_byz {
         2 * spec.task.f + 1
     } else {
@@ -57,6 +54,7 @@ async fn main() {
             let node = node.clone();
             let instance_channel = instance_channel.0.clone();
             spawn(async move {
+                down_node(&node.control_user, &node.control_host, "").await;
                 let matrix = up_node(&node, format!("[{index}]")).await;
                 sleep(Duration::from_secs(1)).await;
                 let args = replica_args(&spec, index);
@@ -83,6 +81,7 @@ async fn main() {
             let node = node.clone();
             let instance_channel = instance_channel.0.clone();
             spawn(async move {
+                down_node(&node.control_user, &node.control_host, "").await;
                 let matrix = up_node(&node, String::from("[C]")).await;
                 sleep(Duration::from_secs(1)).await;
                 let args = client_args(&spec, index);
@@ -176,10 +175,10 @@ async fn up_node(node: &Node, tag: String) -> JoinHandle<()> {
     })
 }
 
-async fn down_node(user: &str, host: &str, inst_id: &str) {
+async fn down_node(user: &str, host: &str, _inst_id: &str) {
     Command::new("ssh")
         .arg(format!("{user}@{host}"))
-        .arg(format!("kill -INT $(cat pid.{inst_id}); rm pid.{inst_id}"))
+        .arg(format!("pkill -INT matrix"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
