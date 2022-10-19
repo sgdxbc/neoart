@@ -23,7 +23,7 @@ use crate::{
     transport::{
         simulated,
         // Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        Destination::{To, ToAll, ToMulticast, ToSelf},
+        Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
         InboundAction,
         InboundPacket,
         MulticastVariant,
@@ -52,13 +52,13 @@ pub struct Request {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderedRequest {
-    client_id: ClientId,
-    request_number: RequestNumber,
-    op: Vec<u8>,
-    sequence_number: u32,
-    ordering_state: [u8; 32],
-    network_signature: Vec<u8>,
-    link_hash: [u8; 32],
+    pub client_id: ClientId,
+    pub request_number: RequestNumber,
+    pub op: Vec<u8>,
+    pub sequence_number: u32,
+    pub ordering_state: [u8; 32],
+    pub network_signature: Vec<u8>,
+    pub link_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,7 +402,7 @@ pub struct Replica {
     enable_vote: bool,
     // keyed by (vote number, batch digest)
     vote_quorums: HashMap<(u32, Digest), HashMap<ReplicaId, Signature>>,
-    will_vote: Option<RangeInclusive<u32>>,
+    // will_vote: Option<RangeInclusive<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,7 +453,7 @@ impl Replica {
             vote_quorums: HashMap::with_capacity(
                 ENTRY_NUMBER * (transport.config.n - transport.config.f),
             ),
-            will_vote: None,
+            // will_vote: None,
             transport,
         }
     }
@@ -560,8 +560,6 @@ impl Replica {
                 });
                 return;
             }
-            println!("{link_hash:?}");
-            println!("{:?}", request);
             todo!() // fallback to slow path
         }
 
@@ -593,48 +591,48 @@ impl Replica {
         //     }
         // }
 
-        // // only trigger a new voting round if there is no outstanding voting
-        // if self.id == self.transport.config.primary(self.view_number)
-        //     && self.speculative_number == self.vote_number
-        // {
-        //     assert_ne!(self.verify_number, self.vote_number);
-        //     self.vote_number = self.verify_number;
-        //     let generic = MulticastGeneric {
-        //         vote_number: self.vote_number,
-        //         // there is no higher certificate collected, only an intention
-        //         // of new voting, so a null certificate is acceptable and
-        //         // reducing replica's verifying workload
-        //         view_number: 0,
-        //         sequence_number: u32::MAX..=self.speculative_number,
-        //         digest: Digest::default(),
-        //         quorum_signatures: Vec::new(),
-        //         signature: Signature::default(),
-        //     };
-        //     self.transport
-        //         .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
-        //     // TODO set timer
-        //     self.send_vote(self.speculative_number + 1..=self.vote_number);
-        // }
-
-        // if self.verify_number % 70 == 0 {
-        const BATCH_SIZE: OpNumber = 100;
-        if self.verify_number / BATCH_SIZE > self.vote_number / BATCH_SIZE {
-            let vote_number = self.verify_number / BATCH_SIZE * BATCH_SIZE;
-            self.send_vote(self.vote_number + 1..=vote_number);
-            self.vote_number = vote_number;
+        // only trigger a new voting round if there is no outstanding voting
+        if self.id == self.transport.config.primary(self.view_number)
+            && self.speculative_number == self.vote_number
+        {
+            assert_ne!(self.verify_number, self.vote_number);
+            self.vote_number = self.verify_number;
+            let generic = MulticastGeneric {
+                vote_number: self.vote_number,
+                // there is no higher certificate collected, only an intention
+                // of new voting, so a null certificate is acceptable and
+                // reducing replica's verifying workload
+                view_number: 0,
+                sequence_number: u32::MAX..=self.speculative_number,
+                digest: Digest::default(),
+                quorum_signatures: Vec::new(),
+                signature: Signature::default(),
+            };
+            self.transport
+                .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
+            // .send_message(ToAll, Message::MulticastGeneric(generic));
+            // TODO set timer
+            self.send_vote(self.speculative_number + 1..=self.vote_number);
         }
+
+        // const BATCH_SIZE: OpNumber = 100;
+        // if self.verify_number / BATCH_SIZE > self.vote_number / BATCH_SIZE {
+        //     let vote_number = self.verify_number / BATCH_SIZE * BATCH_SIZE;
+        //     self.send_vote(self.vote_number + 1..=vote_number);
+        //     self.vote_number = vote_number;
+        // }
     }
 
     fn handle_multicast_vote(&mut self, message: MulticastVote) {
         // TODO assert is primary
         assert!(self.enable_vote);
 
-        // if message.sequence_number != (self.speculative_number + 1..=self.vote_number) {
-        //     return;
-        // }
-        if *message.sequence_number.end() <= self.speculative_number {
+        if message.sequence_number != (self.speculative_number + 1..=self.vote_number) {
             return;
         }
+        // if *message.sequence_number.end() <= self.speculative_number {
+        //     return;
+        // }
 
         let quorum = self
             .vote_quorums
@@ -643,35 +641,35 @@ impl Replica {
             .or_default();
         quorum.insert(message.replica_id, message.signature);
         if quorum.len() == self.transport.config.f * 2 + 1 {
-            // let quorum_signatures = quorum
-            //     .iter()
-            //     .map(|(&id, &signature)| (id, signature))
-            //     .collect();
+            let quorum_signatures = quorum
+                .iter()
+                .map(|(&id, &signature)| (id, signature))
+                .collect();
 
-            // self.vote_number = self.verify_number;
-            // // send certificate as soon as possible, even when vote batch is
-            // // empty
-            // let generic = MulticastGeneric {
-            //     view_number: self.view_number,
-            //     sequence_number: message.sequence_number,
-            //     digest: message.digest,
-            //     quorum_signatures,
-            //     vote_number: self.vote_number,
-            //     signature: Signature::default(),
-            // };
-            // self.transport
-            //     .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
-
-            // self.speculative_commit(self.vote_number);
+            self.vote_number = self.verify_number;
+            // send certificate as soon as possible, even when vote batch is
+            // empty
+            let generic = MulticastGeneric {
+                view_number: self.view_number,
+                sequence_number: message.sequence_number,
+                digest: message.digest,
+                quorum_signatures,
+                vote_number: self.vote_number,
+                signature: Signature::default(),
+            };
+            self.transport
+                .send_signed_message(ToAll, Message::MulticastGeneric(generic), self.id);
 
             // TODO
-            self.speculative_commit(*message.sequence_number.end());
+            // self.speculative_commit(*message.sequence_number.end());
 
-            // // if there is no voting reply expected do not resend actively
-            // if self.vote_number != self.speculative_number {
-            //     // TODO set timer for above generic
-            //     self.send_vote(self.speculative_number + 1..=self.vote_number);
-            // }
+            // if there is no voting reply expected do not resend actively
+            if self.vote_number != self.speculative_number {
+                // TODO set timer for above generic
+                self.send_vote(self.speculative_number + 1..=self.vote_number);
+            }
+
+            self.speculative_commit(self.vote_number);
         }
     }
 
@@ -679,8 +677,8 @@ impl Replica {
         if self
             .log
             .get(speculative_number as usize - 1)
-            .map(|entry| entry.status != LogStatus::Voting)
-            .unwrap_or(true)
+            .filter(|entry| entry.status == LogStatus::Voting)
+            .is_none()
         {
             todo!("speculative commit up to {speculative_number}") // query missing ordered requests
         }
@@ -740,17 +738,19 @@ impl Replica {
                     self.send_vote(message.sequence_number.end() + 1..=message.vote_number);
                 }
             } else {
-                // println!("postpone vote for sequence {}", message.vote_number);
-                let prev = replace(
-                    &mut self.will_vote,
-                    Some(message.sequence_number.end() + 1..=message.vote_number),
-                );
-                if prev.is_some() {
-                    // not sure why this is a possible state in assume byz setup...
-                    println!("will vote: {prev:?} -> {:?}", self.will_vote);
-                }
-                // it is bad to have vote number > verify number, so not update
-                // vote number here
+                // or just ignore?
+                todo!()
+                // // println!("postpone vote for sequence {}", message.vote_number);
+                // let prev = replace(
+                //     &mut self.will_vote,
+                //     Some(message.sequence_number.end() + 1..=message.vote_number),
+                // );
+                // if prev.is_some() {
+                //     // not sure why this is a possible state in assume byz setup...
+                //     println!("will vote: {prev:?} -> {:?}", self.will_vote);
+                // }
+                // // it is bad to have vote number > verify number, so not update
+                // // vote number here
             }
         }
 
@@ -775,14 +775,14 @@ impl Replica {
             replica_id: self.id,
             signature: Signature::default(),
         };
-        // let primary_id = self.transport.config.primary(self.view_number);
+        let primary_id = self.transport.config.primary(self.view_number);
         self.transport.send_signed_message(
-            // if self.id == primary_id {
-            //     ToSelf
-            // } else {
-            //     ToReplica(primary_id)
-            // },
-            ToSelf,
+            if self.id == primary_id {
+                ToSelf
+            } else {
+                ToReplica(primary_id)
+            },
+            // ToSelf,
             Message::MulticastVote(vote),
             self.id,
         );
@@ -791,7 +791,7 @@ impl Replica {
 
 impl Drop for Replica {
     fn drop(&mut self) {
-        println!("reorder size {}", self.reorder_ordered_request.len());
+        // println!("reorder size {}", self.reorder_ordered_request.len());
         if self.id == self.transport.config.primary(self.view_number) {
             if !self.vote_quorums.is_empty() {
                 println!(
