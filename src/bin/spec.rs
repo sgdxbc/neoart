@@ -181,7 +181,7 @@ async fn up_node(node: &Node, tag: String) -> JoinHandle<()> {
 async fn down_node(user: &str, host: &str, _inst_id: &str) {
     Command::new("ssh")
         .arg(format!("{user}@{host}"))
-        .arg(format!("pkill -INT matrix"))
+        .arg(String::from("pkill -INT matrix"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

@@ -21,13 +21,14 @@ use crate::{
     transport::{
         simulated,
         // Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
+        Destination::{To, ToAll, ToMulticast},
         InboundAction,
         InboundPacket,
         MulticastVariant,
         Node,
         Transport,
-        TransportMessage::{self, Allowed, Signed, Verified},
+        // TransportMessage::{self, Allowed, Signed, Verified},
+        TransportMessage::{self, Allowed, Verified},
     },
     App, InvokeResult,
 };
@@ -378,8 +379,6 @@ pub struct Replica {
     votes: HashMap<ReplicaId, MulticastVote>,
     pending_votes: HashMap<u32, Vec<MulticastVote>>,
     pending_generics: HashMap<u32, Vec<MulticastGeneric>>,
-
-    replies: Vec<(ClientId, Reply)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,7 +428,6 @@ impl Replica {
             votes: HashMap::new(),
             pending_votes: HashMap::new(),
             pending_generics: HashMap::new(),
-            replies: Vec::new(),
             transport,
         }
     }
@@ -497,7 +495,7 @@ impl Node for Replica {
             | Allowed(Message::OrderedRequest(message)) => self.handle_ordered_request(message),
             Verified(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
             // need to be caution to reuse...
-            Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
+            // Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
             Verified(Message::MulticastGeneric(message)) => self.handle_multicast_generic(message),
             _ => unreachable!(),
         }
@@ -603,7 +601,8 @@ impl Replica {
         }
 
         self.votes.insert(message.replica_id, message);
-        if self.votes.len() < self.transport.config.f * 2 + 1 {
+        // if self.votes.len() < self.transport.config.f * 2 + 1 {
+        if self.votes.len() < self.transport.config.f * 2 {
             return;
         }
         // can we do better?
@@ -612,6 +611,9 @@ impl Replica {
             .values()
             .map(|vote| vote.sequence_number)
             .collect::<Vec<_>>();
+
+        voted_numbers.push(self.verify_number); //
+
         voted_numbers.resize(self.transport.config.f * 3 + 1, 0);
         let (_, &mut voted_number, _) = voted_numbers.select_nth_unstable(self.transport.config.f);
         assert!(voted_number >= self.speculative_number);
@@ -619,18 +621,18 @@ impl Replica {
             return;
         }
 
-        let generic = MulticastGeneric {
-            votes: self
-                .votes
-                .values()
-                .filter(|vote| vote.sequence_number >= voted_number)
-                .take(self.transport.config.f * 2 + 1)
-                .cloned()
-                .collect(),
-        };
-        assert_eq!(generic.votes.len(), self.transport.config.f * 2 + 1);
-        self.transport
-            .send_message(ToAll, Message::MulticastGeneric(generic));
+        // let generic = MulticastGeneric {
+        //     votes: self
+        //         .votes
+        //         .values()
+        //         .filter(|vote| vote.sequence_number >= voted_number)
+        //         .take(self.transport.config.f * 2 + 1)
+        //         .cloned()
+        //         .collect(),
+        // };
+        // assert_eq!(generic.votes.len(), self.transport.config.f * 2 + 1);
+        // self.transport
+        //     .send_message(ToAll, Message::MulticastGeneric(generic));
         if self.vote_number < self.verify_number {
             self.send_vote(self.verify_number);
         }
@@ -740,13 +742,14 @@ impl Replica {
             replica_id: self.id,
             signature: Signature::default(),
         };
-        let primary = self.transport.config.primary(self.view_number);
+        // let primary = self.transport.config.primary(self.view_number);
         self.transport.send_signed_message(
-            if self.id == primary {
-                ToSelf
-            } else {
-                ToReplica(primary)
-            },
+            // if self.id == primary {
+            //     ToSelf
+            // } else {
+            //     ToReplica(primary)
+            // },
+            ToAll,
             Message::MulticastVote(message),
             self.id,
         );
@@ -760,18 +763,19 @@ impl Drop for Replica {
             "average speculative size {}",
             self.speculative_number / self.n_speculative
         );
-        if self.id == self.transport.config.primary(self.view_number) {
-            if !self.log.is_empty() {
-                let signed_count = self
-                    .log
-                    .iter()
-                    .filter(|entry| Message::has_network_signature(&entry.request))
-                    .count();
-                println!(
-                    "network signature batch size {}",
-                    self.log.len() as f32 / signed_count as f32
-                );
-            }
+        if self.id != self.transport.config.primary(self.view_number) {
+            return;
+        }
+        if !self.log.is_empty() {
+            let signed_count = self
+                .log
+                .iter()
+                .filter(|entry| Message::has_network_signature(&entry.request))
+                .count();
+            println!(
+                "network signature batch size {}",
+                self.log.len() as f32 / signed_count as f32
+            );
         }
     }
 }

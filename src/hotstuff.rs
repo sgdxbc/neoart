@@ -539,7 +539,7 @@ impl Replica {
         self.propose_parent = block_new;
 
         assert!(self.storage.arena[block_new].height > self.voted_height);
-        self.do_broadcast_proposal(proposal.clone(), block_new);
+        self.do_broadcast_proposal(proposal, block_new);
         // self.on_receive_proposal(proposal, block_new);
 
         self.commit();
