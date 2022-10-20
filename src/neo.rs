@@ -378,7 +378,7 @@ pub struct Replica {
     // TODO slow verify buffer
     votes: HashMap<ReplicaId, MulticastVote>,
     pending_votes: HashMap<u32, Vec<MulticastVote>>,
-    pending_generics: HashMap<u32, Vec<MulticastGeneric>>,
+    // pending_generics: HashMap<u32, Vec<MulticastGeneric>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,7 +427,7 @@ impl Replica {
             enable_vote,
             votes: HashMap::new(),
             pending_votes: HashMap::new(),
-            pending_generics: HashMap::new(),
+            // pending_generics: HashMap::new(),
             transport,
         }
     }
@@ -496,7 +496,7 @@ impl Node for Replica {
             Verified(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
             // need to be caution to reuse...
             // Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
-            Verified(Message::MulticastGeneric(message)) => self.handle_multicast_generic(message),
+            // Verified(Message::MulticastGeneric(message)) => self.handle_multicast_generic(message),
             _ => unreachable!(),
         }
     }
@@ -570,11 +570,11 @@ impl Replica {
                 self.handle_multicast_vote(message);
             }
         }
-        if let Some(messages) = self.pending_generics.remove(&self.verify_number) {
-            for message in messages {
-                self.handle_multicast_generic(message);
-            }
-        }
+        // if let Some(messages) = self.pending_generics.remove(&self.verify_number) {
+        //     for message in messages {
+        //         self.handle_multicast_generic(message);
+        //     }
+        // }
     }
 
     fn handle_multicast_vote(&mut self, message: MulticastVote) {
@@ -698,39 +698,39 @@ impl Replica {
         self.speculative_number = speculative_number;
     }
 
-    fn handle_multicast_generic(&mut self, message: MulticastGeneric) {
-        assert!(self.enable_vote);
-        let mut voted_number = u32::MAX;
-        for vote in &message.votes {
-            if vote.replica_id == self.id {
-                continue;
-            }
-            let entry = if let Some(entry) = self.log.get((vote.sequence_number - 1) as usize) {
-                entry
-            } else {
-                //
-                self.pending_generics
-                    .entry(vote.sequence_number)
-                    .or_default()
-                    .push(message);
-                return;
-            };
-            if entry.request.ordering_state != vote.ordering_state {
-                println!("! mismatch ordering state in generic");
-                return;
-            }
-            voted_number = u32::min(voted_number, vote.sequence_number);
-        }
-        if voted_number <= self.speculative_number {
-            return;
-        }
+    // fn handle_multicast_generic(&mut self, message: MulticastGeneric) {
+    //     assert!(self.enable_vote);
+    //     let mut voted_number = u32::MAX;
+    //     for vote in &message.votes {
+    //         if vote.replica_id == self.id {
+    //             continue;
+    //         }
+    //         let entry = if let Some(entry) = self.log.get((vote.sequence_number - 1) as usize) {
+    //             entry
+    //         } else {
+    //             //
+    //             self.pending_generics
+    //                 .entry(vote.sequence_number)
+    //                 .or_default()
+    //                 .push(message);
+    //             return;
+    //         };
+    //         if entry.request.ordering_state != vote.ordering_state {
+    //             println!("! mismatch ordering state in generic");
+    //             return;
+    //         }
+    //         voted_number = u32::min(voted_number, vote.sequence_number);
+    //     }
+    //     if voted_number <= self.speculative_number {
+    //         return;
+    //     }
 
-        // assert verify number >= vote number?
-        if self.verify_number > voted_number {
-            self.send_vote(self.verify_number);
-        }
-        self.speculative_commit(voted_number);
-    }
+    //     // assert verify number >= vote number?
+    //     if self.verify_number > voted_number {
+    //         self.send_vote(self.verify_number);
+    //     }
+    //     self.speculative_commit(voted_number);
+    // }
 
     fn send_vote(&mut self, vote_number: u32) {
         let message = MulticastVote {
@@ -761,7 +761,7 @@ impl Drop for Replica {
     fn drop(&mut self) {
         println!(
             "average speculative size {}",
-            self.speculative_number / self.n_speculative
+            self.speculative_number as f32 / self.n_speculative as f32
         );
         if self.id != self.transport.config.primary(self.view_number) {
             return;
