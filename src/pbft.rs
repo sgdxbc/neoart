@@ -423,26 +423,35 @@ impl Replica {
             self.transport
                 .send_signed_message(ToSelf, Message::Prepare(prepare), self.id);
         }
+        let op_number = message.op_number;
+        let digest = message.digest;
         self.log.push(LogEntry {
             status: LogStatus::Preparing,
             view_number: self.view_number,
             requests,
             pre_prepare: message,
         });
+        if self
+            .prepare_quorums
+            .get(&(op_number, digest))
+            .map(|quorum| quorum.len() >= self.transport.config.f * 2)
+            .unwrap_or(false)
+        {
+            self.commit(op_number);
+        }
     }
 
     fn handle_prepare(&mut self, message: Prepare) {
         if message.view_number != self.view_number {
             return;
         }
-        if self
-            .log
-            .get(message.op_number as usize - 1)
-            .map(|entry| {
-                entry.status == LogStatus::Committing || entry.status == LogStatus::Committed
-            })
-            .unwrap_or(false)
-        {
+        let entry = if let Some(entry) = self.log.get(message.op_number as usize - 1) {
+            entry
+        } else {
+            return;
+        };
+
+        if entry.status == LogStatus::Committing || entry.status == LogStatus::Committed {
             // reply for slow peer
             return;
         }

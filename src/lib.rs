@@ -69,6 +69,7 @@ pub mod bin {
         NeoReplica {
             variant: MulticastVariant,
             enable_vote: bool,
+            batch_size: usize,
         },
         NeoClient,
         PbftReplica {

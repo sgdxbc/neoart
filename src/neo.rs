@@ -378,6 +378,7 @@ pub struct Replica {
     // TODO slow verify buffer
     votes: HashMap<ReplicaId, MulticastVote>,
     pending_votes: HashMap<u32, Vec<MulticastVote>>,
+    batch_size: usize,
     // pending_generics: HashMap<u32, Vec<MulticastGeneric>>,
 }
 
@@ -401,6 +402,7 @@ impl Replica {
         id: ReplicaId,
         app: impl App + Send + 'static,
         enable_vote: bool,
+        batch_size: usize,
     ) -> Self {
         // TODO consider avoid side effect in constructor by adding a dedicated
         // initialization method
@@ -425,6 +427,7 @@ impl Replica {
             n_speculative: 0,
             reorder_ordered_request: Reorder::new(1),
             enable_vote,
+            batch_size,
             votes: HashMap::new(),
             pending_votes: HashMap::new(),
             // pending_generics: HashMap::new(),
@@ -560,7 +563,9 @@ impl Replica {
             entry.request.ordering_state = digest(&entry.request);
         }
 
-        if self.speculative_number == self.vote_number {
+        if self.speculative_number == self.vote_number
+            || self.verify_number >= self.vote_number + self.batch_size as u32
+        {
             self.send_vote(self.verify_number);
         }
 
@@ -891,7 +896,8 @@ mod tests {
                     );
                     transport
                         .listen_multicast(net.multicast_listener(config.replicas[i]), HalfSipHash);
-                    let replica = Replica::new(transport, i as ReplicaId, TestApp::default(), true);
+                    let replica =
+                        Replica::new(transport, i as ReplicaId, TestApp::default(), true, 1);
                     Concurrent::run(replica)
                 })
                 .collect::<Vec<_>>();

@@ -235,6 +235,7 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
             "neo" => MatrixProtocol::NeoReplica {
                 variant: spec.multicast.variant,
                 enable_vote: spec.task.enable_vote,
+                batch_size: spec.task.batch_size,
             },
             "pbft" => MatrixProtocol::PbftReplica {
                 enable_batching: spec.task.batch_size > 1,

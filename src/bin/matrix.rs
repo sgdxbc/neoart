@@ -142,17 +142,22 @@ fn main() {
             MatrixProtocol::NeoReplica {
                 variant,
                 enable_vote,
+                batch_size,
             } => {
                 let socket = UdpSocket::bind(args.config.multicast).await.unwrap();
                 run_replica(args, executor, |mut transport| {
                     transport.listen_multicast(MulticastListener::Os(socket), variant);
                     match app {
                         MatrixApp::Null => {
-                            neo::Replica::new(transport, replica_id, Null, enable_vote)
+                            neo::Replica::new(transport, replica_id, Null, enable_vote, batch_size)
                         }
-                        MatrixApp::Ycsb => {
-                            neo::Replica::new(transport, replica_id, ycsb_app(), enable_vote)
-                        }
+                        MatrixApp::Ycsb => neo::Replica::new(
+                            transport,
+                            replica_id,
+                            ycsb_app(),
+                            enable_vote,
+                            batch_size,
+                        ),
                         _ => unreachable!(),
                     }
                 })
