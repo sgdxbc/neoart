@@ -21,7 +21,7 @@ use crate::{
     transport::{
         simulated,
         // Destination::{To, ToAll, ToMulticast, ToReplica, ToSelf},
-        Destination::{To, ToAll, ToMulticast},
+        Destination::{To, ToAll, ToMulticast, ToReplica},
         InboundAction,
         InboundPacket,
         MulticastVariant,
@@ -40,6 +40,8 @@ pub enum Message {
     MulticastGeneric(MulticastGeneric),
     MulticastVote(MulticastVote),
     Reply(Reply),
+    Query(Query),
+    QueryReply(QueryReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +83,17 @@ pub struct Reply {
     replica_id: ReplicaId,
     result: Vec<u8>,
     signature: Signature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Query {
+    sequence_number: u32,
+    replica_id: ReplicaId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryReply {
+    ordered_request: OrderedRequest,
 }
 
 impl CryptoMessage for Message {
@@ -355,6 +368,7 @@ pub struct Replica {
     vote_number: u32,
     speculative_number: u32,
     n_speculative: u32,
+    n_query: u32,
 
     reorder_ordered_request: Reorder<OrderedRequest>, // received and yet to be reordered
 
@@ -425,6 +439,7 @@ impl Replica {
             vote_number: 0,
             speculative_number: 0,
             n_speculative: 0,
+            n_query: 0,
             reorder_ordered_request: Reorder::new(1),
             enable_vote,
             batch_size,
@@ -488,6 +503,21 @@ impl Node for Replica {
                 Message::MulticastGeneric(message),
                 Message::verify_multicast_generic,
             ),
+            InboundPacket::Unicast {
+                message: message @ Message::Query(_),
+            } => InboundAction::Allow(message),
+            InboundPacket::Unicast {
+                message: Message::QueryReply(QueryReply { ordered_request }),
+            } => {
+                if ordered_request.sequence_number == self.pending_number() {
+                    Message::multicast_action(
+                        self.transport.multicast_variant(),
+                        Message::OrderedRequest(ordered_request),
+                    )
+                } else {
+                    InboundAction::Block
+                }
+            }
             _ => InboundAction::Block,
         }
     }
@@ -500,13 +530,22 @@ impl Node for Replica {
             // need to be caution to reuse...
             // Signed(Message::MulticastVote(message)) => self.handle_multicast_vote(message),
             // Verified(Message::MulticastGeneric(message)) => self.handle_multicast_generic(message),
+            Allowed(Message::Query(message)) => self.handle_query(message),
             _ => unreachable!(),
         }
     }
 }
 
 impl Replica {
+    fn pending_number(&self) -> u32 {
+        self.log.len() as u32 + 1
+    }
+
     fn handle_ordered_request(&mut self, message: OrderedRequest) {
+        if message.sequence_number < self.pending_number() {
+            return; // resolved query
+        }
+
         // we don't look up client table at this point, because every ordered
         // request will be assigned to different sequence number even if they
         // contains identical client request. so certain states e.g. reordering
@@ -519,6 +558,23 @@ impl Replica {
         while let Some(request) = ordered {
             self.verify_ordered_request(request);
             ordered = self.reorder_ordered_request.expect_next();
+        }
+        if !self.reorder_ordered_request.is_empty() {
+            self.n_query += 1;
+            // TODO delay a little bit
+            let primary = self.transport.config.primary(self.view_number);
+            self.transport.send_message(
+                if self.id == primary {
+                    ToAll
+                } else {
+                    ToReplica(primary)
+                },
+                Message::Query(Query {
+                    sequence_number: self.pending_number(),
+                    replica_id: self.id,
+                }),
+            );
+            // TODO resend
         }
     }
 
@@ -760,6 +816,17 @@ impl Replica {
         );
         self.vote_number = vote_number;
     }
+
+    fn handle_query(&mut self, message: Query) {
+        if let Some(entry) = self.log.get((message.sequence_number - 1) as usize) {
+            self.transport.send_message(
+                ToReplica(message.replica_id),
+                Message::QueryReply(QueryReply {
+                    ordered_request: entry.request.clone(),
+                }),
+            );
+        }
+    }
 }
 
 impl Drop for Replica {
@@ -768,6 +835,7 @@ impl Drop for Replica {
             "average speculative size {}",
             self.speculative_number as f32 / self.n_speculative as f32
         );
+        println!("queried {}", self.n_query);
         if self.id != self.transport.config.primary(self.view_number) {
             return;
         }
