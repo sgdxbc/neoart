@@ -3,9 +3,20 @@ use std::{
     convert::TryInto,
     env::var,
     hash::{Hash, Hasher},
+    net::UdpSocket,
+    sync::{
+        atomic::{AtomicU32, Ordering::SeqCst},
+        Arc,
+    },
+    thread::spawn,
     time::Duration,
 };
 
+use bincode::Options;
+use nix::{
+    sched::{sched_setaffinity, CpuSet},
+    unistd::Pid,
+};
 use rand::{thread_rng, Rng};
 use secp256k1::{hashes::sha256, PublicKey, Secp256k1, VerifyOnly};
 use serde::{Deserialize, Serialize};
@@ -368,7 +379,9 @@ pub struct Replica {
     vote_number: u32,
     speculative_number: u32,
     n_speculative: u32,
+    query_number: Arc<AtomicU32>,
     n_query: u32,
+    n_send_query: Arc<AtomicU32>,
 
     reorder_ordered_request: Reorder<OrderedRequest>, // received and yet to be reordered
 
@@ -429,6 +442,51 @@ impl Replica {
                 &[],
             );
         });
+        let query_number = Arc::new(AtomicU32::new(0));
+        let n_send_query = Arc::new(AtomicU32::new(0));
+        spawn({
+            let query_number = query_number.clone();
+            let n_send_query = n_send_query.clone();
+            let config = transport.config.clone();
+            move || {
+                let mut cpu_set = CpuSet::new();
+                cpu_set.set(14).unwrap();
+                sched_setaffinity(Pid::from_raw(0), &cpu_set).unwrap();
+                let socket = UdpSocket::bind((config.replicas[id as usize].ip(), 61000)).unwrap();
+                let mut now = Instant::now();
+                let mut sending = 0;
+                loop {
+                    while Instant::now() - now
+                        < Duration::from_micros(match sending {
+                            // 0 => 0,
+                            // 1 | 2 | 3 => 100,
+                            _ => 40,
+                        })
+                    {}
+                    now = Instant::now();
+                    let query_number = query_number.load(SeqCst);
+                    // let query_number = query_number.swap(0, SeqCst);
+                    if query_number == 0 {
+                        sending = 0;
+                        continue;
+                    }
+                    sending += 1;
+                    let query = Message::Query(Query {
+                        sequence_number: query_number,
+                        replica_id: id,
+                    });
+                    n_send_query.fetch_add(1, SeqCst);
+                    let message = bincode::options().serialize(&query).unwrap();
+                    if id == 0 {
+                        for &replica in &config.replicas[1..] {
+                            socket.send_to(&message, replica).unwrap();
+                        }
+                    } else {
+                        socket.send_to(&message, config.replicas[0]).unwrap();
+                    }
+                }
+            }
+        });
         Self {
             id,
             view_number: 0,
@@ -439,7 +497,9 @@ impl Replica {
             vote_number: 0,
             speculative_number: 0,
             n_speculative: 0,
+            query_number,
             n_query: 0,
+            n_send_query,
             reorder_ordered_request: Reorder::new(1),
             enable_vote,
             batch_size,
@@ -559,22 +619,14 @@ impl Replica {
             self.verify_ordered_request(request);
             ordered = self.reorder_ordered_request.expect_next();
         }
-        if !self.reorder_ordered_request.is_empty() {
-            self.n_query += 1;
-            // TODO delay a little bit
-            let primary = self.transport.config.primary(self.view_number);
-            self.transport.send_message(
-                if self.id == primary {
-                    ToAll
-                } else {
-                    ToReplica(primary)
-                },
-                Message::Query(Query {
-                    sequence_number: self.pending_number(),
-                    replica_id: self.id,
-                }),
-            );
-            // TODO resend
+        // if !self.reorder_ordered_request.is_empty() {
+        if self.reorder_ordered_request.len() > 50 {
+            let prev = self.query_number.swap(self.pending_number(), SeqCst);
+            if prev != self.pending_number() {
+                self.n_query += 1;
+            }
+        } else {
+            self.query_number.swap(0, SeqCst);
         }
     }
 
@@ -836,6 +888,7 @@ impl Drop for Replica {
             self.speculative_number as f32 / self.n_speculative as f32
         );
         println!("queried {}", self.n_query);
+        println!("send query {}", self.n_send_query.load(SeqCst));
         if self.id != self.transport.config.primary(self.view_number) {
             return;
         }
