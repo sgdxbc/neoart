@@ -20,7 +20,7 @@ use neoart::{
     },
     neo, pbft,
     transport::{MulticastListener, Node, Run, Socket, Transport},
-    unreplicated, ycsb, zyzzyva, App, Client,
+    unreplicated, ycsb, zyzzyva, App, Client, minbft,
 };
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -71,7 +71,8 @@ fn main() {
         | MatrixProtocol::ZyzzyvaClient { .. }
         | MatrixProtocol::NeoClient
         | MatrixProtocol::HotStuffClient
-        | MatrixProtocol::PbftClient => runtime::Builder::new_multi_thread()
+        | MatrixProtocol::PbftClient
+        | MatrixProtocol::MinBFTClient => runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(8)
             .on_thread_start({
@@ -186,6 +187,15 @@ fn main() {
                 .await
             }
             MatrixProtocol::HotStuffClient => run_clients(args, hotstuff::Client::new).await,
+            MatrixProtocol::MinBFTReplica => {
+                run_replica(args, executor, |transport| match app {
+                    MatrixApp::Null => minbft::Replica::new(transport, replica_id, Null),
+                    MatrixApp::Ycsb => minbft::Replica::new(transport, replica_id, ycsb_app()),
+                    _ => unreachable!(),
+                })
+                .await
+            }
+            MatrixProtocol::MinBFTClient => run_clients(args, minbft::Client::new).await,
         }
     });
 }

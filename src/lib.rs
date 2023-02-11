@@ -79,6 +79,8 @@ pub mod bin {
         PbftClient,
         HotStuffReplica,
         HotStuffClient,
+        MinBFTReplica,
+        MinBFTClient,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

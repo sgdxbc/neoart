@@ -30,7 +30,7 @@ async fn main() {
     if spec.task.mode == "ur" {
         spec.task.f = 0;
     }
-    let n = if spec.task.assume_byz {
+    let n = if spec.task.assume_byz || spec.task.mode == "minbft" {
         2 * spec.task.f + 1
     } else {
         3 * spec.task.f + 1
@@ -241,6 +241,7 @@ fn replica_args(spec: &Spec, index: usize) -> MatrixArgs {
                 enable_batching: spec.task.batch_size > 1,
             },
             "hotstuff" => MatrixProtocol::HotStuffReplica,
+            "minbft" => MatrixProtocol::MinBFTReplica,
             _ => panic!(),
         },
         app: match &*spec.task.app {
@@ -268,6 +269,7 @@ fn client_args(spec: &Spec, index: usize) -> MatrixArgs {
             "neo" => MatrixProtocol::NeoClient,
             "pbft" => MatrixProtocol::PbftClient,
             "hotstuff" => MatrixProtocol::HotStuffClient,
+            "minbft" => MatrixProtocol::MinBFTClient,
             _ => panic!(),
         },
         app: match &*spec.task.app {

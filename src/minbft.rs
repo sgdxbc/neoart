@@ -153,6 +153,7 @@ impl Node for Client {
         } else {
             unreachable!()
         };
+        // println!("receive {message:?}");
         let invoke = if let Some(invoke) = self.invoke.as_mut() {
             invoke
         } else {
@@ -300,7 +301,7 @@ impl Replica {
             .insert_prepare(message.client_id, message.request_number)
         {
             resend(|reply| {
-                println!("! resend");
+                // println!("! resend");
                 self.transport
                     .send_message(To(message.client_id.0), Message::Reply(reply));
             });
@@ -361,7 +362,9 @@ impl Replica {
     fn prepare(&mut self, message: Prepare) {
         assert_eq!(message.op_number, self.log.len() as OpNumber + 1);
         // if self.id != self.transport.config.primary(self.view_number) {
-        assert_eq!(message.op_number, self.op_number + 1);
+        if self.id != self.transport.config.primary(self.view_number) {
+            assert_eq!(message.op_number, self.op_number + 1);
+        }
         self.op_number = message.op_number;
         let commit = Commit {
             view_number: self.view_number,
@@ -376,9 +379,9 @@ impl Replica {
 
         // let op_number = message.op_number;
         // let digest = message.digest;
-        let digest = digest(&message.requests);
+        // let digest = digest(&message.requests);
         self.log.push(LogEntry {
-            status: LogStatus::Preparing,
+            status: LogStatus::Committing,
             view_number: self.view_number,
             requests: message.requests,
             // pre_prepare: message,
@@ -466,14 +469,13 @@ impl Replica {
             .entry((op_number, digest(&message.requests)))
             .or_default();
         quorum.insert(message.replica_id, message);
-        if op_number == self.commit_number + 1
-            && quorum.len() >= self.transport.config.n - self.transport.config.f
-        {
+        if op_number == self.commit_number + 1 && quorum.len() >= self.transport.config.f + 1 {
             self.execute(op_number);
         }
     }
 
     fn execute(&mut self, op_number: OpNumber) {
+        // println!("execute {op_number}");
         let entry = &mut self.log[op_number as usize - 1];
         assert_eq!(entry.status, LogStatus::Committing);
         entry.status = LogStatus::Committed;
