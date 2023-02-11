@@ -2,6 +2,7 @@ pub mod common;
 pub mod crypto;
 pub mod hotstuff;
 pub mod meta;
+pub mod minbft;
 pub mod neo;
 pub mod pbft;
 pub mod transport;
